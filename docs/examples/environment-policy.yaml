@@ -1,0 +1,179 @@
+# Proposed policy syntax. This file documents the contract; no parser exists yet.
+apiVersion: world.philcantcode.dev/v1alpha1
+kind: EnvironmentPolicy
+metadata:
+  name: android-vr-hostile
+  revision: 1
+
+spec:
+  lease:
+    ttl: 2h
+    priority: 50
+    preemptible: true
+    quiesceDeadline: 30s
+
+  runtime:
+    driver: docker
+    image: registry.example/vr-agent@sha256:replace-with-pinned-digest
+    isolationTier: standard
+    rootFilesystem: readOnly
+    user: "10000:10000"
+    capabilities:
+      drop: [ALL]
+      add: []
+    noNewPrivileges: true
+    seccompProfile: vr-agent-v1
+    network:
+      mode: restricted-egress
+      allowDNS: true
+      allowedCIDRs: []
+      allowedDomains: []
+      denyPrivateRanges: true
+
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+      workspace: 20Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+      swap: 0B
+      pids: 2048
+      workspace: 40Gi
+      captureBytes: 10Gi
+
+  workspace:
+    mode: overlayfs
+    inputView:
+      source: frozen-artifact-selection
+      layout: by-evidence-path
+      cacheScope: campaign
+      construction: require-reflink
+      reuseExactView: true
+      verifyBeforeMount: true
+      verifyAfterRun: true
+      viewRetention: 24h
+    cache:
+      maxBytes: 500Gi
+      highWaterPercent: 85
+      lowWaterPercent: 70
+      verifyOnPopulate: true
+      reverify: on-uncertain-integrity
+    export:
+      declaration: agent-or-host
+      regularFilesOnly: true
+      maxFiles: 10000
+      maxBytes: 20Gi
+      retainFullChangeManifest: true
+
+  target:
+    kind: android-emulator
+    emulator:
+      avdProfile: pixel-api-35-vr
+      systemImageDigest: sha256:replace-with-system-image-digest
+      baselineSnapshot: clean-v1
+      requireHardwareAcceleration: true
+      headless: true
+      memory: 4Gi
+      bootTimeout: 3m
+      restoreOnEnvironmentFailure: explicit-new-generation
+
+  observation:
+    baseline:
+      - world-lifecycle
+      - docker-events
+      - cgroup-metrics
+      - host-pressure
+      - input-view-cache
+      - process-lifecycle
+      - workspace-mutations
+      - network-flows
+      - adb-state
+      - android-logcat
+    metrics:
+      normalInterval: 2s
+      incidentInterval: 250ms
+      dimensions:
+        - host
+        - cache-scope
+        - input-view
+        - lease
+        - container
+        - emulator-process
+        - android-device
+        - selected-process
+    buffers:
+      liveSubscriberEvents: 4096
+      segmentBytes: 64Mi
+      packetRingBytes: 2Gi
+    allowedOnDemand:
+      strace:
+        maxDuration: 2m
+        maxBytes: 512Mi
+      perfetto:
+        maxDuration: 5m
+        maxBytes: 1Gi
+      packetCapture:
+        maxDuration: 15m
+        maxBytes: 2Gi
+        payloads: true
+      mitmproxy:
+        maxDuration: 10m
+        maxBytes: 2Gi
+        decryptedPayloads: restricted
+      frida:
+        maxDuration: 10m
+        requireRootOrGadget: true
+    triggers:
+      - name: memory-pressure-evidence
+        when:
+          metric: lease.memory.psi.full
+          above: 0.10
+          for: 5s
+        actions:
+          - raise-metric-resolution
+          - capture-process-tree
+          - capture-android-meminfo
+      - name: android-crash-evidence
+        when:
+          event: android.native_crash
+        actions:
+          - seal-logcat-window
+          - capture-tombstone-if-permitted
+          - capture-screenshot
+          - finalize-packet-ring
+    sensitivity:
+      default: internal
+      decryptedTraffic: restricted
+      screenshots: restricted
+    retention:
+      liveLocal: 24h
+      finalizeToArtifactStore: true
+      deleteLocalAfterArtifactAck: true
+
+  incidents:
+    minimumEvidence:
+      - lifecycle-window
+      - resource-window
+      - process-tree
+      - workspace-change-manifest
+      - collector-gap-summary
+    recovery:
+      containerFailure: recreate-new-generation
+      emulatorFailure: restore-baseline-new-generation
+      androidAppCrash: keep-generation-and-report
+      observerFailure: fail-if-required
+      physicalDeviceFailure: quarantine
+
+  pressure:
+    reserveHostMemory: 8Gi
+    stopAdmissionOn:
+      memoryPSIFull: 0.05
+      ioPSIFull: 0.10
+      freeDiskPercent: 15
+    shedOrder:
+      - unused-reservations
+      - unleased-warm-emulators
+      - idle-preemptible-leases
+      - active-preemptible-leases
