@@ -1,6 +1,6 @@
 # ADR 0003: Use shared immutable input views and dedicated OverlayFS workspaces
 
-- Status: proposed
+- Status: Accepted
 - Date: 2026-07-24
 
 ## Context
@@ -46,11 +46,15 @@ Every agent generation receives new upper and work directories. The cached view
 is the read-only OverlayFS lower layer, and only the merged view is mounted into
 the agent container. An agent generation pins its view and referenced cache
 entries until output and incident finalization completes. Target runs use
-separate exact materialization manifests and never mount the agent upper or
-merged tree. Unpinned views and content are removed asynchronously by bounded
-TTL/LRU garbage collection. Startup reconciliation rebuilds pins from durable
-leases, target materializations, manifests, and live mounts. The cache is
-non-authoritative and may always be wiped and rebuilt.
+separate exact initial materialization manifests and never mount the agent upper
+or merged tree. During an active run, ADR 0010 permits scoped push streams from
+paths the agent can already read beneath its workspace. Those bytes do not alter
+the initial manifest: their digests, target-relative destinations, operation
+identity, and resulting changes are recorded in an
+`AgentInterventionManifest`. Unpinned views and content are removed
+asynchronously by bounded TTL/LRU garbage collection. Startup reconciliation
+rebuilds pins from durable leases, target materializations, manifests, and live
+mounts. The cache is non-authoritative and may always be wiped and rebuilt.
 
 Production policy requires reflink construction and fails admission when the
 backing filesystem lacks it. An explicit development-only `allow-copy` mode may

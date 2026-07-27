@@ -1,6 +1,6 @@
 # ADR 0004: Keep a durable causal ledger behind resumable live streams
 
-- Status: proposed
+- Status: Accepted
 - Date: 2026-07-24
 
 ## Context
@@ -28,9 +28,12 @@ live fan-out:
 
 Every event carries source-local sequence, cursor, wall/monotonic times, clock
 domain and sync epoch, session/lease, agent-workspace/generation/exec, and
-target/generation/run identities where applicable, collector placement and
-coverage, process identity including start time, policy/capability digests, and
-explicit causal or correlation fields.
+target/generation/run/operation identities where applicable, collector
+placement and coverage, process identity including start time,
+policy/capability digests, evidence-backed origin classification, and explicit
+causal or correlation fields. Target operations distinguish agent control,
+agent-installed instrumentation, declared specimen, system behavior, and
+mixed/unknown origin without discarding the raw observation.
 
 Only defined parentage, trace context, or state/action relationships populate
 `causation_id`. Timestamp proximity is recorded as correlation with method and

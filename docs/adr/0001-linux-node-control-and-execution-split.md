@@ -1,6 +1,6 @@
 # ADR 0001: Target Linux nodes and split control from node execution
 
-- Status: proposed
+- Status: Accepted
 - Date: 2026-07-24
 
 ## Context

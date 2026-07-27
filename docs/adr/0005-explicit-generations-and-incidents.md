@@ -1,6 +1,6 @@
 # ADR 0005: Make failures and recovery explicit through incidents and generations
 
-- Status: proposed
+- Status: Accepted
 - Date: 2026-07-24
 
 ## Context
@@ -13,9 +13,13 @@ same realization survived would hide the failure and destroy causality.
 ## Decision
 
 Agent workspaces and targets have independent monotonically increasing
-generation counters. A failure seals the affected exec or target run and
-generation, records a typed incident, captures bounded minimum evidence, and
-surfaces the incident before recovery.
+generation counters. A failure seals the affected exec or target run, records a
+typed incident, captures bounded minimum evidence, and surfaces the incident
+before recovery. The resource generation is sealed only when that workspace or
+target realization itself failed, is reset, is restored, is replaced, or can no
+longer satisfy its readiness contract. A specimen exit, app crash, or ANR may
+finalize a failed target run while leaving a healthy target generation
+addressable until explicit reset or destruction.
 
 Agent-container recreate starts a new agent generation. Linux-target recreate,
 Android snapshot load, powerwash, or cold boot starts a new target generation

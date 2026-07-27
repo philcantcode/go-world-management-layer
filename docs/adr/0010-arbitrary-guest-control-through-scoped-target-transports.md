@@ -1,6 +1,6 @@
 # ADR 0010: Permit arbitrary guest control through scoped target transports
 
-- Status: accepted
+- Status: Accepted
 - Date: 2026-07-27
 
 ## Context

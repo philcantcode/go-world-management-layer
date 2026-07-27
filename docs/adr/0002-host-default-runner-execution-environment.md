@@ -1,6 +1,6 @@
 # ADR 0002: Run provider CLIs through a lease-bound execution environment
 
-- Status: accepted
+- Status: Accepted
 - Date: 2026-07-27
 
 ## Context

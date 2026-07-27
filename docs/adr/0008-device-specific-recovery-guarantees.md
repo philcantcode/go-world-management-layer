@@ -1,6 +1,6 @@
 # ADR 0008: Keep virtual- and physical-device recovery guarantees distinct
 
-- Status: proposed
+- Status: Accepted
 - Date: 2026-07-24
 
 ## Context
@@ -19,8 +19,9 @@ must not weaken the contract when introduced.
 
 Both device kinds use ADR 0010's scoped ADB contract: an ordinary ADB-compatible
 endpoint exposes exactly one assigned serial and forwards arbitrary device-
-scoped services while rejecting host-server control and all other transports.
-This interaction contract is common; reset and cleanliness guarantees are not.
+scoped services while rejecting host-server control, other serial transports,
+and requests outside the active lease and target run. This interaction contract
+is common; reset and cleanliness guarantees are not.
 
 Virtual-device recovery may load a validated immutable baseline snapshot,
 powerwash a Cuttlefish device, or cold boot isolated state. Each action starts a

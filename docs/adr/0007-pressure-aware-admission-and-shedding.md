@@ -1,6 +1,6 @@
 # ADR 0007: Admit and shed work using hard limits and measured pressure
 
-- Status: proposed
+- Status: Accepted
 - Date: 2026-07-24
 
 ## Context

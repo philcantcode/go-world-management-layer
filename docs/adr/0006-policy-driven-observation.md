@@ -1,6 +1,6 @@
 # ADR 0006: Use low-overhead baseline and policy-triggered invasive observation
 
-- Status: proposed
+- Status: Accepted
 - Date: 2026-07-24
 
 ## Context

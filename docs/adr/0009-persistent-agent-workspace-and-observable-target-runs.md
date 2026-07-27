@@ -1,6 +1,6 @@
 # ADR 0009: Separate the persistent agent workspace from observable target runs
 
-- Status: accepted
+- Status: Accepted
 - Date: 2026-07-27
 
 ## Context
