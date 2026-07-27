@@ -42,13 +42,15 @@ the same cached content extents. Hardlink farms are not used because hardlinks
 would alias metadata and falsely make equal content at different logical paths
 the same file.
 
-Every generation receives new upper and work directories. The cached view is
-the read-only OverlayFS lower layer, and only the merged view is mounted into
-the container. A generation pins its view and referenced cache entries until
-output and incident finalization completes. Unpinned views and content are
-removed asynchronously by bounded TTL/LRU garbage collection. Startup
-reconciliation rebuilds pins from durable leases, manifests, and live mounts.
-The cache is non-authoritative and may always be wiped and rebuilt.
+Every agent generation receives new upper and work directories. The cached view
+is the read-only OverlayFS lower layer, and only the merged view is mounted into
+the agent container. An agent generation pins its view and referenced cache
+entries until output and incident finalization completes. Target runs use
+separate exact materialization manifests and never mount the agent upper or
+merged tree. Unpinned views and content are removed asynchronously by bounded
+TTL/LRU garbage collection. Startup reconciliation rebuilds pins from durable
+leases, target materializations, manifests, and live mounts. The cache is
+non-authoritative and may always be wiped and rebuilt.
 
 Production policy requires reflink construction and fails admission when the
 backing filesystem lacks it. An explicit development-only `allow-copy` mode may
@@ -73,7 +75,8 @@ never supplies a host destination.
 - A unique content digest normally consumes data blocks once per cache scope.
   Each view adds directory/inode metadata, and each generation adds only its
   upper/work state and genuinely copied-up or new data.
-- Reset is a new upper/work pair and generation; input views remain immutable.
+- Agent-workspace recreate uses a new upper/work pair and agent generation;
+  target reset advances only its target generation.
 - A write to a large lower file may copy that whole file into the generation's
   upper layer. Upper-layer quotas therefore measure physical allocation as well
   as logical file size.

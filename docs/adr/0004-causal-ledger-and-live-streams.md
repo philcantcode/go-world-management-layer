@@ -27,9 +27,10 @@ live fan-out:
   storage.
 
 Every event carries source-local sequence, cursor, wall/monotonic times, clock
-domain and sync epoch, environment/generation/lease/exec identities, process
-identity including start time, policy/capability digests, and explicit causal or
-correlation fields.
+domain and sync epoch, session/lease, agent-workspace/generation/exec, and
+target/generation/run identities where applicable, collector placement and
+coverage, process identity including start time, policy/capability digests, and
+explicit causal or correlation fields.
 
 Only defined parentage, trace context, or state/action relationships populate
 `causation_id`. Timestamp proximity is recorded as correlation with method and
@@ -38,10 +39,23 @@ confidence. Collector overflow, restart, compaction, or loss emits a typed gap.
 Subscribers use durable cursors. Slow consumers cannot block the agent or
 collectors; they resume from local or artifact-backed segments.
 
+Each finalized target-run interval produces an `ObservationBundle` that links
+native/raw captures, normalized records, the target change manifest, coverage
+and gaps, incidents, and a derived summary. The bundle cites ledger ranges; it
+does not replace or duplicate the ledger's operational truth.
+
+A deterministic reducer maintains a current `LiveSnapshot` of subject topology,
+latest values, sample age, incidents, pressure, and collector coverage. Clients
+fetch snapshot-at-cursor and then follow the streams. Missing, unsupported,
+stale, and gap states are distinct from numeric zero. Agent and operator views
+are authorization projections over the same ledger, not duplicated telemetry.
+
 ## Consequences
 
 - Live UI/agents and later forensic reconstruction use one semantic event
   model.
+- `worldctl top`, dashboards, and agent views share the same snapshot reducer
+  and staleness semantics rather than independently interpreting metrics.
 - Perfect cross-system total ordering is deliberately not claimed.
 - Segment recovery, hash chaining, cursor stability, clock jumps, duplicate
   delivery, and gap behavior require focused tests.

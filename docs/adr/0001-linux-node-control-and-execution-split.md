@@ -20,15 +20,22 @@ but Docker Desktop is not the reference isolation or performance environment.
 Split the implementation into:
 
 - `worldd`, an unprivileged logical control plane that owns policy, admission,
-  leases, generations, durable state, incidents, and subscriptions; and
+  leases, agent/target generations, target runs, durable state, incidents,
+  observation bundles, and subscriptions; and
 - `world-node`, a local trusted authority that owns Docker Engine, mounts,
-  cgroups, emulators, scoped ADB/device access, and privileged observers.
+  cgroups, sibling agent/target containers, Android virtual devices, scoped ADB
+  access, and privileged observers.
 
 The node accepts only typed, resolved plans under configured roots and
 allowlists. It does not expose shell, Docker passthrough, arbitrary host paths,
 or raw USB operations. It independently validates lease identity and policy
 constraints so a confused control-plane request cannot become arbitrary host
 execution.
+
+ADR 0010 permits arbitrary shell and ADB commands only after a typed envelope
+has bound them to one active target run. This does not add a node or host shell:
+the node selects the already-assigned target transport before forwarding opaque
+guest command bytes.
 
 ## Consequences
 
@@ -45,5 +52,5 @@ execution.
   authority and makes least-privilege testing harder.
 - A platform-neutral v1: would either omit required facilities or falsely claim
   equivalent guarantees.
-- Run Docker/ADB inside the agent container: exposes management authority to an
-  untrusted workload and breaks the containment boundary.
+- Run Docker/ADB inside the agent workspace: exposes management authority to an
+  untrusted workload and prevents sibling isolation between agent and target.

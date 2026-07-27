@@ -2,35 +2,50 @@
 
 - Status: proposed
 - Date: 2026-07-24
+- Revised: 2026-07-27
 - Target module: `github.com/philcantcode/go-world-management-layer`
 - Proposed Go floor: 1.25.12
 
 ## 1. Delivery strategy
 
-Build one real, hostile-input vertical slice before adding multiple runtimes and
-collectors. The first slice must prove the difficult seams together:
+Build one real, hostile-input vertical slice around a persistent agent workspace
+and a disposable Linux target before adding Android or multiple collector
+implementations. The first slice must prove the difficult seams together:
 
 1. a host acquires a lease with one frozen forensic input selection;
-2. the manager admits it against host capacity and creates a dedicated cgroup;
+2. the manager admits it against host capacity and creates an aggregate lease
+   cgroup with agent, target, and observer leaves;
 3. the selection resolves to a canonical input view, whose missing bytes are
    streamed once into the scoped node cache and exposed as a verified OverlayFS
    lower layer;
-4. Docker starts a hardened container and `world-guest` becomes ready;
-5. `go-agent-runner` invokes a fake provider through lease-specific
-   `worldexec`, including its version/help probes;
-6. the provider starts ordinary tools, reads input, and writes derived files;
-7. a client watches live process/file events and host/container metrics;
-8. the provider or host declares one output path;
-9. the manager seals the change set and captures the output, logs, ledger, and
-   execution provenance in `go-forensic-artifacts`;
-10. a forced cgroup OOM in a second run produces an explicit incident, a failed
-    runner result, preserved evidence, and a clean new generation; and
-11. teardown leaves no process, mount, cgroup, network namespace, temporary
+4. Docker starts a hardened agent workspace and `world-guest` becomes ready;
+5. `go-agent-runner` invokes a fake provider through a lease-bound
+   `ExecutionEnvironment`, including version/help probes and remote temporary
+   input materialization;
+6. the provider requests a policy-named Linux target; `world-node` creates a
+   sibling OCI/runc container without exposing the Docker socket;
+7. the manager stages one specimen, starts required Tracee or Inspektor Gadget
+   collectors plus a bounded packet ring, verifies coverage, and starts one
+   target run;
+8. the provider uses `world-target` to issue arbitrary target commands and
+   push tooling while a client watches target process/syscall/file/network
+   events, intervention attribution, and metrics;
+9. finalization seals raw captures, normalized events, target changes, coverage
+   and gaps, and a derived summary into one observation bundle;
+10. the provider consumes that bundle, writes a derived file, and declares it
+    for export;
+11. the manager captures the agent output, target observation bundle, logs,
+    ledger, and provenance in `go-forensic-artifacts`;
+12. a forced target cgroup OOM produces an explicit incident and failed target
+    run while the same agent workspace receives the evidence and successfully
+    requests a clean new target generation; and
+13. teardown leaves no process, mount, cgroup, network namespace, temporary
     descriptor, observer, or writable upper layer behind; released input views
     remain only according to their bounded cache policy.
 
-No emulator, physical-device, Frida, mitmproxy, or distributed scheduling work
-should precede this slice. They depend on its lease, generation, observation,
+No Android, Frida, mitmproxy, stronger target runtime, physical-device, or
+distributed scheduling work should precede this slice. They depend on its
+workspace/target separation, independent generation, observation-bundle,
 incident, artifact, and cleanup contracts.
 
 ## 2. Engineering rules
@@ -62,26 +77,29 @@ api/world/v1/                    protobuf control and observation contracts
 world/                           public Go client and stable views
 policy/                          strict public policy DTOs and compiler entrypoint
 adapters/forensicartifacts/      first-party MaterialAuthority adapter
+adapters/agentrunner/            lease-bound runner ExecutionEnvironment
 cmd/
   worldd/                        logical control-plane daemon
   world-node/                    trusted Linux node authority
-  worldexec/                     lease-bound provider execution shim
-  world-guest/                   container PID 1 and exec supervisor
+  world-guest/                   agent-workspace PID 1 and exec supervisor
+  world-target/                  scoped arbitrary target exec/transfer client
+  world-observe/                 scoped live/bundle observation client
   worldctl/                      operator/debug CLI over the public API
 internal/
   application/                   commands, queries, transactions, orchestration
-  domain/                        lease/generation/incident/resource invariants
+  domain/                        session/workspace/target/run/incident invariants
   admission/                     capacity, pressure, priority, shedding
   ledger/                        control records, segments, cursors, replay
   transport/                     framed exec and bounded stream helpers
   inputcache/                    scoped CAS, view construction, pins, GC
   workspace/                     OverlayFS plan, diff, seal, export
+  observationbundle/             raw refs, normalization, coverage, summaries
   drivers/
-    runtime/docker/              Docker Engine adapter
-    target/emulator/             Android Emulator adapter
-    target/androiddevice/        physical-device inventory and lease adapter
+    agent/docker/                Docker agent-workspace adapter
+    target/linuxcontainer/       visibility-first OCI/runc target adapter
+    target/cuttlefish/           Android virtual-device adapter
     deviceproxy/                 scoped ADB protocol gateway
-    observer/                    collector implementations
+    observer/                    Tracee/IG, packet, Perfetto, Frida adapters
   linux/                         cgroup, mount, namespace, openat2 helpers
   testkit/                       fake drivers, clocks, fault points, leak checks
 docs/                            design, ADRs, policies, operations
@@ -99,13 +117,13 @@ Purpose: retire high-risk unknowns before production scaffolding.
 ### 4.1 Linux node matrix
 
 Exercise at least Ubuntu LTS and one other cgroup v2 distribution in disposable
-VMs. Record kernel, filesystem, Docker Engine/API, runc, rootless, gVisor, KVM,
-SELinux/AppArmor, eBPF, `openat2`, fanotify, and PSI capabilities.
+VMs. Record kernel, filesystem, Docker Engine/API, runc, rootless, gVisor, Kata,
+KVM, SELinux/AppArmor, eBPF/BTF, `openat2`, fanotify, and PSI capabilities.
 
 Prove:
 
-- a container can be placed under a manager-created lease cgroup parent;
-- container plus emulator processes can be measured in one aggregate subtree;
+- agent, Linux target, emulator, and observer processes can be placed in
+  separate leaves under one manager-created aggregate cgroup;
 - PSI poll triggers wake within documented windows;
 - grouped cgroup OOM kills only the intended workload and emits distinguishable
   counters/events;
@@ -136,12 +154,13 @@ prove reconciliation neither deletes a live view nor permanently retains an
 unreferenced one. Verify an agent cannot enumerate cache paths, excluded entries,
 or another selection.
 
-### 4.3 Runner bridge spike
+### 4.3 Runner execution-environment spike
 
 Use the existing `go-agent-runner` deterministic fake CLIs. Run capability
 probes, one successful provider protocol, large simultaneous stdout/stderr,
-stdin close, cancellation, process descendants, terminal disagreement, and a
-shim/network disconnect through `worldexec` into a container.
+stdin close, cancellation, process descendants, terminal disagreement, Grok's
+temporary prompt-file path, executable replacement, and a transport disconnect
+through a custom `ExecutionEnvironment` into a container.
 
 Prove:
 
@@ -149,44 +168,76 @@ Prove:
 - backpressure does not deadlock either side;
 - runner cancellation kills the remote process group;
 - an unconfirmed kill tears down the container;
-- the same absolute working directory works on host and in container; and
-- an incident ID reaches stderr without corrupting stdout.
+- working directories and executables resolve inside the container without a
+  matching host path;
+- temporary inputs arrive as bytes, are materialized inside the container, and
+  are removed during confirmed cleanup;
+- the environment ID prevents capability-cache reuse across agent generations;
+  and
+- a structured execution error links to an incident without corrupting either
+  provider stream.
 
-### 4.4 Emulator spike
+### 4.4 Linux target and open-source observer spike
 
-On a KVM host, boot one headless AVD with an isolated data directory and fixed
-ports. Save/load/list an immutable baseline snapshot, kill the emulator during
-boot and during snapshot save/load, corrupt or invalidate snapshot metadata,
-and verify cold-boot behavior. Capture emulator stderr, logcat with monotonic
-and epoch clocks, network packets, a bounded Perfetto trace, CPU/memory/thermal
-state, and ADB readiness.
+Create a Linux OCI/runc target as a sibling of the agent workspace. Run hostile
+fixtures that fork, exec, open/read/write/rename/delete files, use sockets, crash,
+and exhaust quotas. Compare current Tracee and Inspektor Gadget versions against
+one normalized collector contract and record licensing, privileges, kernel/BTF
+requirements, event schema stability, container scoping, startup races, drop
+counters, throughput, and measured overhead.
 
-### 4.5 Scoped ADB spike
+Prove the selected stack can start before the specimen, attribute events to the
+correct target run and process identity, maintain a bounded packet ring, seal an
+authoritative target change manifest, report all lost coverage, and finalize a
+raw-plus-normalized observation bundle after success, crash, OOM, cancellation,
+collector death, or daemon restart. Compare the same fixtures under gVisor/Kata
+and document the exact visibility lost or moved into the guest.
+
+### 4.5 Android virtual-device spike
+
+On a KVM host, compare Cuttlefish and Android Emulator behind one target-driver
+contract. Boot an instrumented rooted/debuggable AOSP device with isolated state
+and fixed endpoints. Reset to an immutable baseline, kill the runtime during
+boot and reset, corrupt or invalidate snapshot metadata, and verify cold-boot or
+powerwash behavior. Capture runtime stderr, logcat with monotonic and epoch
+clocks, network packets, a bounded Perfetto trace, CPU/memory/thermal state, ADB
+readiness, package/activity/process lifecycle, and screenshots.
+
+Inject a test APK and compare Frida app-API intent hooks with framework-level
+instrumentation in a custom AOSP image. Name their coverage separately. Exercise
+MobSF through its API and decide which static/dynamic outputs are reused as
+external evidence without delegating world lifecycle or provenance to it.
+
+### 4.6 Scoped ADB spike
 
 Prototype a protocol-aware proxy that exposes one assigned serial. Verify that
-device listing, transport selection, server-control services, reverse/forward,
-sync, shell, logcat, and reconnect behavior cannot address another attached
-device or host ADB control. Fuzz ADB framing before selecting or writing the
-production implementation.
+device listing and transport selection cannot address another attached device
+or host ADB control while arbitrary assigned-device services still work. The
+test corpus includes shell, sync/push/pull, install/uninstall, root/remount,
+reverse/forward, logcat, reboot, reconnect, and installing/running Frida server.
+Fuzz ADB framing and race lease closure against long-lived services before
+selecting or writing the production implementation.
 
-### 4.6 Artifact round-trip spike
+### 4.7 Artifact and observation-bundle round-trip spike
 
 Against a disposable `go-forensic-artifacts` case:
 
 - freeze a selection and resolve it to a canonical input-view manifest;
 - stream missing objects through the public artifact reader, populate the
   scoped cache, verify them, and mount the resulting view as lower;
-- capture selected derived files plus stdout/stderr, incident JSON, metric/event
-  segment, and packet/trace object under one activity;
-- trace every output to the input occurrence and world execution; and
+- run a specimen in a sibling Linux target and capture its observation bundle,
+  selected agent-derived files, stdout/stderr, incident JSON, metric/event
+  segments, and packet/trace objects under linked activities;
+- trace every output to the input occurrence, agent exec, and target run; and
 - prove a modified workspace never changes a managed blob or cached input.
 
 ### Phase 0 exit gate
 
 Check in spike code or reproducible test harnesses, machine-readable results,
 selected capability requirements, benchmark numbers, and revised ADRs. Do not
-proceed if safe export, remote cancellation, aggregate accounting, or emulator
-generation rollover remains ambiguous. Do not proceed without a verified
+proceed if safe export, remote cancellation, target-run finalization, collector
+coverage/gaps, aggregate accounting, independent agent/target generations, or
+Android reset remains ambiguous. Do not proceed without a verified
 reflink-capable storage profile or an explicit decision to accept copy cost for
 a named non-production profile.
 
@@ -195,25 +246,35 @@ a named non-production profile.
 Implement without Docker or Android dependencies:
 
 - typed IDs, revisions, errors, and immutable public views;
-- environment, lease, generation, exec, target, input-view, cache-scope,
-  cache-entry, workspace, incident, capture, export, and policy models;
-- declarative state transition tables and replay;
+- research-session, lease, agent-workspace/generation, exec, target/
+  generation/run/operation, observation-bundle, input-view, cache-scope,
+  cache-entry, incident, capture, export, and policy models;
+- separate declarative agent-workspace, target-generation, and target-run state
+  transition tables and replay;
 - strict YAML decoding, canonical policy digest, defaults, cross-field
   validation, capability requirements, and effective-policy output;
 - SQLite schema/migrations, transaction boundaries, idempotency, leases, and
   recovery ownership;
 - append-only segment framing, checksums/hash chain, cursors, rotation, replay,
   compaction markers, and gap records;
+- deterministic live-snapshot reduction, subject topology, staleness and
+  collector-coverage states, plus authorization-filtered projections;
 - admission model and deterministic pressure decision engine;
-- fake runtime/target/input-cache/workspace/observer/material/node drivers;
-- gRPC API, Go client, Unix socket authentication, and `worldctl`; and
+- fake agent-workspace/target/input-cache/workspace/observer/material/node
+  drivers and a deterministic observation-bundle builder;
+- gRPC control/query API, target exec/transfer stream contracts, optional MCP
+  facade, Go client, Unix socket authentication, and `worldctl`; and
 - one `make verify` or equivalent command that runs format, unit, fuzz seed,
   race, vet, generated-contract, and migration checks.
 
 ### Phase 1 exit gate
 
 - Model-based tests traverse every legal and illegal transition.
+- A target reset advances only `TargetGeneration`; property tests prove it never
+  changes a healthy `AgentGeneration` or exposes agent workspace state.
 - Replaying the ledger reconstructs exactly the materialized state.
+- Replaying any event prefix produces the same `LiveSnapshot`; authorization
+  projections cannot reveal another lease or disallowed signal family.
 - Killing the daemon at every database/segment fault point reopens to a valid,
   explicitly repaired or blocked state.
 - One thousand concurrent fake acquire/renew/release/subscribe flows pass under
@@ -221,42 +282,50 @@ Implement without Docker or Android dependencies:
 - Unknown policy fields, capability unknowns, conflicting idempotency keys, and
   stale revisions fail deterministically.
 
-## 6. Phase 2: Docker, guest, shim, workspace, and live metrics
+## 6. Phase 2: agent workspace, runner environment, and live metrics
 
 Implement:
 
 - authenticated `worldd` to `world-node` protocol;
 - Docker Engine probe and version negotiation;
-- hardened container plan and inspection reconciliation;
-- per-lease cgroup parent, hard limits, raw cgroup metrics, PSI triggers, Docker
-  events/stats, and host metrics;
+- hardened agent-container plan and inspection reconciliation;
+- per-lease aggregate plus agent/observer leaf cgroups, hard limits, raw
+  cgroup metrics, PSI triggers, Docker events/stats, and host metrics;
 - scoped content cache population, canonical read-only view construction,
   reference pins, bounded TTL/LRU collection, and startup reconciliation;
 - OverlayFS prepare/mount/diff/seal/unmount with descriptor-safe exports;
 - `world-guest` PID 1, process-group supervision, and guest heartbeat;
-- framed exec transport and lease-specific `worldexec` descriptors;
-- baseline process/file/network-flow collectors and collector health;
+- framed exec transport and the lease-bound `agentrunner.ExecutionEnvironment`
+  adapter, including executable identity and temporary-input materialization;
+- agent process/file/network-flow collectors and collector health;
+- current-state snapshot plus resumable event/metric fan-out, `worldctl watch`,
+  `worldctl top`, and `world-observe snapshot|watch|top` clients;
 - a policy-bounded, non-blocking raw exec-stream tee plus lease-scoped
-  `world-observe` and append-only `world-export` guest helpers; and
-- cleanup/reconciliation after node, Docker daemon, guest, shim, or container
-  failure.
+  `world-observe`, scoped `world-target`, named append-only `world-capture
+  request`, and append-only `world-export` guest helpers; and
+- cleanup/reconciliation after node, Docker daemon, guest, exec transport, or agent
+  container failure.
 
 The vertical slice uses a fake `MaterialAuthority` first, followed immediately
 by the real adapter in phase 3.
 
 ### Phase 2 exit gate
 
-- The runner-bridge spike becomes a permanent end-to-end test.
+- The runner execution-environment spike becomes a permanent end-to-end test.
 - A malicious tool cannot see host paths, Docker socket, host processes,
   management credentials, node cache, excluded artifacts, another input view,
-  another lease, or another network namespace.
+  another lease, target runtime authority, raw ADB, or another network namespace.
 - Exact views are reused, overlapping views do not duplicate their full physical
-  data allocation, and each generation still has an independent writable upper.
-- Cancellation and every abnormal shim disconnect eliminate the remote process
-  tree within the selected bound or destroy the container and report failure.
-- Live metrics include host, lease aggregate, container, and selected process;
-  forced CPU throttling, pids exhaustion, memory high, OOM, and I/O pressure are
-  correctly distinguished.
+  data allocation, and each agent generation still has an independent writable
+  upper.
+- Cancellation and every abnormal execution-transport disconnect eliminate the
+  remote process tree within the selected bound or destroy the container and
+  report failure.
+- Live metrics separately attribute host, lease aggregate, agent workspace,
+  observers, and selected processes; forced CPU throttling, pids exhaustion,
+  memory high, OOM, and I/O pressure are correctly distinguished.
+- Snapshot-then-stream reconnect has no silent interval. Unsupported, stale,
+  lost, and zero-valued signals remain distinguishable in clients and exports.
 - Slow/disconnected observation consumers neither block the provider nor lose
   unreported data; gap records are correct.
 - Teardown leak checks find zero remaining processes, containers, mounts,
@@ -269,12 +338,12 @@ Implement the first-party adapter at the repository edge. Map:
 - qualified input occurrences or a frozen selection to a canonical
   `InputViewManifest`, then stream only cache misses through public object
   readers;
-- world generation/exec to one forensic session/activity;
+- agent generation/exec and target generation/run to linked forensic activities;
 - execution image/tool/policy/capability/host descriptors to allowlisted
   provenance fields;
-- declared outputs, stdout, stderr, incidents, change manifests, ledger
-  segments, pcaps, traces, profiles, screenshots, and tombstones to named output
-  roles; and
+- declared outputs, stdout, stderr, incidents, agent and target change
+  manifests, observation bundles, ledger segments, pcaps, traces, profiles,
+  screenshots, and tombstones to named output roles; and
 - artifact acknowledgements to safe local-retention cleanup.
 
 The adapter must stage outputs, seal workspace revision, import from open file
@@ -288,7 +357,8 @@ transaction through an explicit reconciliation state.
 - Each unique selected digest is fetched and verified once per cache scope;
   repeated and overlapping selections reuse it without exposing unselected
   occurrence metadata.
-- Every captured occurrence traces to the world activity and original inputs.
+- Every captured occurrence traces to the agent exec or target run and original
+  inputs; derived summaries cite their raw event ranges and artifacts.
 - Kill injection before/after every staging, hash, artifact import, ledger
   reference, acknowledgement, and cleanup point leaves either a reconciled
   capture or an explicit incomplete export—never an unreferenced success.
@@ -297,64 +367,101 @@ transaction through an explicit reconciliation state.
 - Replaying the same export idempotency key returns the same occurrences;
   changed path/role/hash conflicts.
 
-## 8. Phase 4: Android emulator driver
+## 8. Phase 4: visibility-first Linux target driver
 
 Implement:
 
-- emulator/system-image/AVD/snapshot capability fingerprints;
-- collision-free port/data-directory allocation and lease cgroup placement;
-- headless boot, multi-signal readiness, health, graceful stop, forced stop,
-  destruction, and reconciliation;
-- immutable baseline snapshots, explicit save/load, invalidation detection,
-  cold boot, and generation rollover;
-- ADB state, build fingerprint, boot properties, logcat, battery/thermal/disk,
-  emulator stderr, screenshot, packet ring, and bounded crash evidence;
-- Android crash/ANR/system-restart classification distinct from emulator death;
-  and
-- optional Perfetto capture within policy.
+- Linux target templates, image/runtime/capability fingerprints, independent
+  target generations, and bounded target-run state machines;
+- sibling OCI/runc containers with dedicated cgroup/network/mount namespaces,
+  exact specimen/fixture materialization, target-private writable layers, and no
+  agent workspace or management-authority mount;
+- arbitrary direct-argv and explicit-shell streams, target-relative push/pull,
+  scoped network endpoints, run stop, health, reset, destroy, and startup
+  reconciliation;
+- one selected open-source eBPF adapter—Tracee or Inspektor Gadget—with required
+  process/syscall/file/network metadata, early-start ordering, container/run
+  attribution, coverage, drop counters, and versioned raw output;
+- bounded packet rings, protocol summaries, cgroup/process metrics, stdout/
+  stderr, authoritative filesystem changes, and crash/OOM evidence;
+- deterministic normalization and observation-bundle finalization with raw refs,
+  coverage/gaps, changes, incidents, and a cited derived summary; and
+- optional gVisor/Kata profiles that publish their reduced or guest-provided
+  visibility rather than claiming parity with host eBPF.
 
 ### Phase 4 exit gate
 
-- Parallel emulators never collide on ports, AVD state, snapshots, cgroups, or
-  observation attribution.
-- Killing at every boot/snapshot/capture transition produces a visible incident
-  and a cleanly linked next generation or quarantine.
-- Restoring a snapshot cannot reuse the failed clock-sync epoch or exec.
-- Deliberate app Java crash, native crash, ANR, Android reboot, ADB offline, QEMU
-  kill, disk full, and host OOM are classified correctly.
-- Live host/container/emulator/Android performance streams can be viewed on one
-  uncertain-but-honest timeline with collector gaps visible.
+- A target cannot read the agent workspace, provider credentials, Docker socket,
+  control plane, cache, or another target. Arbitrary in-target commands cannot
+  escape their lease/target/run transport scope or acquire infrastructure
+  authority.
+- Installing packages and debugging tools, pushing a newly built binary,
+  opening an interactive shell, and launching multiple processes work without
+  adding command-specific API operations. Each action is attributed to a
+  `TargetOperationID` and appears in the observation bundle.
+- The permanent vertical slice proves a target can fail, finalize evidence,
+  reset to a new target generation, and rerun while the same agent workspace and
+  provider session continue.
+- Fork/exec, representative syscall results, file open/read/write/mutation, DNS/
+  connect, packet, exit/signal, OOM, and filesystem changes are attributed to the
+  correct target run with documented completeness and latency.
+- Collector startup races, overload, kill, target crash, daemon restart, and
+  disk full create explicit coverage transitions or gaps and never false
+  completeness.
+- Each successful or failed run produces exactly one idempotently finalized
+  observation bundle whose summary can be regenerated from retained evidence.
 
-## 9. Phase 5: physical-device inventory and lease driver
+## 9. Phase 5: instrumented Android target driver
 
 Implement:
 
-- durable device inventory, build/authorization/capability history, operator
-  labels, battery/thermal/health, and exclusive reservation;
+- the selected Cuttlefish/Android Emulator backend, instrumented AOSP image,
+  runtime/system-image/device/snapshot capability fingerprints, and independent
+  target generations;
+- collision-free endpoint/state allocation, virtual-device leaf-cgroup
+  placement, headless boot, multi-signal readiness, health, stop, reset,
+  destruction, and reconciliation;
 - scoped ADB gateway with one-serial visibility and policy-recorded services;
-- USB/network reconnect, gateway restart, reboot, app reset/reinstall/fixture,
-  lease release, and manual reconditioning workflows;
-- quarantine triggers and operator acknowledgement; and
-- permitted logcat/Perfetto/bugreport/screenshot/Frida capabilities without
-  claiming completeness on production builds.
+- arbitrary assigned-device ADB services, including shell, sync, install,
+  forward/reverse, root/remount, reboot, and agent-managed Frida installation;
+- APK/fixture materialization, target-relative transfers, target-run
+  finalization, and intervention manifests;
+- pinned logcat/dumpsys/Perfetto/packet/screenshot/tombstone/ANR collectors plus
+  host runtime and selected-app metrics;
+- Frida Java/native hooks for app-process intent APIs, file, socket, crypto, and
+  selected security-relevant behavior with precise attached-process coverage;
+- optional custom-framework intent/Binder observation in the AOSP image with a
+  distinct `android.intent.framework` capability;
+- MobSF external static/dynamic adapter with license, provenance, and result
+  mapping; and
+- Android-specific normalization and observation-bundle summaries.
 
 ### Phase 5 exit gate
 
-- One lease cannot list, select, forward to, or otherwise affect another phone.
-- Unplug/replug, unauthorized, offline, reboot, low battery, thermal critical,
-  changed build, failed app cleanup, and proxy crash all have tested outcomes.
-- No automated path returns an uncertain device to the clean pool.
-- Hardware-lab tests preserve unrelated devices and run with explicit operator
-  opt-in for destructive app/device reset operations.
+- Parallel devices never collide on endpoints, writable state, snapshots,
+  cgroups, ADB identities, or observation attribution.
+- One lease cannot list, select, forward to, or otherwise affect another device.
+- An ordinary ADB client can perform arbitrary services against its one assigned
+  rooted/debuggable emulator, including installing and replacing Frida server,
+  without per-command approval or access to the host ADB server.
+- Deliberate Java/native crash, ANR, Android reboot, ADB offline, runtime kill,
+  disk full, collector loss, and host OOM have distinct tested outcomes and
+  sealed observation bundles.
+- App-API intent hooks and framework intent coverage pass different fixtures and
+  are never reported as interchangeable.
+- Reset advances only target generation; the same agent workspace can compare
+  multiple clean Android runs and query their separate bundles.
+- Known CPU/memory/I/O, Binder, intent, file, and network workloads are
+  attributed within documented completeness, accuracy, latency, and overhead.
 
 ## 10. Phase 6: advanced observers and feedback
 
 Add each observer as an independent driver only after its contract and teardown
 test exist:
 
-- eBPF process/syscall/file/network probes with ring-loss counters;
+- additional eBPF gadgets/events beyond the required Linux metadata profile;
 - targeted `strace` process-tree capture;
-- bounded tcpdump/tshark packet rings and finalization;
+- deeper Zeek analysis and packet-payload extraction beyond the required ring;
 - mitmproxy explicit/transparent capture with CA and sensitive-payload policy;
 - Android/Linux Perfetto configuration and query summaries;
 - Frida injected/server/gadget modes with capability and modification manifest;
@@ -376,15 +483,17 @@ test exist:
 
 Implement:
 
-- rootless and gVisor production profiles where phase 0 proves compatibility;
+- rootless agent-workspace and optional gVisor/Kata target profiles where phase
+  0 proves compatibility and their visibility contract is explicit;
 - signed/pinned images and policy distribution;
 - node registration, drain, maintenance, quarantine, upgrade, and version skew;
 - backup/snapshot/restore and migration for world state and unfinalized segments;
 - dashboards and alerts derived from the same public observation schema;
 - capacity benchmarks, warm-pool policy, fairness, and starvation prevention;
-- scheduled chaos and hardware-lab suites; and
-- operator runbooks for leaked mounts, Docker loss, corrupt AVD/snapshot,
-  quarantined phone, artifact outage, disk pressure, and state reconciliation.
+- scheduled chaos and KVM Android suites; and
+- operator runbooks for leaked mounts, Docker loss, corrupt target state,
+  observation-bundle finalization, artifact outage, disk pressure, and state
+  reconciliation.
 
 ### Phase 7 exit gate
 
@@ -399,16 +508,15 @@ mount/export path, observer privileges, policy compiler, and artifact adapter.
 | Class | Required evidence |
 | --- | --- |
 | unit | invariants, transitions, policy, resource math, error mapping, event conversion |
-| model/property | state-machine sequences, admission fairness, cache pin/GC safety, change-set algebra, replay equivalence |
-| fuzz | policy YAML, protobuf frames, Docker/ADB/emulator events, paths, input/change manifests, ledger recovery |
+| model/property | independent agent/target state sequences, admission fairness, cache pin/GC safety, change/bundle algebra, replay equivalence |
+| fuzz | policy YAML, protobuf frames, Docker/ADB/Android/collector events, paths, input/change/bundle manifests, ledger recovery |
 | race/stress | concurrent leases, subscriptions, collectors, exports, driver reconciliation |
-| contract | every fake and real driver passes one behavior suite |
-| security | escape corpus, confused deputy, path race, cross-lease/device access, secret/sensitivity leaks |
+| contract | every fake and real driver passes one behavior suite; runner host/default and world environment produce equivalent provider outcomes |
+| security | agent-target separation, escape corpus, confused deputy, path race, cross-lease/target access, secret/sensitivity leaks |
 | fault injection | process kill, error, delay, partial I/O, disk full, OOM, clock jump at each named boundary |
 | integration | real Docker, OverlayFS, cgroup v2, PSI, namespace, eBPF, artifact store |
-| emulator | KVM boot/snapshot/crash/ADB/logcat/Perfetto/network behavior |
-| hardware | physical-device reservation, scoping, reconnect, reboot, cleanup, quarantine |
-| performance | physical cache/view allocation, proxy latency/throughput, collector overhead, event rate, sealing cost, admission response |
+| Android | KVM boot/reset/crash/ADB/logcat/Perfetto/Frida/intent/network behavior |
+| performance | metric accuracy/delivery latency, syscall/file/network completeness, subject attribution, cache/view allocation, proxy throughput, collector overhead, bundle sealing, admission response |
 | chaos/soak | multi-day mixed workloads, random daemon/runtime/device failures, pressure oscillation |
 | compatibility | recorded Engine/emulator/ADB/event fixtures and supported schema migrations |
 
@@ -424,22 +532,26 @@ At minimum inject immediately before and after:
   pin/release, and garbage collection;
 - upper/work creation and OverlayFS mount/bind;
 - cgroup creation and limit application;
-- Docker create/start and guest handshake;
+- agent Docker create/start and guest handshake;
+- target create, materialization, collector readiness, run start/stop, target
+  change sealing, observation-bundle normalization/summary, reset, and destroy;
 - each observer start and readiness acknowledgement;
+- metric collection, snapshot reduction, segment publication, subscriber
+  fan-out, cursor handoff, staleness transition, and gap publication;
 - exec acceptance, process spawn, stream attach, terminal record, and cleanup;
-- emulator data clone, port reservation, boot, ADB readiness, snapshot save/load;
+- Android state clone, endpoint reservation, boot, ADB readiness, reset/restore;
 - observation frame write, rotation, sync, index, and artifact finalization;
 - workspace freeze, diff, file open, hash, staging copy, artifact import, and ack;
-- incident acceptance, minimum evidence, publish, recovery decision, and
-  generation creation; and
-- unmount, container/device release, cgroup removal, and local deletion.
+- incident acceptance, minimum evidence, publish, recovery decision, and the
+  correct independent generation creation; and
+- unmount, agent/target release, cgroup removal, and local deletion.
 
 The test harness kills whole processes, not only returns injected errors, to
 exercise actual recovery.
 
 ### 12.3 Security escape corpus
 
-Run a deliberately malicious container that attempts:
+Run deliberately malicious agent and target containers that attempt:
 
 - `/proc`, `/sys`, host PID, namespace, cgroup, kernel-log, and device access;
 - Docker/containerd sockets and common credential/config paths;
@@ -450,11 +562,20 @@ Run a deliberately malicious container that attempts:
   output floods;
 - direct cache-path guessing, cross-view enumeration, excluded-entry access,
   cache-key collision, and malformed or inconsistent input manifests;
+- target access to agent workspace files/credentials and agent attempts to mount
+  its workspace into a target or turn scoped push/pull into host-path access;
 - cross-lease IP/Unix-socket access and management API guessing;
-- access to another emulator/phone serial or the raw host ADB server;
+- cross-lease live queries, forged observation filters, capture-profile argument
+  injection, and attempts to stop or reconfigure required collectors;
+- access to another target/Android serial or the raw host ADB server;
 - fork bombs, descriptor exhaustion, disk/inode exhaustion, memory bombs, CPU
   spin, and packet floods; and
 - instrumentation disable/evasion and malformed collector output.
+
+The same suite positively proves that command scoping is not a semantic
+allowlist: arbitrary shell/argv, pushed binaries, package installation, ADB
+shell/sync/install/forward/reverse/reboot, and Frida replacement succeed inside
+the assigned disposable target and receive correct operation attribution.
 
 The suite proves the boundary remains intact and that the attempt itself is
 visible. It does not claim immunity to unknown host-kernel/runtime exploits;
@@ -467,14 +588,14 @@ those motivate the stronger isolation tier and node containment.
 - Linux integration: real Docker and unprivileged behaviors on every merge.
 - Privileged disposable VM: OverlayFS, cgroups, PSI, namespaces, eBPF, security
   corpus, and forced host-level failures.
-- KVM runner: emulator boot/snapshot/crash suite.
-- Hardware lab: scheduled and explicit physical-device suite.
-- Nightly: race, extended fuzz, gVisor/rootless matrix, compatibility fixtures.
+- KVM runner: Cuttlefish/emulator boot/reset/crash/collector suite.
+- Nightly: race, extended fuzz, Tracee/Inspektor Gadget compatibility fixtures,
+  and gVisor/Kata visibility matrix.
 - Weekly: chaos/soak, high-rate telemetry, pressure/fairness, and disaster
   recovery.
 
-No developer laptop or shared CI host should run destructive pressure, raw USB,
-or privileged escape tests directly; use disposable dedicated nodes.
+No developer laptop or shared CI host should run destructive pressure or
+privileged escape tests directly; use disposable dedicated nodes.
 
 ## 13. Provisional performance budgets
 
@@ -482,16 +603,25 @@ Phase 0 must validate or revise these before they become acceptance criteria:
 
 - local control API p95 below 50 ms for non-provisioning operations at 100
   concurrent clients;
-- shim added p99 stream latency below 10 ms for 4 KiB frames on one node and no
-  stdout/stderr corruption at 50 MiB/s aggregate;
+- execution-environment transport adds p99 stream latency below 10 ms for 4 KiB
+  frames on one node and no stdout/stderr corruption at 50 MiB/s aggregate;
 - normal metric interval 2 seconds, incident interval 250 ms for a bounded
   window, and PSI threshold reaction within one configured kernel window plus
   250 ms control latency;
 - baseline observation below 3% CPU and 128 MiB manager memory per active lease
   at the representative workload event rate, with host-global observer cost
   reported separately;
+- normal live samples reach a local subscriber within 500 ms p95 after
+  collection and incident-resolution samples within 100 ms p95, with collection
+  time and delivery delay separately reported;
 - zero dropped control/incident records; every bulk loss produces a gap record
   no later than the current segment rotation;
+- required Linux metadata coverage includes the target process tree and selected
+  syscall/file/network fixture set at a phase-0-measured event rate; any loss is
+  reported before bundle finalization;
+- target-run finalization publishes a queryable bundle within 5 seconds p95 for
+  metadata-only fixtures after workload exit, excluding separately reported
+  artifact-upload latency;
 - confirmed exec cancellation within 5 seconds under a healthy node; otherwise
   container teardown starts immediately and is incident-visible;
 - sealing time scales with changed files/bytes, not the entire immutable lower
@@ -511,13 +641,15 @@ Silent omission is a release blocker.
 | --- | --- |
 | policy field | YAML DTO -> strict validation -> canonical digest -> capability resolution -> effective policy -> runtime/target/workspace/observer plan -> persisted view -> ledger -> incident/export provenance |
 | identity/correlation | API request -> domain command -> state row -> node plan -> guest/observer context -> every event/metric/capture -> artifact activity -> host VR command metadata |
+| agent/target generation | session -> agent workspace or target transition -> node resource -> event envelope -> incident/bundle -> artifact/VR activity, without updating the sibling generation |
+| target run | typed run request -> materialization manifest -> collector plan/readiness -> workload -> raw/normalized events -> coverage/change seal -> observation bundle -> agent/host view |
 | resource request/limit | policy -> admission -> cgroup/emulator/container plan -> metric labels -> pressure decision -> incident feedback -> final activity environment |
-| capability | driver probe -> fingerprint -> policy decision -> public lease view -> downgrade/failure event -> generation provenance |
+| capability | driver probe -> fingerprint -> policy decision -> public lease view -> downgrade/failure event -> affected agent/target generation provenance |
 | input view | artifact selection -> canonical manifest -> cache scope/lookup/population -> read-only view -> pin -> mount -> release/GC -> activity and incident provenance |
 | workspace member | input-view manifest -> lower mount -> mutation event -> sealed change set -> export -> artifact occurrence -> VR activity material |
 | clock information | source collector -> sync epoch -> event envelope -> segment index -> timeline query -> incident window -> captured trace metadata |
 | sensitivity/retention | policy -> collector -> live authorization -> local segment -> OTLP/export filter -> artifact role -> cleanup acknowledgement |
-| failure/recovery | driver fact -> classifier -> incident -> shim outcome -> runner error join -> generation transition -> artifact evidence -> host observation command |
+| failure/recovery | driver fact -> classifier -> incident -> affected exec/run outcome -> correct independent generation transition -> bundle/artifact evidence -> host observation command |
 
 Add automated descriptor/field coverage tests where possible. Generated
 protobuf-to-domain/view adapters use common mapping helpers, and tests fail when
@@ -533,13 +665,16 @@ replacements in development.
 
 ### `go-agent-runner`
 
-No initial change is required. After the shim vertical slice, propose a narrow
-execution-backend interface only if it improves cancellation/incident handling
-without exposing provider adapter internals. Remove the shim path completely if
-that interface replaces it; do not retain two half-supported transports.
+The runner now has the required `ExecutionEnvironment` contract. Its nil value
+is local-host execution. The world adapter uses the same interface for probes
+and attempts, resolves executable identity within the agent workspace,
+transports temporary inputs as bytes, preserves separate ordered streams and
+callback backpressure, and confirms process-tree and temporary-input cleanup.
 
-The runner currently contains source-compatibility deprecation remnants. They
-are unrelated to this project and should not be copied into new APIs.
+Keep provider-specific flag construction, protocol decoding, retries, sessions,
+schema validation, and terminal authority in the runner. Compatibility tests in
+both repositories must pin the shared interface behavior. Do not add a second
+execution path or provider-aware logic to this repository.
 
 ### `go-forensic-artifacts`
 
@@ -557,43 +692,58 @@ translation. Add no direct dependency from world to VR.
 
 ## 16. V1 acceptance criteria
 
-1. One hundred mixed container leases and the configured emulator capacity run
-   concurrently under the race detector and real-node stress without broken
-   state, cross-lease visibility, or unbounded growth.
-2. Provider probes and executions through `worldexec` are byte-for-byte
-   compatible with direct fake-provider execution, including failure and
-   cancellation semantics.
-3. The malicious escape corpus cannot access host management authority,
-   another lease, another input view, another device, the node cache, or the
-   artifact repository.
-4. Different frozen selections expose exactly their authorized entries. Exact
+1. One hundred agent workspaces with mixed Linux target runs and the configured
+   Android capacity run concurrently under the race detector and real-node
+   stress without broken state, cross-lease/target visibility, or unbounded
+   growth.
+2. Provider probes and executions through the world `ExecutionEnvironment` are
+   byte-for-byte compatible with the runner's host default, including remote
+   temporary inputs, executable-generation invalidation, failure, limits,
+   cancellation, and cleanup semantics.
+3. The malicious escape corpus cannot access host management authority, another
+   lease, another input view, another target, the node cache, artifact
+   repository, or agent workspace from a target. The agent cannot obtain the
+   Docker socket, raw ADB authority, or privileged collector control.
+4. Inside its assigned target, the agent can execute arbitrary Linux commands,
+   transfer arbitrary workspace-visible tools, and use arbitrary device-scoped
+   ADB services—including Frida installation—without semantic approval. These
+   actions cannot select another target or host service and are recorded with
+   operation and intervention provenance.
+5. Different frozen selections expose exactly their authorized entries. Exact
    views are reused; overlapping views share physical content allocation; and
    release, crash reconciliation, and bounded GC leave neither deleted live
    inputs nor unbounded abandoned copies.
-5. Every workspace change is represented as added/modified/deleted/renamed/
-   metadata/opaque state; every exported byte is safely opened, hashed, and
-   traceable to immutable inputs and one execution.
-6. Killing each component at every named fault boundary never yields a false
+6. Agent and target changes are represented separately as added/modified/
+   deleted/renamed/metadata/opaque state; every exported or automatically
+   captured byte is safely opened, hashed, and traceable to immutable inputs and
+   one agent exec or target run.
+7. Killing each component at every named fault boundary never yields a false
    success, hidden crash, silently reused generation, or committed reference to
    missing bytes.
-7. Container OOM, process crash, emulator death, Android app crash/ANR, ADB
-   loss, physical-device disconnect, host pressure eviction, collector loss,
-   and workspace integrity failure are distinguishable and evidence-backed.
-8. Snapshot restore/cold boot always creates a new generation. Physical-device
-   incomplete reset always quarantines.
-9. Live activity and performance subscriptions are resumable; slow consumers
-   cannot stall work; every loss/compaction is explicit.
-10. Admission prevents configured control-plane reserve exhaustion, and pressure
+8. Agent workspace failure, target process exit, Linux target OOM/failure,
+   Android runtime death, Android app crash/ANR, ADB loss, host pressure
+   eviction, collector loss, and workspace integrity failure are distinguishable
+   and evidence-backed.
+9. Target reset/restore/cold boot always creates a new `TargetGeneration`
+   without changing a healthy `AgentGeneration`. A failed agent workspace
+   creates a new agent generation without rewriting target history.
+10. Live snapshots and activity/performance subscriptions separately attribute
+   agent workspace, Linux target/run, Android host/guest/app, observer, and
+   selected-process work. They are resumable; slow consumers cannot stall work;
+   every stale, unsupported, lost, or compacted interval is explicit.
+11. Admission prevents configured control-plane reserve exhaustion, and pressure
    shedding follows priority/preemptibility policy with a durable rationale.
-11. Every injected observer has bounded resource use, sensitivity metadata,
-    output provenance, gap reporting, and verified teardown.
-12. Ledger replay after random process termination matches materialized state or
+12. Every target run produces exactly one idempotently finalized observation
+    bundle with native/raw refs, normalized events, target changes, coverage and
+    gaps, incidents, and a reproducible cited summary. Every observer has bounded
+    resource use, sensitivity metadata, provenance, and verified teardown.
+13. Ledger replay after random process termination matches materialized state or
     stops with a precise, recoverable inconsistency; it never repairs
     destructively without an explicit action.
-13. A full end-to-end run can be recorded as a forensic activity and then as a
+14. A full end-to-end run can be recorded as a forensic activity and then as a
     VR activity/observation by the host, preserving shared correlation and
     causation IDs.
-14. `make verify` (or the final cross-platform equivalent) is the single
+15. `make verify` (or the final cross-platform equivalent) is the single
     non-interactive verification entry point and emits machine-readable test,
     race, fuzz, security, integration, and benchmark summaries.
 
@@ -602,16 +752,24 @@ translation. Add no direct dependency from world to VR.
 The architecture recommends a direction but requires evidence for these exact
 choices:
 
-- rootless Docker as the standard profile versus userns-remapped rootful Docker
-  where dedicated OverlayFS/cgroup control needs privilege;
+- rootless Docker versus userns-remapped rootful Docker for the agent workspace,
+  and the exact hardened runc profile for visibility-first Linux targets;
 - whether `world-node` owns a tiny separate mount helper or keeps mount/open
   operations in its already trusted process;
 - the production reflink-capable backing filesystem, cache integrity mode,
   security-scope defaults, high/low watermarks, and whether high view
   cardinality warrants packed immutable images;
-- gVisor compatibility/performance for the common agent toolchain and which
-  observer features become unavailable;
-- the scoped ADB proxy implementation and smallest safe service set;
+- Tracee versus Inspektor Gadget for the required Linux metadata contract,
+  including license, embedding/process boundary, startup races, completeness,
+  schema stability, drop accounting, and overhead;
+- gVisor/Kata compatibility/performance and the exact target visibility lost or
+  replaced by in-guest collection;
+- Cuttlefish versus Android Emulator for scale, reset, snapshot, instrumentation,
+  and operational behavior, plus whether framework-level intent coverage
+  requires a maintained custom AOSP image;
+- the scoped ADB proxy implementation, protocol-validation strategy, and exact
+  host-global/cross-serial deny boundary while preserving arbitrary assigned-
+  device services;
 - the exact protobuf segment framing/compression and local segment size;
 - safe provider credential delivery that supports each CLI without mounting a
   general host home directory;
@@ -622,5 +780,5 @@ choices:
   screenshots, memory, and device identifiers.
 
 These choices can alter driver implementations and deployment profiles. They do
-not alter the lease, generation, explicit-incident, safe-export, or causal-ledger
-invariants.
+not alter agent/target separation, independent generations, required visibility,
+observation-bundle, explicit-incident, safe-export, or causal-ledger invariants.

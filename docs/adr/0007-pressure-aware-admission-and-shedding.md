@@ -13,16 +13,17 @@ thrashing. Waiting for OOM can lose evidence and the control plane itself.
 ## Decision
 
 Each lease declares requests, hard limits, priority, preemptibility, TTL, and
-observer/capture cost. The container and emulator host process share an
-aggregate lease cgroup parent. Admission uses allocatable resources, current and
-trending host/per-cgroup PSI, disk bytes/inodes, devices, snapshot headroom,
-warm-pool cost, and a reserved control-plane margin.
+observer/capture cost. The agent workspace, Linux targets, Android host
+processes, and observers have separate cgroup leaves under an aggregate lease
+parent. Admission uses allocatable resources, current and trending
+host/per-cgroup PSI, disk bytes/inodes, devices, snapshot headroom, warm-pool
+cost, and a reserved control-plane margin.
 
 Pressure actions escalate in a fixed, logged order: raise observation, stop
 admission, expire unused reservations, shrink unleased warm pools, quiesce idle
-preemptible work, then revoke active preemptible work only if necessary to
-protect the host. Active work is not silently paused. Revocation fails its exec
-and creates a `resource_eviction` incident.
+preemptible targets, then revoke active target runs before agent workspaces when
+priority permits. Active work is not silently paused. Revocation fails and
+finalizes the affected run or exec and creates a `resource_eviction` incident.
 
 Hard cgroup CPU/memory/I/O/pids limits remain the containment boundary. OOM,
 throttling, `memory.events`, pids events, and PSI are preserved so a job-limit

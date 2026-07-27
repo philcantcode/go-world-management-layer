@@ -14,24 +14,37 @@ isolation.
 
 ## Decision
 
-Use three observation levels:
+Target visibility is preferred over selecting a stronger but opaque isolation
+runtime. Use three cumulative observation levels:
 
-1. Always-on baseline: lifecycle, Docker events/stats, cgroup/PSI metrics,
-   process lifecycle, workspace mutations, network-flow metadata, ADB state,
-   permitted Android logs, and collector health.
-2. Policy triggers: temporarily increase metric resolution or start bounded
-   captures when a defined event/threshold occurs.
-3. Authorized on-demand: a host or agent requests a named collector within the
-   immutable effective policy's maximum powers.
+1. Required metadata baseline: lifecycle, Docker events/stats, cgroup/PSI,
+   separately attributed agent/target/emulator/observer metrics, process and
+   syscall results, file-open/read/write metadata, authoritative target changes,
+   network-flow metadata, ADB state, permitted Android logs, Android health, and
+   collector coverage.
+2. Deep observation: policy triggers or named requests start bounded broader
+   syscall arguments, packet rings, Perfetto/ftrace, Frida hooks, or state
+   snapshots.
+3. Payload observation: explicitly filtered file/socket buffers, decrypted
+   traffic, memory, or screens within strict sensitivity, duration, and byte
+   limits.
 
 `strace`, packet payloads, mitmproxy, Perfetto, Frida, screen recording, and
 profiles are never invisible defaults. Each activation records an injection
 manifest, version/configuration digest, privileges, expected and measured
 overhead, sensitivity, outputs, and verified teardown.
 
-Collector failure and ring-buffer loss are observable. If a collector is marked
-required, its failure fails or quarantines the generation according to policy;
-otherwise the generation records an explicit downgrade/gap.
+These rules govern host-managed collectors and coverage claims. ADR 0010 also
+allows the agent to install arbitrary instrumentation inside its assigned
+target. That tooling is recorded as an agent intervention and never becomes
+coverage authority merely because it produced output.
+
+Collector placement is recorded as host, runtime, guest, or injected app.
+Collector failure and ring-buffer loss are observable. If required coverage
+cannot start or is lost, admission or the target run fails according to policy;
+otherwise the run records an explicit downgrade/gap. Every finalized target run
+produces an observation bundle containing raw references, normalized events,
+coverage, changes, and a derived summary.
 
 ## Consequences
 

@@ -1,4 +1,4 @@
-# ADR 0008: Keep emulator and physical-device recovery guarantees distinct
+# ADR 0008: Keep virtual- and physical-device recovery guarantees distinct
 
 - Status: proposed
 - Date: 2026-07-24
@@ -13,13 +13,20 @@ state constraints and generally cannot provide a complete snapshot rollback.
 
 ## Decision
 
-Implement one capability-aware `TargetDriver` contract with distinct emulator
-and physical-device adapters.
+Implement one capability-aware `TargetDriver` contract. V1 implements the
+Android virtual-device adapter; a physical-device adapter is future scope and
+must not weaken the contract when introduced.
 
-Emulator recovery may load a validated immutable baseline snapshot or cold boot
-an isolated AVD clone. Either action starts a new environment generation after
-incident evidence capture. Snapshot validity is bound to emulator version,
-system image, AVD configuration, and features.
+Both device kinds use ADR 0010's scoped ADB contract: an ordinary ADB-compatible
+endpoint exposes exactly one assigned serial and forwards arbitrary device-
+scoped services while rejecting host-server control and all other transports.
+This interaction contract is common; reset and cleanliness guarantees are not.
+
+Virtual-device recovery may load a validated immutable baseline snapshot,
+powerwash a Cuttlefish device, or cold boot isolated state. Each action starts a
+new target generation after incident evidence capture without changing a
+healthy agent generation. Snapshot validity is bound to runtime version, system
+image, device configuration, and features.
 
 Physical devices are exclusively reserved and reached through a scoped ADB
 gateway that exposes only the assigned serial. Raw USB and the host ADB server
@@ -35,14 +42,15 @@ reset.
   differences.
 - Physical-device pools require operator workflows, inventory history, battery/
   thermal controls, and quarantine capacity.
-- Tests need fake devices plus dedicated hardware-lab scenarios; emulator tests
-  are not evidence for phone recovery.
+- A future physical-device implementation requires fake-device contract tests
+  plus dedicated hardware-lab scenarios; virtual-device tests are not evidence
+  for phone recovery.
 
 ## Rejected alternatives
 
 - Treat a reboot or `pm clear` as a phone snapshot restore: it does not reset the
   whole device.
-- Give the container raw USB: exposes all devices and a large host attack
+- Give the agent workspace raw USB: exposes all devices and a large host attack
   surface.
 - Use one host ADB server directly: ordinary device listing/selection can reveal
   or target phones outside the lease.

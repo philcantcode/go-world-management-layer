@@ -1,9 +1,9 @@
 # Proposed policy syntax. This file documents the contract; no parser exists yet.
 apiVersion: world.philcantcode.dev/v1alpha1
-kind: EnvironmentPolicy
+kind: ResearchSessionPolicy
 metadata:
-  name: android-vr-hostile
-  revision: 1
+  name: mixed-vr-visibility-first
+  revision: 3
 
 spec:
   lease:
@@ -12,36 +12,36 @@ spec:
     preemptible: true
     quiesceDeadline: 30s
 
-  runtime:
-    driver: docker
-    image: registry.example/vr-agent@sha256:replace-with-pinned-digest
-    isolationTier: standard
-    rootFilesystem: readOnly
-    user: "10000:10000"
-    capabilities:
-      drop: [ALL]
-      add: []
-    noNewPrivileges: true
-    seccompProfile: vr-agent-v1
+  agentWorkspace:
+    runtime:
+      driver: docker
+      image: registry.example/vr-agent@sha256:replace-with-pinned-digest
+      isolationProfile: agent-standard
+      rootFilesystem: readOnly
+      user: "10000:10000"
+      capabilities:
+        drop: [ALL]
+        add: []
+      noNewPrivileges: true
+      seccompProfile: vr-agent-v1
     network:
       mode: restricted-egress
       allowDNS: true
       allowedCIDRs: []
       allowedDomains: []
       denyPrivateRanges: true
-
-  resources:
-    requests:
-      cpu: "2"
-      memory: 4Gi
-      workspace: 20Gi
-    limits:
-      cpu: "4"
-      memory: 8Gi
-      swap: 0B
-      pids: 2048
-      workspace: 40Gi
-      captureBytes: 10Gi
+      targetAccess: scoped-gateway-and-declared-endpoints
+    resources:
+      requests:
+        cpu: "2"
+        memory: 4Gi
+        workspace: 20Gi
+      limits:
+        cpu: "4"
+        memory: 8Gi
+        swap: 0B
+        pids: 2048
+        workspace: 40Gi
 
   workspace:
     mode: overlayfs
@@ -67,42 +67,199 @@ spec:
       maxBytes: 20Gi
       retainFullChangeManifest: true
 
-  target:
-    kind: android-emulator
-    emulator:
-      avdProfile: pixel-api-35-vr
-      systemImageDigest: sha256:replace-with-system-image-digest
-      baselineSnapshot: clean-v1
-      requireHardwareAcceleration: true
-      headless: true
-      memory: 4Gi
-      bootTimeout: 3m
-      restoreOnEnvironmentFailure: explicit-new-generation
+  targets:
+    maxConcurrent: 2
+    materialTransfer:
+      source: declared-artifact-occurrences
+      agentWorkspacePush: allowed-beneath-workspace-recorded
+      maxTransferBytesPerRun: 4Gi
+      verifyBeforeRun: true
+    templates:
+      - name: linux-binary-visible
+        kind: linux-container
+        runtime:
+          driver: docker
+          runtime: runc
+          image: registry.example/linux-target@sha256:replace-with-pinned-digest
+          isolationProfile: observable-container
+          baseImage: readOnly
+          user: "20000:20000"
+          capabilities:
+            drop: [ALL]
+            add: []
+          noNewPrivileges: true
+          seccompProfile: observed-target-v1
+        material:
+          mountPoint: /target/input
+          writableState: private-overlay
+        interaction:
+          commandAuthority: arbitrary-inside-assigned-target
+          execTransport: direct-argv-and-explicit-shell
+          fileTransfer: push-pull-target-relative
+          networkEndpoints: policy-declared
+          deniedInfrastructureAuthority:
+            - host-exec
+            - docker-api
+            - host-mounts
+            - other-targets
+        resources:
+          limits:
+            cpu: "2"
+            memory: 2Gi
+            swap: 0B
+            pids: 1024
+            writableState: 10Gi
+        reset:
+          afterEveryRun: true
+          mode: recreate-new-target-generation
+
+      - name: android-apk-visible
+        kind: android-virtual-device
+        runtime:
+          driver: cuttlefish
+          systemImageDigest: sha256:replace-with-instrumented-aosp-digest
+          isolationProfile: instrumented-android
+          baselineState: clean-v1
+          requireHardwareAcceleration: true
+          headless: true
+          rooted: true
+          debuggable: true
+          bootTimeout: 3m
+        interaction:
+          commandAuthority: arbitrary-inside-assigned-device
+          adb: scoped-gateway
+          deviceScopedADBServices: arbitrary
+          fileTransfer: adb-sync-and-scoped-stream
+          deniedInfrastructureAuthority:
+            - host-adb-server-control
+            - other-serials
+            - raw-usb
+            - host-exec
+        resources:
+          limits:
+            cpu: "4"
+            memory: 6Gi
+            writableState: 16Gi
+        reset:
+          afterEveryRun: true
+          mode: baseline-new-target-generation
+
+  resources:
+    aggregateLimits:
+      cpu: "10"
+      memory: 18Gi
+      captureBytes: 10Gi
 
   observation:
+    priority: visibility-first
+    requiredCoverage:
+      linux-container:
+        - process-tree
+        - syscall-results
+        - file-io-metadata
+        - filesystem-change-manifest
+        - network-flows
+        - packet-ring
+      android-virtual-device:
+        - package-process-activity-lifecycle
+        - android-logcat
+        - android-perfetto-ring
+        - app-api-intents
+        - network-flows
+        - packet-ring
+        - filesystem-change-manifest
+    profiles:
+      default: metadata
+      metadata:
+        capturePayloads: false
+        fileEvents: [open, read, write, rename, unlink]
+        syscallArguments: selected-safe
+      deep:
+        maxDuration: 10m
+        maxBytes: 4Gi
+      payload:
+        enabled: authorized-on-demand
+        requireProcessOrPathFilter: true
+        maxDuration: 5m
+        maxBytes: 1Gi
+        sensitivity: restricted
     baseline:
       - world-lifecycle
       - docker-events
       - cgroup-metrics
       - host-pressure
       - input-view-cache
-      - process-lifecycle
-      - workspace-mutations
-      - network-flows
-      - adb-state
+      - agent-process-lifecycle
+      - target-process-lifecycle
+      - target-syscall-metadata
+      - target-file-io-metadata
+      - target-filesystem-changes
+      - target-network-flows
+      - target-packet-ring
+      - android-runtime-metrics
+      - android-process-metrics
+      - android-package-activity-lifecycle
+      - android-app-api-intents
       - android-logcat
+      - android-perfetto-ring
+      - collector-health
+    collectors:
+      linuxMetadata:
+        adapter: phase-0-selected-tracee-or-inspektor-gadget
+        placement: host
+        failRunOnCoverageLoss: true
+      androidSystem:
+        adapters: [perfetto, logcat, dumpsys]
+        placement: guest
+        failRunOnCoverageLoss: true
+      androidAppHooks:
+        adapter: frida
+        placement: injected-app
+        coverage: attached-processes
+      packetCapture:
+        adapter: dumpcap
+        placement: host-network-namespace
+        ringBytes: 2Gi
+      protocolSummary:
+        adapter: zeek
+        mode: during-or-after-run
+      mobileAnalysis:
+        adapter: mobsf
+        mode: external-api
     metrics:
       normalInterval: 2s
       incidentInterval: 250ms
+      staleAfter: 6s
+      rateWindows: [10s, 1m, 5m]
       dimensions:
         - host
-        - cache-scope
-        - input-view
         - lease
-        - container
-        - emulator-process
+        - agent-workspace
+        - target
+        - target-run
+        - observer
+        - android-runtime
         - android-device
         - selected-process
+    liveAccess:
+      agent:
+        enabled: true
+        minimumMetricInterval: 1s
+        signals:
+          - lifecycle
+          - own-process-tree
+          - target-process-tree
+          - target-syscall-file-network-metadata
+          - resource-metrics
+          - android-health
+          - collector-coverage
+          - sealed-observation-bundles
+      visual:
+        screenshots: target-transitions-and-on-demand
+        liveScreenMaxFps: 2
+    agentRequests:
+      profiles: [deep]
+      namedCaptures: [strace, perfetto, packetPayload, mitmproxy, frida]
     buffers:
       liveSubscriberEvents: 4096
       segmentBytes: 64Mi
@@ -114,39 +271,48 @@ spec:
       perfetto:
         maxDuration: 5m
         maxBytes: 1Gi
-      packetCapture:
-        maxDuration: 15m
-        maxBytes: 2Gi
-        payloads: true
+      packetPayload:
+        maxDuration: 5m
+        maxBytes: 1Gi
+        requireFlowFilter: true
       mitmproxy:
         maxDuration: 10m
         maxBytes: 2Gi
         decryptedPayloads: restricted
       frida:
         maxDuration: 10m
-        requireRootOrGadget: true
+        hostManagedCollectorScripts: pinned
+        agentInstalledInstrumentation: allowed-recorded-not-coverage-authority
     triggers:
-      - name: memory-pressure-evidence
+      - name: target-memory-pressure-evidence
         when:
-          metric: lease.memory.psi.full
+          metric: target.memory.psi.full
           above: 0.10
           for: 5s
         actions:
           - raise-metric-resolution
-          - capture-process-tree
-          - capture-android-meminfo
+          - capture-target-process-tree
       - name: android-crash-evidence
         when:
           event: android.native_crash
         actions:
           - seal-logcat-window
+          - seal-perfetto-ring
           - capture-tombstone-if-permitted
           - capture-screenshot
           - finalize-packet-ring
+    bundles:
+      rawCollectorOutputs: true
+      normalizedEvents: true
+      targetChangeManifest: true
+      collectorCoverageAndGaps: true
+      derivedAgentSummary: true
+      summaryMustCiteEvidence: true
     sensitivity:
       default: internal
       decryptedTraffic: restricted
       screenshots: restricted
+      payloads: restricted
     retention:
       liveLocal: 24h
       finalizeToArtifactStore: true
@@ -157,14 +323,15 @@ spec:
       - lifecycle-window
       - resource-window
       - process-tree
-      - workspace-change-manifest
-      - collector-gap-summary
+      - target-change-manifest
+      - collector-coverage-and-gaps
     recovery:
-      containerFailure: recreate-new-generation
-      emulatorFailure: restore-baseline-new-generation
-      androidAppCrash: keep-generation-and-report
-      observerFailure: fail-if-required
-      physicalDeviceFailure: quarantine
+      agentWorkspaceFailure: recreate-new-agent-generation
+      linuxTargetFailure: recreate-new-target-generation
+      androidRuntimeFailure: baseline-new-target-generation
+      targetWorkloadExit: finalize-run-and-report
+      androidAppCrash: finalize-run-and-report
+      observerFailure: fail-run-if-required
 
   pressure:
     reserveHostMemory: 8Gi
@@ -174,6 +341,7 @@ spec:
       freeDiskPercent: 15
     shedOrder:
       - unused-reservations
-      - unleased-warm-emulators
-      - idle-preemptible-leases
-      - active-preemptible-leases
+      - unleased-warm-targets
+      - idle-preemptible-targets
+      - active-preemptible-target-runs
+      - preemptible-agent-workspaces
