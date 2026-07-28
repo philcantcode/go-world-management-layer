@@ -1,0 +1,857 @@
+syntax = "proto3";
+
+package world.v1;
+
+option go_package = "github.com/philcantcode/go-world-management-layer/api/world/v1;worldv1";
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// WorldService is the only public control-plane contract. Paths in this API are
+// workspace-relative or target-relative; it intentionally has no host shell,
+// host executable path, arbitrary mount, Docker socket, or host ADB surface.
+service WorldService {
+  rpc AcquireResearchSession(AcquireResearchSessionRequest) returns (AcquireResearchSessionResponse);
+  rpc GetResearchSession(GetResearchSessionRequest) returns (ResearchSessionView);
+  rpc WaitResearchSession(WaitResearchSessionRequest) returns (ResearchSessionView);
+  rpc RenewLease(RenewLeaseRequest) returns (Lease);
+  rpc ReleaseResearchSession(ReleaseResearchSessionRequest) returns (ReleaseOutcome);
+
+  rpc CreateTarget(CreateTargetRequest) returns (Target);
+  rpc GetTarget(GetTargetRequest) returns (Target);
+  rpc StartTargetRun(StartTargetRunRequest) returns (TargetRun);
+  rpc WaitTargetRun(WaitTargetRunRequest) returns (TargetRun);
+  rpc StopTargetRun(StopTargetRunRequest) returns (ObservationBundle);
+  rpc ResetTarget(ResetTargetRequest) returns (Target);
+  rpc DestroyTarget(DestroyTargetRequest) returns (Outcome);
+  rpc RequestRecovery(RequestRecoveryRequest) returns (RecoveredResource);
+  rpc QuarantineTarget(QuarantineTargetRequest) returns (Target);
+
+  rpc OpenExec(stream ExecFrame) returns (stream ExecFrame);
+  rpc OpenTargetExec(stream TargetExecFrame) returns (stream TargetExecFrame);
+  rpc PushTargetFile(stream FileTransferFrame) returns (stream FileTransferFrame);
+  rpc PullTargetFile(PullTargetFileRequest) returns (stream FileTransferFrame);
+  rpc OpenTargetADB(stream ADBFrame) returns (stream ADBFrame);
+
+  rpc GetLiveSnapshot(GetLiveSnapshotRequest) returns (LiveSnapshot);
+  rpc SubscribeObservations(SubscribeObservationsRequest) returns (stream ObservationRecord);
+  rpc SubscribeMetrics(SubscribeMetricsRequest) returns (stream MetricSample);
+  rpc StartCapture(StartCaptureRequest) returns (Capture);
+  rpc RequestCapture(RequestCaptureRequest) returns (Capture);
+  rpc StopCapture(StopCaptureRequest) returns (Capture);
+  rpc GetObservationBundle(GetObservationBundleRequest) returns (ObservationBundle);
+  rpc GetIncident(GetIncidentRequest) returns (Incident);
+
+  rpc DeclareExport(DeclareExportRequest) returns (Export);
+  rpc PreviewChangeSet(PreviewChangeSetRequest) returns (ChangeSet);
+  rpc CommitExport(CommitExportRequest) returns (Export);
+
+  // Driver-facing revision transitions use the same authenticated, revisioned
+  // contract and expose every operation currently implemented by Core.
+  rpc TransitionAgentGeneration(TransitionAgentGenerationRequest) returns (AgentWorkspace);
+  rpc TransitionTargetGeneration(TransitionTargetGenerationRequest) returns (Target);
+  rpc TransitionTargetRun(TransitionTargetRunRequest) returns (TargetRun);
+  rpc CreateTargetOperation(CreateTargetOperationRequest) returns (TargetOperation);
+  rpc TransitionTargetOperation(TransitionTargetOperationRequest) returns (TargetOperation);
+  rpc CreateIncident(CreateIncidentRequest) returns (Incident);
+  rpc TransitionIncident(TransitionIncidentRequest) returns (Incident);
+  rpc GetExec(GetExecRequest) returns (Exec);
+  rpc CreateExec(CreateExecRequest) returns (Exec);
+  rpc TransitionExec(TransitionExecRequest) returns (Exec);
+  rpc FinalizeExec(FinalizeExecRequest) returns (Exec);
+}
+
+message MutationMetadata {
+  string idempotency_key = 1;
+  string correlation_id = 2;
+  string causation_id = 3;
+  string authorized_policy_reference = 4;
+  google.protobuf.Timestamp deadline = 5;
+}
+
+message InputViewSpec {
+  string resolved_input_view_id = 1;
+  string frozen_selection_ref = 2;
+  repeated string immutable_occurrence_refs = 3;
+  repeated PathMapping path_mappings = 4;
+  repeated string allowed_sidecars = 5;
+  string cache_security_scope = 6;
+  bool require_zero_copy = 7;
+}
+
+message PathMapping {
+  string occurrence_ref = 1;
+  string workspace_relative_path = 2;
+}
+
+message AcquireResearchSessionRequest {
+  MutationMetadata mutation = 1;
+  InputViewSpec input_view = 2;
+  string policy_digest = 3;
+  string capability_digest = 4;
+  google.protobuf.Duration ttl = 5;
+}
+
+message AcquireResearchSessionResponse {
+  Lease lease = 1;
+  ResearchSessionView view = 2;
+}
+
+message GetResearchSessionRequest { string research_session_id = 1; }
+message WaitResearchSessionRequest {
+  string research_session_id = 1;
+  string desired_state = 2;
+}
+message RenewLeaseRequest {
+  MutationMetadata mutation = 1;
+  string lease_id = 2;
+  uint64 expected_revision = 3;
+  google.protobuf.Duration ttl = 4;
+}
+message ReleaseResearchSessionRequest {
+  MutationMetadata mutation = 1;
+  string lease_id = 2;
+  uint64 expected_revision = 3;
+  string reason = 4;
+}
+message ReleaseOutcome {
+  string research_session_id = 1;
+  string lease_id = 2;
+  google.protobuf.Timestamp released_at = 3;
+}
+
+message CreateTargetRequest {
+  MutationMetadata mutation = 1;
+  string lease_id = 2;
+  TargetTemplate template = 3;
+}
+message TargetTemplate {
+  string reference = 1;
+  string kind = 2;
+  string policy_digest = 3;
+  string capability_digest = 4;
+}
+message GetTargetRequest { string target_id = 1; }
+message StartTargetRunRequest {
+  MutationMetadata mutation = 1;
+  string target_id = 2;
+  TargetRunSpec run_spec = 3;
+}
+message TargetRunSpec {
+  repeated string specimen_occurrence_refs = 1;
+  repeated string fixture_refs = 2;
+  string materialization_digest = 3;
+}
+message WaitTargetRunRequest {
+  string target_id = 1;
+  string target_run_id = 2;
+  string desired_state = 3;
+}
+message StopTargetRunRequest {
+  MutationMetadata mutation = 1;
+  string target_id = 2;
+  string target_run_id = 3;
+  uint64 expected_revision = 4;
+  string reason = 5;
+}
+message ResetTargetRequest {
+  MutationMetadata mutation = 1;
+  string target_id = 2;
+  uint64 expected_revision = 3;
+  // Exactly one of: baseline, recreate, snapshot.
+  string reset_mode = 4;
+  string recovery_incident_id = 5;
+  // Required only when reset_mode is snapshot.
+  string snapshot_name = 6;
+}
+message DestroyTargetRequest {
+  MutationMetadata mutation = 1;
+  string target_id = 2;
+  uint64 expected_revision = 3;
+  string reason = 4;
+}
+message QuarantineTargetRequest {
+  MutationMetadata mutation = 1;
+  string target_id = 2;
+  uint64 expected_revision = 3;
+  string reason = 4;
+}
+message RequestRecoveryRequest {
+  MutationMetadata mutation = 1;
+  string incident_id = 2;
+  uint64 expected_revision = 3;
+  string mode = 4;
+  string resource = 5;
+  string strategy = 6;
+  string visibility_acknowledgement = 7;
+}
+message RecoveredResource {
+  string resource_kind = 1;
+  string resource_id = 2;
+  uint64 generation = 3;
+  uint64 revision = 4;
+  Incident incident = 5;
+  Target target = 6;
+  AgentWorkspace agent_workspace = 7;
+  Lease lease = 8;
+}
+message Outcome {
+  string resource_id = 1;
+  string state = 2;
+  uint64 revision = 3;
+}
+
+message ExecStart {
+  MutationMetadata mutation = 1;
+  string lease_id = 2;
+  string provider_executable = 3;
+  // Arguments after argv[0]; provider_executable supplies the executable and argv[0].
+  repeated string argv = 4;
+  string workspace_relative_working_directory = 5;
+  repeated TemporaryInput temporary_inputs = 6;
+  TerminalSettings terminal = 7;
+}
+message TemporaryInput {
+  string name_hint = 1;
+  // Zero-based index within ExecStart.argv.
+  uint32 argv_index = 2;
+  bytes content = 3;
+  uint32 mode = 4;
+}
+message TerminalSettings {
+  bool enabled = 1;
+  uint32 rows = 2;
+  uint32 columns = 3;
+  string terminal_type = 4;
+}
+message ExecFrame {
+  ExecStart start = 1;
+  bytes stdin = 2;
+  bytes stdout = 3;
+  bytes stderr = 4;
+  string signal = 5;
+  TerminalSettings resize = 6;
+  bool heartbeat = 7;
+  ExecOutcome outcome = 8;
+}
+message TargetExecStart {
+  MutationMetadata mutation = 1;
+  string target_id = 2;
+  string target_run_id = 3;
+  // A complete direct command: argv[0] is the executable and later entries are arguments.
+  repeated string argv = 4;
+  bytes explicit_shell_bytes = 5;
+  string target_relative_working_directory = 6;
+  TerminalSettings terminal = 7;
+}
+message TargetExecFrame {
+  TargetExecStart start = 1;
+  bytes stdin = 2;
+  bytes stdout = 3;
+  bytes stderr = 4;
+  string signal = 5;
+  TerminalSettings resize = 6;
+  bool heartbeat = 7;
+  ExecOutcome outcome = 8;
+}
+message ExecOutcome {
+  int32 exit_code = 1;
+  string termination = 2;
+  string error = 3;
+}
+message FileTransferStart {
+  MutationMetadata mutation = 1;
+  string target_id = 2;
+  string target_run_id = 3;
+  string workspace_relative_path = 4;
+  string target_relative_path = 5;
+  uint32 mode = 6;
+}
+message FileTransferFrame {
+  FileTransferStart start = 1;
+  bytes data = 2;
+  uint64 offset = 3;
+  string digest = 4;
+  bool complete = 5;
+  TargetOperation operation = 6;
+}
+message PullTargetFileRequest {
+  MutationMetadata mutation = 1;
+  string target_id = 2;
+  string target_run_id = 3;
+  string target_relative_path = 4;
+  string workspace_relative_path = 5;
+}
+message ADBStart {
+  MutationMetadata mutation = 1;
+  string target_id = 2;
+  string target_run_id = 3;
+}
+message ADBFrame {
+  ADBStart start = 1;
+  bytes client_bytes = 2;
+  bytes server_bytes = 3;
+  string assigned_serial = 4;
+  bool complete = 5;
+}
+
+message ObservationFilter {
+  string lease_id = 1;
+  repeated string target_ids = 2;
+  repeated string target_run_ids = 3;
+  repeated string subject_ids = 4;
+  repeated string signal_families = 5;
+  repeated string record_kinds = 6;
+}
+message GetLiveSnapshotRequest { ObservationFilter filter = 1; }
+message SubscribeObservationsRequest {
+  ObservationFilter filter = 1;
+  uint64 after_cursor = 2;
+}
+message SubscribeMetricsRequest {
+  ObservationFilter filter = 1;
+  google.protobuf.Duration resolution = 2;
+  uint64 after_cursor = 3;
+}
+message LiveSnapshot {
+  uint64 cursor = 1;
+  repeated Subject subjects = 2;
+  repeated MetricSample metrics = 3;
+  repeated CollectorCoverage coverage = 4;
+  repeated IncidentSummary incidents = 5;
+  repeated PressureTransition pressure = 6;
+}
+message Subject {
+  string subject_id = 1;
+  string parent_subject_id = 2;
+  string lease_id = 3;
+  string kind = 4;
+  string signal_family = 5;
+  map<string,string> labels = 6;
+}
+message ObservationRecord {
+  uint64 cursor = 1;
+  string kind = 2;
+  string event_id = 3;
+  ObservationIdentity identity = 4;
+  string signal_family = 5;
+  string subject_id = 6;
+  string source = 7;
+  string source_instance = 8;
+  uint64 source_sequence = 9;
+  bool has_source_sequence = 10;
+  google.protobuf.Timestamp observed_at = 11;
+  string policy_digest = 12;
+  string capability_digest = 13;
+  bytes payload = 14;
+  Gap gap = 15;
+  CausalContext causal = 16;
+}
+message ObservationIdentity {
+  string research_session_id = 1;
+  string lease_id = 2;
+  string agent_workspace_id = 3;
+  uint64 agent_generation = 4;
+  string exec_id = 5;
+  string target_id = 6;
+  uint64 target_generation = 7;
+  string target_run_id = 8;
+  string target_operation_id = 9;
+}
+message CausalContext {
+  string causation_id = 1;
+  string correlation_id = 2;
+  string correlation_method = 3;
+  double confidence = 4;
+}
+message MetricSample {
+  uint64 cursor = 1;
+  string lease_id = 2;
+  string subject_id = 3;
+  string signal_family = 4;
+  string name = 5;
+  string state = 6;
+  optional double value = 7;
+  optional double last_value = 8;
+  google.protobuf.Timestamp collected_at = 9;
+  google.protobuf.Duration sample_age = 10;
+  Gap gap = 11;
+  string detail = 12;
+}
+message CollectorCoverage {
+  string collector_id = 1;
+  string subject_id = 2;
+  string signal_family = 3;
+  string placement = 4;
+  string level = 5;
+  string status = 6;
+  bool required = 7;
+  uint64 dropped_records = 8;
+  Gap gap = 9;
+  uint64 updated_cursor = 10;
+}
+message IncidentSummary {
+  string incident_id = 1;
+  string lease_id = 2;
+  string subject_id = 3;
+  string signal_family = 4;
+  string state = 5;
+  string summary = 6;
+  uint64 updated_cursor = 7;
+}
+message PressureTransition {
+  string lease_id = 1;
+  string subject_id = 2;
+  string signal_family = 3;
+  string resource = 4;
+  string level = 5;
+  double value = 6;
+  string detail = 7;
+  uint64 cursor = 8;
+}
+message Gap {
+  string cause = 1;
+  string source = 2;
+  string source_instance = 3;
+  uint64 from_sequence = 4;
+  uint64 through_sequence = 5;
+  uint64 from_cursor = 6;
+  uint64 through_cursor = 7;
+  string detail = 8;
+}
+
+message StartCaptureRequest {
+  MutationMetadata mutation = 1;
+  string lease_id = 2;
+  CaptureSpec capture_spec = 3;
+}
+message RequestCaptureRequest {
+  MutationMetadata mutation = 1;
+  string lease_id = 2;
+  string named_profile = 3;
+}
+message StopCaptureRequest {
+  MutationMetadata mutation = 1;
+  string capture_id = 2;
+  uint64 expected_revision = 3;
+	string lease_id = 4;
+}
+message CaptureSpec {
+  string profile = 1;
+  repeated string signal_families = 2;
+  google.protobuf.Duration duration = 3;
+  uint64 byte_limit = 4;
+}
+message Capture {
+  string capture_id = 1;
+  string lease_id = 2;
+  string profile = 3;
+  string state = 4;
+  uint64 revision = 5;
+  google.protobuf.Timestamp started_at = 6;
+  google.protobuf.Timestamp stopped_at = 7;
+  repeated ArtifactReference artifacts = 8;
+}
+message GetObservationBundleRequest { string target_run_id = 1; }
+message ObservationBundle {
+  string bundle_id = 1;
+  string target_run_id = 2;
+  string target_id = 3;
+  uint64 target_generation = 4;
+  string agent_workspace_id = 5;
+  uint64 agent_generation = 6;
+  uint64 first_cursor = 7;
+  uint64 last_cursor = 8;
+  repeated ArtifactReference raw_artifacts = 9;
+  repeated ObservationRecord normalized_events = 10;
+  repeated MetricSample metrics = 11;
+  repeated CollectorCoverage coverage = 12;
+  repeated Gap gaps = 13;
+  ChangeSet target_changes = 14;
+  repeated string incident_ids = 15;
+  DerivedSummary summary = 16;
+  string state = 17;
+  uint64 revision = 18;
+  google.protobuf.Timestamp created_at = 19;
+  google.protobuf.Timestamp sealed_at = 20;
+}
+message ArtifactReference {
+  string reference = 1;
+  string digest = 2;
+  uint64 size = 3;
+  string role = 4;
+  string sensitivity = 5;
+}
+message DerivedSummary {
+  string text = 1;
+  repeated string inferences = 2;
+  repeated EvidenceCitation citations = 3;
+}
+message EvidenceCitation {
+  uint64 first_cursor = 1;
+  uint64 last_cursor = 2;
+  ArtifactReference artifact = 3;
+}
+
+message GetIncidentRequest { string incident_id = 1; }
+message Cause {
+  string kind = 1;
+  string summary = 2;
+  string method = 3;
+  double confidence = 4;
+}
+message IncidentMetric {
+  string subject_id = 1;
+  string subject_kind = 2;
+  string name = 3;
+  string unit = 4;
+  string kind = 5;
+  string availability = 6;
+  optional uint64 counter_value = 7;
+  optional double numeric_value = 8;
+  google.protobuf.Timestamp collected_at = 9;
+  google.protobuf.Timestamp published_at = 10;
+  uint64 cursor = 11;
+  map<string, string> labels = 12;
+  string exec_id = 13;
+  string target_run_id = 14;
+}
+message IncidentGap {
+  string kind = 1;
+  string source = 2;
+  string source_instance = 3;
+  uint64 first_source_sequence = 4;
+  uint64 last_source_sequence = 5;
+  uint64 first_cursor = 6;
+  uint64 last_cursor = 7;
+  google.protobuf.Timestamp started_at = 8;
+  google.protobuf.Timestamp ended_at = 9;
+  uint64 lost_records = 10;
+  string reason = 11;
+}
+message IncidentCoverage {
+  string collector_id = 1;
+  string signal_family = 2;
+  string placement = 3;
+  string level = 4;
+  string status = 5;
+  bool required = 6;
+  google.protobuf.Timestamp started_at = 7;
+  google.protobuf.Timestamp ended_at = 8;
+  uint64 dropped_records = 9;
+  repeated IncidentGap gaps = 10;
+}
+message Incident {
+  string incident_id = 1;
+  string classification = 2;
+  string research_session_id = 3;
+  string lease_id = 4;
+  string agent_workspace_id = 5;
+  uint64 agent_generation = 6;
+  string exec_id = 7;
+  string target_id = 8;
+  uint64 target_generation = 9;
+  string target_run_id = 10;
+  string trigger = 11;
+  string last_known_state = 12;
+  Cause cause = 13;
+  uint64 first_relevant_cursor = 14;
+  uint64 last_relevant_cursor = 15;
+  repeated IncidentMetric high_water_metrics = 16;
+  repeated string recovery_actions = 17;
+  repeated string visibility_acknowledgements = 18;
+  string state = 19;
+  uint64 revision = 20;
+  google.protobuf.Timestamp occurred_at = 21;
+  google.protobuf.Timestamp updated_at = 22;
+  repeated IncidentCoverage coverage = 23;
+  string observation_bundle_id = 24;
+  repeated ArtifactReference artifacts = 25;
+}
+
+message DeclareExportRequest {
+  MutationMetadata mutation = 1;
+  string lease_id = 2;
+  repeated ExportPath paths = 3;
+}
+message ExportPath {
+  string workspace_relative_path = 1;
+  string role = 2;
+}
+message PreviewChangeSetRequest { string lease_id = 1; }
+message CommitExportRequest {
+  MutationMetadata mutation = 1;
+  string export_id = 2;
+  uint64 expected_workspace_revision = 3;
+	string lease_id = 4;
+}
+message Export {
+  string export_id = 1;
+  string lease_id = 2;
+  repeated ExportPath paths = 3;
+  string state = 4;
+  uint64 revision = 5;
+  uint64 workspace_revision = 6;
+  repeated string occurrence_refs = 7;
+  repeated ArtifactReference artifacts = 8;
+}
+message ChangeSet {
+  string scope = 1;
+  uint64 workspace_revision = 2;
+  repeated Change changes = 3;
+  google.protobuf.Timestamp sealed_at = 4;
+}
+message Change {
+  string kind = 1;
+  string workspace_relative_path = 2;
+  string previous_workspace_relative_path = 3;
+  string before_digest = 4;
+  string after_digest = 5;
+  map<string,string> metadata = 6;
+}
+
+message ResearchSession {
+  string research_session_id = 1;
+  string state = 2;
+  uint64 revision = 3;
+  string lease_id = 4;
+  string agent_workspace_id = 5;
+  string input_view_id = 6;
+  string policy_digest = 7;
+  string capability_digest = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+	string owner_subject = 11;
+}
+message Lease {
+  string lease_id = 1;
+  string research_session_id = 2;
+  string agent_workspace_id = 3;
+  uint64 agent_generation = 4;
+  string input_view_id = 5;
+  string policy_digest = 6;
+  string capability_digest = 7;
+  // Effective lease lifecycle state. Once termination is present this is the
+  // termination state, so an expiring lease is never projected as active.
+  string state = 8;
+  uint64 revision = 9;
+  google.protobuf.Timestamp expires_at = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp updated_at = 12;
+  LeaseTermination termination = 13;
+}
+message LeaseTermination {
+  // "release" for an operator-requested release or "expiry" for deadline
+  // enforcement.
+  string kind = 1;
+  // One of "releasing", "expiring", "released", or "expired".
+  string state = 2;
+  string reason = 3;
+  string begin_idempotency_key = 4;
+  string begin_request_digest = 5;
+  uint64 initiated_lease_revision = 6;
+  google.protobuf.Timestamp initiated_at = 7;
+  string complete_idempotency_key = 8;
+  string complete_request_digest = 9;
+  google.protobuf.Timestamp completed_at = 10;
+}
+message AgentWorkspace {
+  string agent_workspace_id = 1;
+  string research_session_id = 2;
+  uint64 current_generation = 3;
+  uint64 revision = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  repeated AgentGeneration generations = 7;
+}
+message AgentGeneration {
+  uint64 generation = 1;
+  string workspace_id = 2;
+  string input_view_id = 3;
+  string policy_digest = 4;
+  string capability_digest = 5;
+  uint64 previous_generation = 6;
+  string recovery_incident_id = 7;
+  string state = 8;
+  uint64 revision = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  string provisioning_plan_digest = 12;
+}
+message Target {
+  string target_id = 1;
+  string research_session_id = 2;
+  string lease_id = 3;
+  string template_reference = 4;
+  string kind = 5;
+  uint64 current_generation = 6;
+  uint64 revision = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  repeated TargetGeneration generations = 10;
+  repeated TargetRun runs = 11;
+  repeated TargetOperation operations = 12;
+}
+message TargetGeneration {
+  uint64 generation = 1;
+  string policy_digest = 2;
+  string capability_digest = 3;
+  uint64 previous_generation = 4;
+  string recovery_incident_id = 5;
+  string state = 6;
+  uint64 revision = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  string provisioning_plan_digest = 10;
+}
+message TargetRun {
+  string target_run_id = 1;
+  uint64 generation = 2;
+  string agent_workspace_id = 3;
+  uint64 agent_generation = 4;
+  string materialization_digest = 5;
+  string state = 6;
+  uint64 revision = 7;
+  string bundle_id = 8;
+  repeated string incident_ids = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  string bundle_artifact = 12;
+  string bundle_digest = 13;
+  string provisioning_plan_digest = 14;
+}
+message TargetOperation {
+  string target_operation_id = 1;
+  string target_run_id = 2;
+  uint64 generation = 3;
+  string kind = 4;
+  string command_display = 5;
+  string content_digest = 6;
+  string state = 7;
+  uint64 revision = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+message ResearchSessionView {
+  ResearchSession session = 1;
+  Lease lease = 2;
+  AgentWorkspace agent_workspace = 3;
+  repeated Target targets = 4;
+  repeated Incident incidents = 5;
+  repeated Exec execs = 6;
+}
+
+message Exec {
+  string exec_id = 1;
+  string research_session_id = 2;
+  string lease_id = 3;
+  string agent_workspace_id = 4;
+  uint64 agent_generation = 5;
+  string kind = 6;
+  string executable = 7;
+  // Arguments after argv[0]; executable supplies the executable and argv[0].
+  repeated string argv = 8;
+  string workspace_relative_working_directory = 9;
+  string state = 10;
+  uint64 revision = 11;
+  optional int32 exit_code = 12;
+  string signal = 13;
+  repeated string incident_ids = 14;
+  bool cleanup_confirmed = 15;
+  string error = 16;
+  google.protobuf.Timestamp created_at = 17;
+  google.protobuf.Timestamp updated_at = 18;
+}
+message GetExecRequest { string exec_id = 1; }
+message CreateExecRequest {
+  MutationMetadata mutation = 1;
+  string lease_id = 2;
+  string kind = 3;
+  string provider_executable = 4;
+  // Arguments after argv[0]; provider_executable supplies the executable and argv[0].
+  repeated string argv = 5;
+  string workspace_relative_working_directory = 6;
+}
+message TransitionExecRequest {
+  MutationMetadata mutation = 1;
+  string exec_id = 2;
+  uint64 expected_revision = 3;
+  string state = 4;
+}
+message FinalizeExecRequest {
+  MutationMetadata mutation = 1;
+  string exec_id = 2;
+  uint64 expected_revision = 3;
+  string state = 4;
+  optional int32 exit_code = 5;
+  string signal = 6;
+  repeated string incident_ids = 7;
+  bool cleanup_confirmed = 8;
+  string error = 9;
+}
+
+message TransitionAgentGenerationRequest {
+  MutationMetadata mutation = 1;
+  string agent_workspace_id = 2;
+  uint64 generation = 3;
+  uint64 expected_revision = 4;
+  string state = 5;
+}
+message TransitionTargetGenerationRequest {
+  MutationMetadata mutation = 1;
+  string target_id = 2;
+  uint64 generation = 3;
+  uint64 expected_revision = 4;
+  string state = 5;
+}
+message TransitionTargetRunRequest {
+  MutationMetadata mutation = 1;
+  string target_id = 2;
+  string target_run_id = 3;
+  uint64 expected_revision = 4;
+  string state = 5;
+}
+message CreateTargetOperationRequest {
+  MutationMetadata mutation = 1;
+  string target_id = 2;
+  string target_run_id = 3;
+  string kind = 4;
+  string command_display = 5;
+  string content_digest = 6;
+}
+message TransitionTargetOperationRequest {
+  MutationMetadata mutation = 1;
+  string target_id = 2;
+  string target_operation_id = 3;
+  uint64 expected_revision = 4;
+  string state = 5;
+}
+message CreateIncidentRequest {
+  MutationMetadata mutation = 1;
+  string classification = 2;
+  string research_session_id = 3;
+  string lease_id = 4;
+  string agent_workspace_id = 5;
+  uint64 agent_generation = 6;
+  string exec_id = 7;
+  string target_id = 8;
+  uint64 target_generation = 9;
+  string target_run_id = 10;
+  string trigger = 11;
+  string last_known_state = 12;
+  Cause cause = 13;
+  uint64 first_relevant_cursor = 14;
+  uint64 last_relevant_cursor = 15;
+  repeated IncidentMetric high_water_metrics = 16;
+  repeated IncidentCoverage coverage = 17;
+  string observation_bundle_id = 18;
+  repeated ArtifactReference artifacts = 19;
+}
+message TransitionIncidentRequest {
+  MutationMetadata mutation = 1;
+  string incident_id = 2;
+  uint64 expected_revision = 3;
+  string state = 4;
+  repeated string recovery_actions = 5;
+  repeated string visibility_acknowledgements = 6;
+}

@@ -1,0 +1,238 @@
+apiVersion: world.philcantcode.dev/v1alpha1
+kind: ResearchSessionPolicy
+metadata:
+  name: e2e-directory-copy
+  revision: 1
+spec:
+  lease:
+    ttl: 2h
+    priority: 50
+    preemptible: true
+    quiesceDeadline: 30s
+  agentWorkspace:
+    runtime:
+      driver: docker
+      image: world-e2e:local@sha256:6105d6cc76af4009c44e4692f219054456e7111487afb0c71077d9f887668fef
+      isolationProfile: agent-standard
+      rootFilesystem: readOnly
+      user: "65532:65532"
+      capabilities:
+        drop: [ALL]
+        add: []
+      noNewPrivileges: true
+      seccompProfile: runtime-default
+    network:
+      mode: none
+      allowDNS: false
+      allowedCIDRs: []
+      allowedDomains: []
+      denyPrivateRanges: true
+      targetAccess: none
+    resources:
+      requests:
+        cpu: "0.25"
+        memory: 32Mi
+        workspace: 1Mi
+      limits:
+        cpu: "1"
+        memory: 256Mi
+        swap: 0B
+        pids: 128
+        workspace: 16Mi
+        workspaceInodes: 1024
+  workspace:
+    mode: directory-copy-non-production
+    inputView:
+      source: frozen-artifact-selection
+      layout: by-evidence-path
+      cacheScope: session
+      construction: allow-copy
+      reuseExactView: true
+      verifyBeforeMount: true
+      verifyAfterRun: true
+      viewRetention: 1h
+    cache:
+      maxBytes: 64Mi
+      highWaterPercent: 85
+      lowWaterPercent: 70
+      verifyOnPopulate: true
+      reverify: always
+    export:
+      declaration: host-only
+      regularFilesOnly: true
+      maxFiles: 1024
+      maxBytes: 16Mi
+      retainFullChangeManifest: true
+  targets:
+    maxConcurrent: 1
+    materialTransfer:
+      source: declared-artifact-occurrences
+      agentWorkspacePush: allowed-beneath-workspace-recorded
+      maxTransferBytesPerRun: 8Mi
+      verifyBeforeRun: true
+    templates:
+      - name: linux-visible
+        kind: linux-container
+        runtime:
+          driver: docker
+          runtime: runc
+          image: world-e2e:local@sha256:6105d6cc76af4009c44e4692f219054456e7111487afb0c71077d9f887668fef
+          isolationProfile: observable-container
+          baseImage: readOnly
+          user: "65532:65532"
+          capabilities:
+            drop: [ALL]
+            add: []
+          noNewPrivileges: true
+          seccompProfile: runtime-default
+        material:
+          mountPoint: /target/input
+          writableState: private-directory-non-production
+        interaction:
+          commandAuthority: arbitrary-inside-assigned-target
+          execTransport: direct-argv-and-explicit-shell
+          fileTransfer: push-pull-target-relative
+          networkEndpoints: none
+          deniedInfrastructureAuthority: [host-exec, docker-api, host-mounts, other-targets]
+        resources:
+          limits:
+            cpu: "1"
+            memory: 256Mi
+            swap: 0B
+            pids: 128
+            writableState: 16Mi
+        reset:
+          afterEveryRun: false
+          mode: recreate-new-target-generation
+  resources:
+    aggregateLimits:
+      cpu: "2"
+      memory: 512Mi
+      captureBytes: 16Mi
+  observation:
+    priority: visibility-first
+    requiredCoverage:
+      linux-container: [target.lifecycle]
+    profiles:
+      default: metadata
+      metadata:
+        capturePayloads: false
+        fileEvents: [open, read, write, rename, unlink]
+        syscallArguments: selected-safe
+      deep:
+        maxDuration: 1m
+        maxBytes: 4Mi
+        signalFamilies: [process]
+      payload:
+        enabled: authorized-on-demand
+        requireProcessOrPathFilter: true
+        maxDuration: 1m
+        maxBytes: 4Mi
+        sensitivity: restricted
+        signalFamilies: [process]
+    baseline: [world-lifecycle, cgroup-metrics, target-process-lifecycle, collector-health]
+    collectors:
+      linuxMetadata:
+        adapter: tracee
+        placement: host
+        failRunOnCoverageLoss: false
+      androidSystem:
+        adapters: [perfetto, logcat, dumpsys]
+        placement: guest
+        failRunOnCoverageLoss: false
+      androidAppHooks:
+        adapter: frida
+        placement: injected-app
+        coverage: attached-processes
+      packetCapture:
+        adapter: dumpcap
+        placement: host-network-namespace
+        ringBytes: 1Mi
+      protocolSummary:
+        adapter: zeek
+        mode: after-run
+      mobileAnalysis:
+        adapter: mobsf
+        mode: external-api
+    metrics:
+      normalInterval: 2s
+      incidentInterval: 250ms
+      staleAfter: 6s
+      rateWindows: [10s, 1m]
+      dimensions: [host, lease, agent-workspace, target, target-run, observer]
+    liveAccess:
+      agent:
+        enabled: true
+        minimumMetricInterval: 1s
+        signals: [lifecycle, target-process-tree, resource-metrics, collector-coverage]
+      visual:
+        screenshots: disabled
+        liveScreenMaxFps: 1
+    agentRequests:
+      profiles: [deep]
+      namedCaptures: [worldLifecycle, strace, perfetto, packetPayload, mitmproxy, frida]
+    buffers:
+      liveSubscriberEvents: 256
+      segmentBytes: 1Mi
+      packetRingBytes: 1Mi
+    allowedOnDemand:
+      worldLifecycle:
+        maxDuration: 1m
+        maxBytes: 4Mi
+        signalFamilies: [target.lifecycle]
+      strace:
+        maxDuration: 1m
+        maxBytes: 4Mi
+        signalFamilies: [process]
+      perfetto:
+        maxDuration: 1m
+        maxBytes: 4Mi
+        signalFamilies: [process]
+      packetPayload:
+        maxDuration: 1m
+        maxBytes: 4Mi
+        requireFlowFilter: true
+        signalFamilies: [network]
+      mitmproxy:
+        maxDuration: 1m
+        maxBytes: 4Mi
+        decryptedPayloads: restricted
+        signalFamilies: [network]
+      frida:
+        maxDuration: 1m
+        hostManagedCollectorScripts: pinned
+        agentInstalledInstrumentation: allowed-recorded-not-coverage-authority
+        signalFamilies: [process]
+    triggers: []
+    bundles:
+      rawCollectorOutputs: true
+      normalizedEvents: true
+      targetChangeManifest: true
+      collectorCoverageAndGaps: true
+      derivedAgentSummary: true
+      summaryMustCiteEvidence: true
+    sensitivity:
+      default: internal
+      decryptedTraffic: restricted
+      screenshots: restricted
+      payloads: restricted
+    retention:
+      liveLocal: 1h
+      finalizeToArtifactStore: true
+      deleteLocalAfterArtifactAck: true
+  incidents:
+    minimumEvidence: [lifecycle-window, resource-window, process-tree, target-change-manifest, collector-coverage-and-gaps]
+    recovery:
+      agentWorkspaceFailure: recreate-new-agent-generation
+      linuxTargetFailure: recreate-new-target-generation
+      androidRuntimeFailure: baseline-new-target-generation
+      targetWorkloadExit: finalize-run-and-report
+      androidAppCrash: finalize-run-and-report
+      observerFailure: fail-run-if-required
+  pressure:
+    reserveHostMemory: 256Mi
+    stopAdmissionOn:
+      memoryPSIFull: 0.05
+      ioPSIFull: 0.10
+      freeDiskPercent: 15
+    shedOrder: [unused-reservations, unleased-warm-targets, idle-preemptible-targets, active-preemptible-target-runs, preemptible-agent-workspaces]

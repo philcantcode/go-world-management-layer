@@ -1,0 +1,125 @@
+# --- Build / package output ---
+/bin/
+/dist/
+/out/
+/build/
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+
+# Built command binaries dropped at repo root (go build ./cmd/...)
+/worldd
+/world-node
+/worldctl
+/world-guest
+/world-idle
+/world-target
+/world-observe
+/world-capture
+/world-export
+/world-capabilities
+/verify
+
+# --- Go test / tooling artifacts ---
+*.test
+*.out
+*.prof
+*.pprof
+coverage.txt
+coverage.html
+coverage.out
+cover.out
+*.coverprofile
+profile.cov
+cpu.out
+mem.out
+block.out
+mutex.out
+__debug_bin*
+debug.test
+
+# Module / workspace local state (never commit)
+/vendor/
+go.work
+go.work.sum
+
+# --- Caches and ephemeral local workdirs ---
+/.cache/
+/.cache-*/
+**/.gocache/
+.tmp/
+.tmp-*/
+*.tmp
+*.temp
+
+# Verification harness output
+/coverage/
+/verification/
+
+# E2E specimen build trees (sources stay tracked)
+testdata/e2e/**/build/
+
+# Package-local test workdirs (MkdirTemp(".", "world-..."))
+**/world-linux-target-test-*/
+**/world-cuttlefish-*/
+**/world-adb-*/
+**/world-*-test-*/
+
+# --- Runtime state (daemons, DBs, sockets, locks) ---
+/.world/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
+*.sock
+*.worldd.lock
+*.world-node.lock
+
+# Local sealed material / orchestration dumps if created under the tree
+/bundles/
+/material/
+/ledger/
+/orchestration/
+
+# --- Logs ---
+*.log
+*.stderr.txt
+*.stdout.txt
+*.stderr.log
+*.stdout.log
+
+# --- Secrets / local config (never sync) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+id_ecdsa
+*.keystore
+
+# --- Editors / IDEs ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.code-workspace
+
+# --- OS junk ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/

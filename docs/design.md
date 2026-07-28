@@ -1,6 +1,6 @@
 # World management layer design
 
-- Status: proposed v1 architecture
+- Status: v1 target architecture with current implementation boundary
 - Date: 2026-07-24
 - Revised: 2026-07-27
 - Initial deployment: dedicated Linux hosts
@@ -35,6 +35,34 @@ Version 1 targets dedicated Linux nodes. OverlayFS, cgroup v2 pressure signals,
 Linux namespaces, eBPF, and KVM are part of the actual design, not portable
 implementation details. A Windows or macOS client may call a remote Linux node,
 but Docker Desktop is not the initial security or performance reference.
+
+### 1.1 Current implementation boundary
+
+The target architecture below intentionally reaches beyond the currently
+shipped executable topology. Today `worldd` and `world-node` are independent
+full daemons with different default state paths/endpoints; there is no
+controller-to-node protocol and `world-node` does not register with `worldd`.
+Either binary can run logical-only or activate the same fail-closed physical
+Linux composition from a trusted version-2 deployment profile:
+
+- a directory-copy workspace and digest-pinned Docker agent container;
+- digest-pinned Docker Linux targets with scoped exec/file transports;
+- deployment-authorized local input/output/bundle material;
+- optional profile-defined process observers and ledger capture; and
+- startup policy compilation, plan preflight, exact physical-plan binding,
+  resource admission, inventory/adoption, lease drain, and crash recovery.
+
+`directory-copy-non-production` is the only daemon-composed workspace mode;
+the OverlayFS, cgroup/pressure actuation, eBPF suites, split controller/node
+topology, and fleet scheduler described later remain target architecture.
+
+Android is not daemon-composed. The Cuttlefish-family driver, exact-serial ADB
+authorization, and AttachedEmulator backend have an opt-in real SDK-emulator
+test that installs and launches an APK through a run-scoped gateway, then
+revokes the endpoint without stopping the externally owned emulator. Both
+daemon configurations still accept only `android-target-driver=none`; this
+qualification is not managed Cuttlefish boot, reset, destruction, or startup
+reconciliation.
 
 ## 2. Ecosystem boundaries
 
@@ -121,10 +149,10 @@ world-owned `MaterialAuthority` interface.
    transport is structurally bound to one lease, target generation, and run.
    Lifecycle, resource, network, capture, and export mutations remain validated
    against the frozen policy.
-3. Agent workspaces and target sandboxes are sibling resources owned by
-   `world-node`. A target never mounts the agent workspace or receives its
-   provider credentials unless an explicit material-transfer policy names the
-   exact paths and direction.
+3. Agent workspaces and target sandboxes are sibling resources owned by the
+   trusted host-driver composition. A target never mounts the agent workspace
+   or receives its provider credentials unless an explicit material-transfer
+   policy names the exact paths and direction.
 4. A workspace lower layer is immutable. Writes go only to the lease's upper
    layer. A new agent generation never reuses an unsealed upper layer.
 5. An input view contains exactly the entries in its canonical manifest. The
@@ -165,6 +193,38 @@ world-owned `MaterialAuthority` interface.
 
 ## 6. Component architecture
 
+### 6.1 Current executable topology
+
+```text
+trusted operator / client
+  | world.v1 gRPC (bearer or mTLS)
+  v
+worldd OR world-node
+  |-- logical lifecycle core + SQLite control journal
+  |-- durable observation ledger/live projections
+  |-- local bundle finalizer/material publication
+  `-- optional version-2 deployment-profile composition
+        |-- strict policy compile + complete capability fingerprint
+        |-- directory workspace + Docker agent + world-guest exec
+        |-- Docker Linux target + scoped exec/file transports
+        |-- optional process observers
+        `-- optional ledger capture
+```
+
+Both binaries use this same composition. They are independent services; there
+is no RPC, registration, or scheduling relationship between them. The default
+driver selection is logical-only. Physical Linux mode requires the Docker agent
+and directory workspace together, an absolute immutable deployment profile,
+exact locally present image digests, and non-overlapping managed roots. Linux
+targets, process observers, and ledger capture are additional explicit
+selections constrained by that profile. Android and physical-device selections
+are rejected.
+
+### 6.2 Target controller/node split
+
+The following is the intended dedicated-host/fleet topology, not a claim about
+the currently shipped relationship between the two binaries:
+
 ```text
 trusted host application
   | acquire / release / incidents / observations / exports
@@ -197,7 +257,7 @@ agent tools -> world-target / scoped ADB / optional MCP -> target gateways
 agent tools -> world-observe -> worldd -> observer projections and bundles
 ```
 
-### 6.1 `worldd`
+### 6.3 Target `worldd` responsibility
 
 `worldd` owns logical truth: research sessions, leases, agent workspace and
 target generations, target runs, effective policies, idempotency, transitions,
@@ -205,9 +265,9 @@ incidents, export intents, observation bundles, cursors, and admission
 decisions. It has no host command-execution API and does not accept arbitrary
 host paths from clients.
 
-### 6.2 `world-node`
+### 6.4 Target `world-node` responsibility
 
-`world-node` is the only component that can access Docker Engine, create agent
+In the target split, `world-node` is the only component that can access Docker Engine, create agent
 or target containers, mount workspaces, place processes in cgroups, allocate
 virtual-device ports, talk to raw ADB, and attach privileged observers. Its
 local API accepts resolved workspace, target, and collector plans plus
@@ -225,10 +285,11 @@ optional profiles. Capability probing must reveal when they hide guest syscalls
 or prevent required ptrace/eBPF observation; a visibility-required policy fails
 rather than silently substituting a less complete collector set.
 
-### 6.3 `world-guest`
+### 6.5 `world-guest`
 
-`world-guest` is a small, versioned supervisor running as PID 1 in the agent
-workspace. It:
+`world-guest` is a small, versioned framed exec supervisor running inside the
+agent workspace. The current Docker plan uses Docker's `--init`, so host
+enforcement does not rely on `world-guest` being container PID 1. It:
 
 - starts the requested pinned provider executable directly with an argument
   vector and explicit working directory;
@@ -289,8 +350,9 @@ ADB-server operations, or another lease or target identity.
 
 ### 6.6 Target sandboxes and observation bundles
 
-A target sandbox is an add-on resource owned by a `TargetDriver`. V1 provides a
-Linux OCI-container driver and an Android virtual-device driver. Each
+A target sandbox is an add-on resource owned by a `TargetDriver`. The v1 target
+architecture provides Linux OCI-container and Android virtual-device drivers;
+the shipped daemon composition currently activates only the Linux driver. Each
 `TargetInstance` has an independently versioned runtime realization, while each
 `TargetRun` is one bounded execution and observation window within that
 realization.
@@ -347,6 +409,9 @@ attributes, never public identity.
 ```text
 research session: requested -> admitted -> leased -> releasing -> released
 
+lease: active -> releasing -> released
+          `-----------------> expired
+
 agent workspace generation:
 provisioning -> booting -> ready -> running -> quiescing -> sealed
                                   |               |
@@ -372,7 +437,93 @@ The implementation uses one shared transition guard over separate declarative
 tables. Drivers report observations; they do not update state directly.
 Replaying accepted transition records must reconstruct the same current state.
 
-### 7.3 Capability fingerprint
+Release and expiry use a separate durable termination record so admission
+closes before cleanup begins. A requested release persists `releasing`; a due
+active lease persists `expiring` while its public lease state remains active.
+The trusted drain stops captures, resumes or completes reserved exports,
+force-stops and finalizes nonterminal target runs, destroys physical target and
+agent ownership, marks remaining execs/target operations terminal, and only
+then commits `released` or `expired`. Startup and a bounded periodic ticker
+resume the same child idempotency identities after interruption.
+
+### 7.3 Shipped daemon ownership and startup crash reconciliation
+
+Each daemon first takes a nonblocking, process-wide lock on the sibling
+`<canonical-control-path>.worldd.lock`. Acquisition resolves the absolute
+control path and parent-directory aliases, requires regular single-link
+control/lock files whose opened handles still match their paths, and rejects
+symlink/reparse, hard-link, and special-file aliases. Linux, Darwin, BSD, and
+Solaris lock the canonical parent directory before the sibling file to
+stabilize the pathname namespace, then release the file before the directory;
+same-directory over-exclusion is intentional. Windows uses `LockFileEx` and
+holds the lock file without delete sharing. AIX fails closed as unsupported
+because its available sibling-file lock cannot provide replacement-resistant
+namespace ownership. The lock precedes credentials, SQLite, the ledger, driver
+construction, reconciliation, and listener creation, and is released last
+after RPC shutdown and local cleanup. It coordinates conforming daemons; it is
+not a defense against arbitrary same-user mutation.
+
+The current daemon then performs physical/run reconciliation before lease
+cleanup and before constructing its RPC server or listener. It reconstructs
+immutable plans from durable state, re-applies policy admission, inventories
+exact physical identities, and adopts only a resource whose labels and
+inspected configuration match that plan. Version-5 observer markers bind their
+filename and run ID to the persisted run-plan digest and full observer start
+signature. They also persist every exact external `CollectorPlan`, a
+`start_committed` flag written only after `ObserverDriver.Start` succeeds, and
+the intrinsic collector ID/start time when `target.lifecycle` is required.
+The marker's stopped/committed phases additionally carry the digest of the
+complete persisted target-run result, the digest of the canonical version-2
+stop preparation permitted to consume that result, and a bounded evidence-
+journal reference. Both stop digests must be present together and must match
+the preparation file and its hash-chain anchor; a stopped marker cannot be
+reattached to different evidence after a crash.
+The complete plan carries the child idempotency key, collector/session/lease,
+workspace/agent generation, target/generation/run, runtime attachment,
+requirement, adapter/version/configuration digest, resource and byte limits,
+and original start time. Recovery validates these bindings against the
+authority-selected plan; it never mints a replacement collector identity or
+start time. Foreign, malformed, ambiguous, missing-when-required, or mismatched
+evidence fails startup.
+
+A nonterminal bound run is an interruption, not a resumable execution. The
+Linux reconciler force-stops surviving execution and proves it stopped; it may
+restart only an inert target and reconstruct the run as prepared for the normal
+failure-finalization path. It never calls `StartRun`, restarts a specimen or
+collector, or replaces the original maximum-duration timer. The built-in Linux
+parent-death `SIGKILL` contract proves death only for the directly spawned
+collector process; Go's fork/exec path also closes the parent-exit race.
+Adapters that daemonize or leave surviving helpers are unsupported unless an
+external cgroup/process-tree supervisor supplies an equivalent authoritative
+proof. Unsupported platforms or custom cleanup contracts fail closed.
+
+Only after that death proof may the process observer reconcile durable output.
+For every exact persisted collector binding it requires one bounded,
+non-symlink transaction directory and validates terminal manifests, stream
+roles, artifact references, digests, sizes, the shared byte limit, and object
+reachability. A valid finalized transaction retains its immutable artifacts,
+but the recovered collector's continuity is still recorded as lost. Partial,
+never-finished output is closed with an exact-plan `aborted` transaction and
+its partial files are removed. A missing transaction is tolerated only when
+`start_committed` is false; a present valid finalized transaction remains
+authoritative even when that flag is false because output publication may have
+won the marker-update race. Foreign collectors/files/objects, conflicting or
+mismatched control files, missing referenced objects, and unsafe path/type
+changes fail startup. Complete unreferenced objects are safely removed; a
+truncated pending object is removed only when it is a verified prefix tied to
+an exact interrupted partial. Complete pending objects referenced by a valid
+finalized manifest are promoted. A final scan requires precisely the reachable
+digest set.
+
+Successful recovery records planned signals as lost, adds explicit
+control-plane-loss gaps, seals a failed observation bundle, links a
+`control_plane_failure` incident, commits the final observer marker and
+`bundle.completed` read gate, and marks nonterminal target operations `lost`.
+Retrying leaves this terminal run and bundle unchanged. Any incomplete
+identity, stop, collector-cleanup, or finalization proof aborts startup before
+RPC and before lease cleanup.
+
+### 7.4 Capability fingerprint
 
 Before admission, each driver reports tri-state capabilities (`supported`,
 `unsupported`, `unknown`) plus constraints and immutable version evidence:
@@ -413,15 +564,23 @@ use the same contract.
 - `OpenTargetADB(target_run) -> scoped_endpoint`
 - `WaitTargetRun(target_run, desired_state) -> target_run`
 - `StopTargetRun(target_run, reason) -> observation_bundle`
-- `ResetTarget(target, reset_mode) -> new_target_generation`
+- `ResetTarget(target, reset_mode, snapshot_name?) -> new_target_generation`, where
+  `reset_mode` is exactly `baseline`, `recreate`, or `snapshot`; `snapshot_name`
+  is required only for `snapshot`
 - `DestroyTarget(target, reason) -> outcome`
 - `RequestRecovery(incident, mode) -> recovered_resource`
 - `QuarantineTarget(target, reason) -> target`
 
 Every mutation requires an idempotency key, expected revision where applicable,
 correlation ID, causation ID when explicit, authorized policy reference, and
-deadline. Retrying the same key and payload returns the original result;
-reusing a key with different input conflicts.
+deadline. An idempotency key is canonical only when it is non-empty, valid
+UTF-8, unchanged by trimming, and at most 1024 bytes. Retrying the same key and
+payload returns the original result; reusing a key with different input
+conflicts. Internal saga steps derive child identities through one
+domain-separated, length-framed function. It keeps an unambiguous
+`parent/suffix` readable and otherwise appends a SHA-256 commitment while
+remaining within 1024 bytes, so nested or maximum-length keys cannot poison
+replay or collapse distinct component boundaries.
 
 The acquire request contains an agent-workspace `InputViewSpec`, not a host
 path. It identifies a frozen selection or explicit immutable occurrences,
@@ -434,8 +593,10 @@ manifest so target access never implies access to the whole agent workspace.
 ### 8.2 Execution transport
 
 `OpenExec` is a bidirectional framed stream into the agent workspace. The start
-frame carries a provider executable, argv vector, working directory, bounded
-temporary-input declarations, terminal settings, and exec idempotency key.
+frame carries a provider executable, the arguments after `argv[0]`, a working
+directory, bounded temporary-input declarations, terminal settings, and exec
+idempotency key. The executable supplies `argv[0]`; temporary-input indices are
+zero-based over the separate argument vector.
 Subsequent frames carry raw stream bytes, signals, resize events, heartbeats,
 and one terminal outcome. It is the transport behind the runner execution
 environment, not a provider-aware protocol.
@@ -1049,6 +1210,43 @@ state. Finalized segments and large captures are committed to the forensic
 artifact authority. OTLP/Prometheus export is supported for live operations but
 is not the authoritative audit ledger.
 
+Target-run finalization spans several durable authorities and therefore uses a
+recoverable ordered saga:
+
+1. append the exact per-run reservation and its idempotency/signature binding;
+2. stop the target and observers and durably journal their complete result;
+3. write the canonical version-2 stop preparation containing the reservation,
+   mutation metadata, initial run state/revision, generation identities,
+   creation time, required coverage, complete persisted result, and compact
+   failure-incident intent;
+4. bind the stopped observer marker to both the result digest and the complete
+   preparation digest, then anchor that file identity in the hash-chained
+   control ledger;
+5. create or resume the exact failure incident when the preparation contains
+   an incident intent;
+6. seal immutable evidence and publish the digest-matching material artifact;
+7. write the canonical public bundle/terminal-commit projection, then anchor
+   its file identity, size, and digest in the hash-chained control ledger;
+8. commit the Core run terminal state from that exact projection;
+9. publish and hash-chain-index the public bundle file;
+10. commit the stopped observer marker; and
+11. append `bundle.completed`, which is the public read gate.
+
+Startup removes only recognized unreachable atomic temporary files. It resumes
+an anchored stage without rebuilding evidence, verifies an already-terminal
+Core record against that stage, repairs a missing public file/index, promotes
+the matching stopped observer marker, and writes the completion gate. An
+unanchored pre-terminal public stage is rolled back for exact-reservation retry;
+an unanchored terminal stage, anchored stage with no exact file, non-canonical
+or tampered bytes, foreign bundle file, or conflicting index fails startup.
+Recovery after an earlier stop reservation reuses that reservation's original
+namespace, idempotency key, and signature rather than inventing startup
+ownership. A marker-bound stop-preparation file without its ledger anchor is
+retained and anchored; an unbound unanchored file is removable. Once anchored,
+the exact preparation is the only allowed source for incident creation, seal,
+publication, and terminal commit. Public bundle reads remain unavailable until
+the index, committed observer marker, and `bundle.completed` record agree.
+
 ## 14. Pressure-aware admission and shedding
 
 Each lease has resource requests, hard limits, priority, preemptibility, and a
@@ -1151,6 +1349,30 @@ cross-field invariants, resolves defaults, probes capabilities, and emits a
 canonical effective-policy document for each admitted agent or target
 generation.
 
+In the shipped physical composition, a version-2 deployment profile names each
+regular policy source by exact `metadata.name@metadata.revision`. Startup probes
+the selected agent, target, workspace, and observer facts, constructs one
+complete capability fingerprint, compiles every source against it, and binds
+the resulting effective-policy and capability digests into the immutable agent
+and target plans. Every configured plan passes through the same physical-policy
+admission checks before those effective policies are published to durable
+control state. No listener is open during load, probe, compile, preflight, or
+startup reconciliation.
+
+Immediately before a physical mutation, admission resolves the durable policy
+pair again and checks the exact driver-reported plan rather than trusting the
+request or the startup report alone. It enforces runtime, image, isolation,
+network, workspace, resource, target concurrency, reset/recovery, capture, and
+export constraints. Aggregate CPU, memory, and capture admission is calculated
+from an authoritative inventory of all persisted sessions with their exact
+plans re-resolved; an idempotent candidate is excluded once so a retry does not
+double-count itself. Policy denial occurs before logical or physical mutation.
+
+`world-capabilities -policy <path>` performs the non-provisioning Docker probe
+and reports the canonical policy digest plus the complete capability digest.
+The daemon independently repeats compilation and physical-plan preflight; the
+operator tool is preparation and evidence, not an authorization bypass.
+
 Policy areas are:
 
 - agent-workspace runtime/image/isolation, input-view selection/layout, cache
@@ -1183,9 +1405,11 @@ See [the example policy](examples/environment-policy.yaml).
 
 ## 17. Driver and helper boundaries
 
-Stable world-owned ports keep vendor APIs out of the domain:
+Stable world-owned ports keep vendor APIs out of the domain. The following
+shows conceptual shapes with names abbreviated for readability; the compiled
+interfaces in `internal/ports` are authoritative:
 
-```go
+```text
 type AgentWorkspaceDriver interface {
     Probe(context.Context) (CapabilitySet, error)
     Provision(context.Context, AgentWorkspacePlan) (AgentWorkspace, error)
@@ -1307,12 +1531,13 @@ history without collapsing the systems into one database.
 
 ### 19.2 Trust boundaries
 
-The host application, `worldd`, `world-node`, policy store, observer supervisor,
-and artifact adapter are trusted. The agent workspace, provider, research tools,
-Linux targets, inputs, Android apps, and device responses are untrusted. Agent
-workspace and targets are sibling trust domains with no shared writable mount or
-management authority. `world-guest` is trusted for orchestration but runs in the
-agent workspace compromise domain; host enforcement never depends solely on it.
+The host application, each independently deployed daemon, its selected host
+drivers, policy store, observer supervisor, and material adapter are trusted.
+The agent workspace, provider, research tools, Linux targets, inputs, Android
+apps, and device responses are untrusted. Agent workspace and targets are
+sibling trust domains with no shared writable mount or management authority.
+`world-guest` is trusted for orchestration but runs in the agent workspace
+compromise domain; host enforcement never depends solely on it.
 
 Physical devices and emulators may attack ADB, USB, network, parsers, or
 collectors. Those adapters are separate processes with bounded inputs and least
@@ -1320,16 +1545,20 @@ privilege. Captured content is untrusted evidence, not safe structured data.
 
 ### 19.3 Isolation and visibility profiles
 
-- `agent-standard`: rootless/user-namespaced Docker and a hardened OCI profile
-  for the persistent agent workspace.
+- `agent-standard`: an unprivileged numeric container user and hardened Docker
+  plan for the persistent agent workspace: read-only root, no network, no new
+  privileges, all capabilities dropped, no host namespaces/devices/runtime
+  socket, and one managed workspace mount. Running Docker itself rootless is a
+  deployment capability to probe and qualify, not an assumption of this name.
 - `observable-container`: hardened standard OCI/runc Linux target with required
   host eBPF, namespace, network, and filesystem coverage. This is the v1 target
   default because visibility has priority.
 - `sandboxed-kernel`: optional gVisor/Kata target with stronger kernel isolation;
   admitted only with an explicitly reduced visibility contract or equivalent
   in-guest collectors.
-- `instrumented-android`: rooted/debuggable AOSP virtual device with pinned
-  Perfetto, logcat, state, packet, and Frida/framework observation capabilities.
+- `instrumented-android`: target profile for a rooted/debuggable AOSP virtual
+  device with pinned Perfetto, logcat, state, packet, and Frida/framework
+  observation capabilities. It remains outside the daemon composition.
 - `device-lab`: future dedicated node/USB/network isolation for physical phones.
 
 No tier is named `unrestricted`; permissions are described concretely.

@@ -1,4 +1,4 @@
-# Proposed policy syntax. This file documents the contract; no parser exists yet.
+# Strict policy example accepted by the policy compiler.
 apiVersion: world.philcantcode.dev/v1alpha1
 kind: ResearchSessionPolicy
 metadata:
@@ -15,7 +15,7 @@ spec:
   agentWorkspace:
     runtime:
       driver: docker
-      image: registry.example/vr-agent@sha256:replace-with-pinned-digest
+      image: registry.example/vr-agent@sha256:1111111111111111111111111111111111111111111111111111111111111111
       isolationProfile: agent-standard
       rootFilesystem: readOnly
       user: "10000:10000"
@@ -80,7 +80,7 @@ spec:
         runtime:
           driver: docker
           runtime: runc
-          image: registry.example/linux-target@sha256:replace-with-pinned-digest
+          image: registry.example/linux-target@sha256:2222222222222222222222222222222222222222222222222222222222222222
           isolationProfile: observable-container
           baseImage: readOnly
           user: "20000:20000"
@@ -117,7 +117,7 @@ spec:
         kind: android-virtual-device
         runtime:
           driver: cuttlefish
-          systemImageDigest: sha256:replace-with-instrumented-aosp-digest
+          systemImageDigest: sha256:3333333333333333333333333333333333333333333333333333333333333333
           isolationProfile: instrumented-android
           baselineState: clean-v1
           requireHardwareAcceleration: true
@@ -146,8 +146,8 @@ spec:
 
   resources:
     aggregateLimits:
-      cpu: "10"
-      memory: 18Gi
+      cpu: "12"
+      memory: 20Gi
       captureBytes: 10Gi
 
   observation:
@@ -177,12 +177,14 @@ spec:
       deep:
         maxDuration: 10m
         maxBytes: 4Gi
+        signalFamilies: [process, file, network, resource-metrics]
       payload:
         enabled: authorized-on-demand
         requireProcessOrPathFilter: true
         maxDuration: 5m
         maxBytes: 1Gi
         sensitivity: restricted
+        signalFamilies: [process, file, network]
     baseline:
       - world-lifecycle
       - docker-events
@@ -259,30 +261,39 @@ spec:
         liveScreenMaxFps: 2
     agentRequests:
       profiles: [deep]
-      namedCaptures: [strace, perfetto, packetPayload, mitmproxy, frida]
+      namedCaptures: [worldLifecycle, strace, perfetto, packetPayload, mitmproxy, frida]
     buffers:
       liveSubscriberEvents: 4096
       segmentBytes: 64Mi
       packetRingBytes: 2Gi
     allowedOnDemand:
+      worldLifecycle:
+        maxDuration: 2m
+        maxBytes: 512Mi
+        signalFamilies: [target.lifecycle]
       strace:
         maxDuration: 2m
         maxBytes: 512Mi
+        signalFamilies: [process, syscall]
       perfetto:
         maxDuration: 5m
         maxBytes: 1Gi
+        signalFamilies: [process, performance]
       packetPayload:
         maxDuration: 5m
         maxBytes: 1Gi
         requireFlowFilter: true
+        signalFamilies: [network-packet]
       mitmproxy:
         maxDuration: 10m
         maxBytes: 2Gi
         decryptedPayloads: restricted
+        signalFamilies: [network-flow]
       frida:
         maxDuration: 10m
         hostManagedCollectorScripts: pinned
         agentInstalledInstrumentation: allowed-recorded-not-coverage-authority
+        signalFamilies: [process, app-api]
     triggers:
       - name: target-memory-pressure-evidence
         when:
