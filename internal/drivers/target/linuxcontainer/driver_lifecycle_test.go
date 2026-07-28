@@ -481,6 +481,18 @@ func TestResetReplaysCommittedCleanupFailureWithoutRepeatingDestruction(t *testi
 	run.stopped = true
 	run.result = &ports.TargetRunStopReceipt{RunID: authority.RunID, Outcome: ports.RunFailed, FailureKind: ports.TargetRunFailureNeverStarted, StoppedAt: time.Unix(20, 0).UTC()}
 	previousDirectory := driver.targets[targetKey(authority.TargetID, authority.Generation)].plan.TargetDirectory
+	// Materialization seals the managed tree; restore write bits before Replace.
+	if err := filepath.WalkDir(previousDirectory, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink == 0 {
+			return os.Chmod(path, 0o700)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.RemoveAll(previousDirectory); err != nil {
 		t.Fatal(err)
 	}

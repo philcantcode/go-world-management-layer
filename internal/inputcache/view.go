@@ -112,7 +112,9 @@ func (c *Cache) buildView(ctx context.Context, canonical InputViewManifest) (str
 	}
 	defer removeCacheTree(staging) // best-effort cleanup; a returned build error remains authoritative
 	viewRoot := filepath.Join(staging, "root")
-	if err := os.MkdirAll(viewRoot, 0o500); err != nil {
+	// Staging directories must remain writable until every entry is published.
+	// The finished view root is sealed to 0o500 after the rename below.
+	if err := os.MkdirAll(viewRoot, 0o700); err != nil {
 		return "", err
 	}
 	for _, entry := range canonical.Entries {
@@ -124,7 +126,7 @@ func (c *Cache) buildView(ctx context.Context, canonical InputViewManifest) (str
 			return "", err
 		}
 		viewPath := filepath.Join(viewRoot, filepath.FromSlash(entry.Path))
-		if err := os.MkdirAll(filepath.Dir(viewPath), 0o500); err != nil {
+		if err := os.MkdirAll(filepath.Dir(viewPath), 0o700); err != nil {
 			return "", err
 		}
 		cloned, err := cloneFile(contentPath, viewPath, os.FileMode(entry.Mode)&0o777)

@@ -38,7 +38,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Durable safe-path namespaces and managed Linux ownership are
+        # implemented for linux and windows only (see internal/safepath).
+        os: [ubuntu-latest, windows-latest]
         go-version: ["1.23.x"]
 
     steps:

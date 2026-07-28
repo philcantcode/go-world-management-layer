@@ -57,10 +57,16 @@ Initial public release of the world management layer.
 - Canonicalize agent workspace mount paths through `EvalSymlinks` so host
   path aliases (for example Windows TEMP junctions) do not fail closed when
   the leaf tree is clean.
+- Build input-cache views with writable staging directories, then seal the
+  finished root to `0o500` (Unix hosts previously failed while publishing
+  entries into a read-only staging root).
 - Make unit tests portable on non-root Linux and CRLF Windows checkouts:
   guest ownership fixtures use the current process identity when root handoff
   is unavailable; policy fixture replacements normalize newlines; directory-copy
-  composition tests skip off Windows where `node.os.windows` is required.
+  composition tests skip off Windows where `node.os.windows` is required;
+  sealed managed trees are re-opened for write before intentional test
+  corruption. CI exercises Ubuntu and Windows (safe-path namespaces are
+  implemented for those platforms only).
 
 ### Notes
 
