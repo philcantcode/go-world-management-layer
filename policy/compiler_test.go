@@ -300,7 +300,9 @@ func examplePolicy(t *testing.T) []byte {
 	if err != nil {
 		t.Fatalf("read example policy: %v", err)
 	}
-	return source
+	// Fixtures and replaceOnce helpers assume Unix newlines. Normalize so
+	// Windows checkouts with CRLF still match the documented replacements.
+	return bytes.ReplaceAll(source, []byte("\r\n"), []byte("\n"))
 }
 
 func fingerprintFor(t *testing.T, source []byte, overrides map[string]CapabilityStatus, omit map[string]bool) CapabilityFingerprint {

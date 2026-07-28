@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	goruntime "runtime"
 	"sync"
 	"testing"
 	"time"
@@ -539,6 +540,11 @@ func lifecycleTestDriverWithRuntime(t *testing.T, runtime Runtime) (*Driver, Run
 		t.Fatal(err)
 	}
 	plan := validLifecycleContainerPlan(t, root, lease, target, 1)
+	// Production targets hand off to 65532:65532 and require root on Linux.
+	// Lifecycle unit tests only need a consistent identity the process can own.
+	if goruntime.GOOS == "linux" && os.Geteuid() != 0 {
+		plan.User = fmt.Sprintf("%d:%d", os.Geteuid(), os.Getegid())
+	}
 	if err := prepareTargetDirectories(root, plan); err != nil {
 		t.Fatal(err)
 	}

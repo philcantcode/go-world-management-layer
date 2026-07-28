@@ -24,7 +24,7 @@ func TestProvisionRequiresFramedGuestReadinessAndUsesConfiguredBinary(t *testing
 	}
 	engine := &recordingEngine{readiness: successfulReadinessFrames(t)}
 	driver, err := New(Config{
-		Build:  BuildConfig{WorkspaceRoot: root, ImageRepository: "example.invalid/agent", GuestBinary: "/opt/world/world-guest"},
+		Build:  BuildConfig{WorkspaceRoot: root, ImageRepository: "example.invalid/agent", GuestBinary: "/opt/world/world-guest", ContainerUser: testGuestUser(t)},
 		Engine: engine,
 	})
 	if err != nil {
@@ -67,7 +67,7 @@ func TestProvisionRemovesContainerWhenGuestReadinessIsNotAuthoritative(t *testin
 		t.Fatal(err)
 	}
 	engine := &recordingEngine{readiness: []transport.Frame{{Kind: transport.KindTerminal, Data: badTerminal}}}
-	driver, err := New(Config{Build: BuildConfig{WorkspaceRoot: root, ImageRepository: "example.invalid/agent"}, Engine: engine})
+	driver, err := New(Config{Build: BuildConfig{WorkspaceRoot: root, ImageRepository: "example.invalid/agent", ContainerUser: testGuestUser(t)}, Engine: engine})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestInspectPreservesIntentionalSealedStop(t *testing.T) {
 	}
 	engine := &recordingEngine{readiness: successfulReadinessFrames(t)}
 	driver, err := New(Config{
-		Build:  BuildConfig{WorkspaceRoot: root, ImageRepository: "example.invalid/agent"},
+		Build:  BuildConfig{WorkspaceRoot: root, ImageRepository: "example.invalid/agent", ContainerUser: testGuestUser(t)},
 		Engine: engine,
 	})
 	if err != nil {

@@ -27,13 +27,14 @@ func prepareWorkspaceAccess(root, user string) error {
 	if err != nil {
 		return fmt.Errorf("resolve workspace mount: %w", err)
 	}
+	// Canonicalize through EvalSymlinks so host path aliases (Windows TEMP
+	// junctions, path rewrites) do not fail closed when the leaf tree itself
+	// is clean. The walk below still rejects symlinks inside the mount.
 	resolved, err := filepath.EvalSymlinks(absolute)
 	if err != nil {
 		return fmt.Errorf("resolve workspace mount components: %w", err)
 	}
-	if filepath.Clean(resolved) != filepath.Clean(absolute) {
-		return fmt.Errorf("workspace mount contains a symlink or junction")
-	}
+	absolute = filepath.Clean(resolved)
 	entries := make([]workspaceAccessEntry, 0, 16)
 	err = filepath.WalkDir(absolute, func(hostPath string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {

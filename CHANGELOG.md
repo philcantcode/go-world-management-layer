@@ -48,6 +48,19 @@ Initial public release of the world management layer.
 - Windows Docker Desktop end-to-end harness under `testdata/e2e/`.
 - Architecture, implementation plan, accepted ADRs, example policy, and
   operator runbooks under `docs/`.
+- CI across Ubuntu, Windows, and macOS; tag-driven GitHub release workflow;
+  Dependabot for Go modules and Actions; MIT license; changelog, releasing,
+  and security docs.
+
+### Fixed
+
+- Canonicalize agent workspace mount paths through `EvalSymlinks` so host
+  path aliases (for example Windows TEMP junctions) do not fail closed when
+  the leaf tree is clean.
+- Make unit tests portable on non-root Linux and CRLF Windows checkouts:
+  guest ownership fixtures use the current process identity when root handoff
+  is unavailable; policy fixture replacements normalize newlines; directory-copy
+  composition tests skip off Windows where `node.os.windows` is required.
 
 ### Notes
 

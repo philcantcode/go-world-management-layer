@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +18,17 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/testkit"
 )
 
+// directory-copy-non-production policy requires node.os.windows; physical
+// composition tests that load the e2e fixture only run on that host class.
+func requireDirectoryCopyCompositionHost(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "windows" {
+		t.Skip("directory-copy-non-production composition requires node.os.windows")
+	}
+}
+
 func TestConfigureHostDriversUsesProfileAndProbesWithoutDocker(t *testing.T) {
+	requireDirectoryCopyCompositionHost(t)
 	fixture := newProfileFixture(t, true)
 	fixture.profile.Runs[0].RequiredCoverage = []string{linuxcontainer.IntrinsicSignalFamily}
 	observations := testObservationLedger(t)
@@ -92,6 +103,7 @@ func TestRunObserverCoordinatorUsesControlTimeoutForDetachedCleanup(t *testing.T
 }
 
 func TestConfigureHostDriversPreflightsTargetPhysicalPlan(t *testing.T) {
+	requireDirectoryCopyCompositionHost(t)
 	tests := map[string]struct {
 		wrap func(ports.TargetDriver) ports.TargetDriver
 		want string
@@ -127,6 +139,7 @@ func TestConfigureHostDriversPreflightsTargetPhysicalPlan(t *testing.T) {
 }
 
 func TestConfigureHostDriversFailsClosedOnProbeMismatch(t *testing.T) {
+	requireDirectoryCopyCompositionHost(t)
 	fixture := newProfileFixture(t, false)
 	configuration := physicalTestConfig(t, fixture, false)
 	clock := testkit.NewClock(time.Now().UTC())
@@ -151,6 +164,7 @@ func TestConfigureHostDriversFailsClosedOnProbeMismatch(t *testing.T) {
 }
 
 func TestConfigureHostDriversRejectsMissingPolicyCapabilities(t *testing.T) {
+	requireDirectoryCopyCompositionHost(t)
 	fixture := newProfileFixture(t, false)
 	configuration := physicalTestConfig(t, fixture, false)
 	clock := testkit.NewClock(time.Now().UTC())
@@ -177,6 +191,7 @@ func TestConfigureHostDriversRejectsMissingPolicyCapabilities(t *testing.T) {
 }
 
 func TestConfigureHostDriversComposesProbedExternalObserver(t *testing.T) {
+	requireDirectoryCopyCompositionHost(t)
 	fixture := newProfileFixture(t, true)
 	configuration := physicalTestConfig(t, fixture, true)
 	configuration.observerDriver = "process"
@@ -230,6 +245,7 @@ func TestConfigureHostDriversComposesProbedExternalObserver(t *testing.T) {
 }
 
 func TestConfigureHostDriversRejectsOverlappingRoots(t *testing.T) {
+	requireDirectoryCopyCompositionHost(t)
 	fixture := newProfileFixture(t, false)
 	configuration := physicalTestConfig(t, fixture, false)
 	configuration.agentWorkspaceRoot = fixture.sourceRoot

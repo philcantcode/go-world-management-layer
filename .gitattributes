@@ -1,0 +1,30 @@
+# Normalize text to LF so policy fixtures and replace-based tests are stable
+# across Windows, macOS, and Linux checkouts.
+* text=auto eol=lf
+
+*.go text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.proto text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=lf
+Makefile text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.apk binary
+*.bin binary
+*.class binary
+*.jar binary
+*.so binary
+*.dylib binary
+*.dll binary
+*.exe binary
