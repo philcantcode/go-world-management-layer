@@ -48,10 +48,13 @@ func objectFor(content []byte) Object {
 
 func newTestCache(t *testing.T, source ContentSource, construction Construction) *Cache {
 	t.Helper()
-	cache, err := New(Options{Root: t.TempDir(), SecurityScope: "campaign-one", Construction: construction, VerifyCacheHits: true, MaxContentBytes: 1024, MaxCacheBytes: 1024, ViewRetention: time.Nanosecond, HighWaterPercent: 80, LowWaterPercent: 50}, source)
+	root := t.TempDir()
+	cache, err := New(Options{Root: root, SecurityScope: "campaign-one", Construction: construction, VerifyCacheHits: true, MaxContentBytes: 1024, MaxCacheBytes: 1024, ViewRetention: time.Nanosecond, HighWaterPercent: 80, LowWaterPercent: 50}, source)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Sealed view trees are 0o500/0o400; re-open for write before TempDir cleanup.
+	t.Cleanup(func() { _ = removeCacheTree(root) })
 	return cache
 }
 

@@ -116,7 +116,8 @@ func (c *Cache) Collect(ctx context.Context) (GCResult, error) {
 		if !expired && current <= high {
 			continue
 		}
-		if err := os.RemoveAll(view.path); err != nil {
+		// Views are sealed read-only; chmod the tree before removal.
+		if err := removeCacheTree(view.path); err != nil {
 			return GCResult{}, err
 		}
 		result.RemovedViews = append(result.RemovedViews, view.name)
