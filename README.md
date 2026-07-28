@@ -1,19 +1,25 @@
 # Go world management layer
 
+[![CI](https://github.com/philcantcode/go-world-management-layer/actions/workflows/ci.yml/badge.svg)](https://github.com/philcantcode/go-world-management-layer/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/philcantcode/go-world-management-layer/world.svg)](https://pkg.go.dev/github.com/philcantcode/go-world-management-layer/world)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 `go-world-management-layer` is the operational boundary between autonomous
 vulnerability-research agents and the programs or Android apps they investigate.
 It keeps a persistent agent workspace separate from disposable target
 sandboxes, scopes every operation to a lease and generation, and preserves
 failures and observation gaps as evidence.
 
-**Status:** active pre-v1 implementation. `worldd` and `world-node` both ship an
-authenticated logical control plane and an opt-in physical Linux composition:
-digest-pinned Docker agent workspaces, directory-copy workspaces, Docker Linux
-targets, deployment-authorized local material, optional process observers, and
-ledger capture. Physical startup requires an immutable version-2 deployment
-profile; the daemon probes the selected drivers, compiles every strict policy
-against the complete capability fingerprint, preflights every published plan,
-and fails closed before opening its listener if the result cannot be enforced.
+**Status:** v0.1.0 — active pre-v1 implementation. Minor 0.x releases may break
+APIs, CLIs, policies, schemas, or on-disk formats; pin consumers to an exact
+tag. `worldd` and `world-node` both ship an authenticated logical control plane
+and an opt-in physical Linux composition: digest-pinned Docker agent workspaces,
+directory-copy workspaces, Docker Linux targets, deployment-authorized local
+material, optional process observers, and ledger capture. Physical startup
+requires an immutable version-2 deployment profile; the daemon probes the
+selected drivers, compiles every strict policy against the complete capability
+fingerprint, preflights every published plan, and fails closed before opening
+its listener if the result cannot be enforced.
 
 Android remains a different boundary. The Cuttlefish-family driver and scoped
 ADB gateway have an opt-in real Android SDK emulator qualification, including
@@ -125,6 +131,30 @@ commit; public file/index; committed observer marker; and finally
 removes only recognized unreachable atomic staging files, and fails closed on
 tampering or missing/conflicting stages. See the
 [startup and reconciliation runbook](docs/operations/startup-and-reconciliation.md).
+
+## Install
+
+Requires [Go 1.23](https://go.dev/dl/) or newer.
+
+Library client:
+
+```console
+go get github.com/philcantcode/go-world-management-layer/world@v0.1.0
+```
+
+```go
+import "github.com/philcantcode/go-world-management-layer/world"
+```
+
+Daemons and operator tools:
+
+```console
+go install github.com/philcantcode/go-world-management-layer/cmd/worldd@v0.1.0
+go install github.com/philcantcode/go-world-management-layer/cmd/worldctl@v0.1.0
+```
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes and [RELEASING.md](RELEASING.md)
+for the tag-and-publish process.
 
 ## Quick start: local control plane
 
@@ -387,6 +417,7 @@ protocol interpretation (`go-agent-runner`), immutable forensic byte custody
 - [Architecture decisions](docs/adr/README.md)
 - [Example policy](docs/examples/environment-policy.yaml)
 - [Operator runbooks](docs/operations/README.md)
+- [Changelog](CHANGELOG.md) · [Releasing](RELEASING.md) · [Security](SECURITY.md)
 
 The design and implementation plan describe the intended full v1 system. The
 status table in this README and executable verification are authoritative for
