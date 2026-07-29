@@ -12,7 +12,6 @@ import (
 // wrapper guarantees that config-level publication and exact-plan admission
 // see the same composition facts.
 type AgentPhysicalEnforcement struct {
-	DirectoryWorkspace   bool
 	BoundedLedgerCapture bool
 }
 
@@ -49,9 +48,6 @@ func (r *agentPhysicalPolicyReporter) AgentWorkspacePlanPhysicalPolicy(ctx conte
 // Apply adds only enforcement owned by the composed host services. Runtime
 // facts and exact plan values remain supplied by the underlying driver.
 func (e AgentPhysicalEnforcement) Apply(report ports.AgentWorkspacePhysicalPolicyReport) ports.AgentWorkspacePhysicalPolicyReport {
-	if e.DirectoryWorkspace {
-		report = WithDirectoryWorkspaceEnforcement(report)
-	}
 	if e.BoundedLedgerCapture {
 		report = WithBoundedLedgerCaptureEnforcement(report)
 	}

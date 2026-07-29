@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/philcantcode/go-world-management-layer/internal/application"
+	"github.com/philcantcode/go-world-management-layer/internal/drivers/target/cuttlefish"
 	"github.com/philcantcode/go-world-management-layer/internal/ledger"
 	"github.com/philcantcode/go-world-management-layer/internal/orchestration"
 	"github.com/philcantcode/go-world-management-layer/internal/orchestration/policyauthority"
@@ -73,18 +74,29 @@ type config struct {
 	agentGuestBinary     string
 	agentContainerUser   string
 
-	linuxTargetDriver     string
-	targetRoot            string
-	targetImageRepository string
-	targetAllowPtrace     bool
-	androidTargetDriver   string
-	physicalTargetDriver  string
-	observerDriver        string
-	observerOutputRoot    string
-	captureDriver         string
-	captureRoot           string
-	workspaceDriver       string
-	materialDriver        string
+	linuxTargetDriver       string
+	targetRoot              string
+	targetImageRepository   string
+	targetAllowPtrace       bool
+	androidTargetDriver     string
+	androidTargetRoot       string
+	androidSystemImageRoot  string
+	androidADBBinary        string
+	androidADBServer        string
+	androidEmulatorBinary   string
+	androidSDKRoot          string
+	androidSDKManagerBinary string
+	androidAVDManagerBinary string
+	androidADBBasePort      int
+	androidBackendVersion   string
+	androidRuntimeVersion   string
+	physicalTargetDriver    string
+	observerDriver          string
+	observerOutputRoot      string
+	captureDriver           string
+	captureRoot             string
+	workspaceDriver         string
+	materialDriver          string
 }
 
 // Main is the shared executable entrypoint. Both binaries intentionally use
@@ -157,6 +169,11 @@ func Run(ctx context.Context, args []string, mode Mode) (runErr error) {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if composition.close != nil {
+			runErr = errors.Join(runErr, composition.close())
+		}
+	}()
 	var leasePolicyAdmission orchestration.LeaseOperationPolicyAdmission
 	if composition.resolver != nil {
 		admissionConfig := composition.policyAdmission
@@ -236,9 +253,9 @@ func Run(ctx context.Context, args []string, mode Mode) (runErr error) {
 	if !composition.profileDigest.IsZero() {
 		profileDigest = composition.profileDigest.String()
 	}
-	log.Printf("%s listening on %s (agent=%s linux_target=%s observer=%s capture=%s workspace=%s material=%s deployment_profile=%s)",
+	log.Printf("%s listening on %s (agent=%s linux_target=%s android_target=%s observer=%s capture=%s workspace=%s material=%s deployment_profile=%s)",
 		mode, listener.Addr(), configuration.agentDriver, configuration.linuxTargetDriver,
-		configuration.observerDriver, configuration.captureDriver, configuration.workspaceDriver, configuration.materialDriver, profileDigest)
+		configuration.androidTargetDriver, configuration.observerDriver, configuration.captureDriver, configuration.workspaceDriver, configuration.materialDriver, profileDigest)
 	select {
 	case <-ctx.Done():
 		stopServer(server, configuration.shutdownTimeout)
@@ -333,6 +350,17 @@ func parseConfig(args []string, mode Mode) (config, error) {
 	flags.StringVar(&value.targetImageRepository, "target-image-repository", value.targetImageRepository, "digest-pinned target image repository prefix (WORLD_TARGET_IMAGE_REPOSITORY)")
 	flags.BoolVar(&value.targetAllowPtrace, "target-allow-ptrace", value.targetAllowPtrace, "allow SYS_PTRACE in Linux targets (WORLD_TARGET_ALLOW_PTRACE)")
 	flags.StringVar(&value.androidTargetDriver, "android-target-driver", value.androidTargetDriver, "Android target driver selection (WORLD_ANDROID_TARGET_DRIVER)")
+	flags.StringVar(&value.androidTargetRoot, "android-target-root", value.androidTargetRoot, "managed Android target state root (WORLD_ANDROID_TARGET_ROOT)")
+	flags.StringVar(&value.androidSystemImageRoot, "android-system-image-root", value.androidSystemImageRoot, "digest-addressed Android system-image root (WORLD_ANDROID_SYSTEM_IMAGE_ROOT)")
+	flags.StringVar(&value.androidADBBinary, "android-adb-binary", value.androidADBBinary, "ADB executable path (WORLD_ANDROID_ADB_BINARY)")
+	flags.StringVar(&value.androidADBServer, "android-adb-server", value.androidADBServer, "upstream ADB server address (WORLD_ANDROID_ADB_SERVER)")
+	flags.StringVar(&value.androidEmulatorBinary, "android-emulator-binary", value.androidEmulatorBinary, "Android Emulator executable path (WORLD_ANDROID_EMULATOR_BINARY)")
+	flags.StringVar(&value.androidSDKRoot, "android-sdk-root", value.androidSDKRoot, "installed Android SDK root (WORLD_ANDROID_SDK_ROOT)")
+	flags.StringVar(&value.androidSDKManagerBinary, "android-sdkmanager-binary", value.androidSDKManagerBinary, "Android sdkmanager executable path (WORLD_ANDROID_SDKMANAGER_BINARY)")
+	flags.StringVar(&value.androidAVDManagerBinary, "android-avdmanager-binary", value.androidAVDManagerBinary, "Android avdmanager executable path (WORLD_ANDROID_AVDMANAGER_BINARY)")
+	flags.IntVar(&value.androidADBBasePort, "android-adb-base-port", value.androidADBBasePort, "first managed Android console port, even 5554..5584 (WORLD_ANDROID_ADB_BASE_PORT)")
+	flags.StringVar(&value.androidBackendVersion, "android-backend-version", value.androidBackendVersion, "expected Android backend version (WORLD_ANDROID_BACKEND_VERSION)")
+	flags.StringVar(&value.androidRuntimeVersion, "android-runtime-version", value.androidRuntimeVersion, "expected Android runtime/build version (WORLD_ANDROID_RUNTIME_VERSION)")
 	flags.StringVar(&value.physicalTargetDriver, "physical-target-driver", value.physicalTargetDriver, "physical target driver selection (WORLD_PHYSICAL_TARGET_DRIVER)")
 	flags.StringVar(&value.observerDriver, "observer-driver", value.observerDriver, "external observer driver: none or process (WORLD_OBSERVER_DRIVER)")
 	flags.StringVar(&value.observerOutputRoot, "observer-output-dir", value.observerOutputRoot, "durable process observer output directory (WORLD_OBSERVER_OUTPUT_DIR)")
@@ -377,6 +405,10 @@ func defaultConfig(mode Mode) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	androidADBBasePort, err := environmentInt("WORLD_ANDROID_ADB_BASE_PORT", cuttlefish.ManagedEmulatorMinConsolePort)
+	if err != nil {
+		return config{}, err
+	}
 	controlTimeout, err := environmentDuration("WORLD_CONTROL_TIMEOUT", 30*time.Second)
 	if err != nil {
 		return config{}, err
@@ -403,8 +435,16 @@ func defaultConfig(mode Mode) (config, error) {
 		agentDriver:       envOr("WORLD_AGENT_DRIVER", "none"), dockerBinary: envOr("WORLD_DOCKER_BINARY", "docker"), agentWorkspaceRoot: os.Getenv("WORLD_AGENT_WORKSPACE_ROOT"),
 		agentImageRepository: os.Getenv("WORLD_AGENT_IMAGE_REPOSITORY"), agentGuestBinary: envOr("WORLD_AGENT_GUEST_BINARY", "/usr/local/bin/world-guest"), agentContainerUser: envOr("WORLD_AGENT_CONTAINER_USER", "65532:65532"),
 		linuxTargetDriver: envOr("WORLD_LINUX_TARGET_DRIVER", "none"), targetRoot: os.Getenv("WORLD_TARGET_ROOT"), targetImageRepository: os.Getenv("WORLD_TARGET_IMAGE_REPOSITORY"), targetAllowPtrace: allowPtrace,
-		androidTargetDriver: envOr("WORLD_ANDROID_TARGET_DRIVER", "none"), physicalTargetDriver: envOr("WORLD_PHYSICAL_TARGET_DRIVER", "none"),
-		observerDriver: envOr("WORLD_OBSERVER_DRIVER", "none"), observerOutputRoot: os.Getenv("WORLD_OBSERVER_OUTPUT_DIR"),
+		androidTargetDriver: envOr("WORLD_ANDROID_TARGET_DRIVER", "none"),
+		androidTargetRoot:   os.Getenv("WORLD_ANDROID_TARGET_ROOT"), androidSystemImageRoot: os.Getenv("WORLD_ANDROID_SYSTEM_IMAGE_ROOT"),
+		androidADBBinary: envOr("WORLD_ANDROID_ADB_BINARY", "adb"), androidADBServer: envOr("WORLD_ANDROID_ADB_SERVER", "127.0.0.1:5037"),
+		androidEmulatorBinary: envOr("WORLD_ANDROID_EMULATOR_BINARY", "emulator"),
+		androidSDKRoot:        os.Getenv("WORLD_ANDROID_SDK_ROOT"), androidSDKManagerBinary: envOr("WORLD_ANDROID_SDKMANAGER_BINARY", "sdkmanager"),
+		androidAVDManagerBinary: envOr("WORLD_ANDROID_AVDMANAGER_BINARY", "avdmanager"),
+		androidADBBasePort:      androidADBBasePort,
+		androidBackendVersion:   os.Getenv("WORLD_ANDROID_BACKEND_VERSION"), androidRuntimeVersion: os.Getenv("WORLD_ANDROID_RUNTIME_VERSION"),
+		physicalTargetDriver: envOr("WORLD_PHYSICAL_TARGET_DRIVER", "none"),
+		observerDriver:       envOr("WORLD_OBSERVER_DRIVER", "none"), observerOutputRoot: os.Getenv("WORLD_OBSERVER_OUTPUT_DIR"),
 		captureDriver: envOr("WORLD_CAPTURE_DRIVER", "none"), captureRoot: os.Getenv("WORLD_CAPTURE_DIR"),
 		workspaceDriver: envOr("WORLD_WORKSPACE_DRIVER", "none"), materialDriver: envOr("WORLD_MATERIAL_DRIVER", "local"),
 	}, nil
@@ -437,7 +477,7 @@ func (c config) validate() error {
 		"linux-target-driver":    {c.linuxTargetDriver, []string{"none", "docker"}},
 		"workspace-driver":       {c.workspaceDriver, []string{"none", "directory"}},
 		"material-driver":        {c.materialDriver, []string{"local"}},
-		"android-target-driver":  {c.androidTargetDriver, []string{"none"}},
+		"android-target-driver":  {c.androidTargetDriver, []string{"none", "android-emulator"}},
 		"physical-target-driver": {c.physicalTargetDriver, []string{"none"}},
 		"observer-driver":        {c.observerDriver, []string{"none", "process"}},
 		"capture-driver":         {c.captureDriver, []string{"none", "ledger"}},
@@ -446,12 +486,15 @@ func (c config) validate() error {
 			return err
 		}
 	}
-	physical := c.agentDriver != "none" || c.workspaceDriver != "none" || c.linuxTargetDriver != "none"
+	physical := c.agentDriver != "none" || c.workspaceDriver != "none" || c.linuxTargetDriver != "none" || c.androidTargetDriver != "none"
 	if (c.agentDriver == "docker") != (c.workspaceDriver == "directory") {
 		return fmt.Errorf("agent-driver=docker and workspace-driver=directory must be enabled together")
 	}
 	if c.linuxTargetDriver == "docker" && c.agentDriver != "docker" {
 		return fmt.Errorf("linux-target-driver=docker requires the Docker agent and directory workspace drivers")
+	}
+	if c.androidTargetDriver != "none" && c.agentDriver != "docker" {
+		return fmt.Errorf("android-target-driver requires the Docker agent and directory workspace drivers")
 	}
 	if !physical {
 		if c.captureDriver != "none" {
@@ -464,6 +507,9 @@ func (c config) validate() error {
 			"agent-workspace-root": c.agentWorkspaceRoot != "", "agent-image-repository": c.agentImageRepository != "",
 			"target-root": c.targetRoot != "", "target-image-repository": c.targetImageRepository != "",
 			"target-allow-ptrace": c.targetAllowPtrace,
+			"android-target-root": c.androidTargetRoot != "", "android-system-image-root": c.androidSystemImageRoot != "",
+			"android-sdk-root":        c.androidSDKRoot != "",
+			"android-backend-version": c.androidBackendVersion != "", "android-runtime-version": c.androidRuntimeVersion != "",
 			"observer-output-dir": c.observerOutputRoot != "", "observer-driver": c.observerDriver != "none",
 		} {
 			if configured {
@@ -514,6 +560,36 @@ func (c config) validate() error {
 		if c.targetRoot != "" || c.targetImageRepository != "" || c.targetAllowPtrace {
 			return fmt.Errorf("target-root, target-image-repository, and target-allow-ptrace require linux-target-driver=docker")
 		}
+	}
+	if c.androidTargetDriver != "none" {
+		if err := requireAbsoluteManagedRoot("android-target-root", c.androidTargetRoot); err != nil {
+			return err
+		}
+		if err := requireAbsoluteManagedRoot("android-system-image-root", c.androidSystemImageRoot); err != nil {
+			return err
+		}
+		for name, value := range map[string]string{
+			"android-adb-binary": c.androidADBBinary, "android-adb-server": c.androidADBServer,
+			"android-backend-version": c.androidBackendVersion, "android-runtime-version": c.androidRuntimeVersion,
+		} {
+			if strings.TrimSpace(value) == "" {
+				return fmt.Errorf("%s must not be blank when the Android target driver is enabled", name)
+			}
+		}
+		if c.androidADBBasePort < cuttlefish.ManagedEmulatorMinConsolePort || c.androidADBBasePort > cuttlefish.ManagedEmulatorMaxConsolePort || c.androidADBBasePort%2 != 0 {
+			return fmt.Errorf("android-adb-base-port must be an even console port from %d through %d", cuttlefish.ManagedEmulatorMinConsolePort, cuttlefish.ManagedEmulatorMaxConsolePort)
+		}
+		if err := cuttlefish.ValidateManagedADBServerEndpoint(c.androidADBServer); err != nil {
+			return fmt.Errorf("android-adb-server: %w", err)
+		}
+		if strings.TrimSpace(c.androidEmulatorBinary) == "" || strings.TrimSpace(c.androidSDKManagerBinary) == "" || strings.TrimSpace(c.androidAVDManagerBinary) == "" {
+			return fmt.Errorf("android-emulator requires non-blank emulator, sdkmanager, and avdmanager binaries")
+		}
+		if err := requireAbsoluteManagedRoot("android-sdk-root", c.androidSDKRoot); err != nil {
+			return err
+		}
+	} else if c.androidTargetRoot != "" || c.androidSystemImageRoot != "" || c.androidSDKRoot != "" || c.androidBackendVersion != "" || c.androidRuntimeVersion != "" {
+		return fmt.Errorf("Android roots and version expectations require android-target-driver")
 	}
 	if !validContainerPath(c.agentGuestBinary) {
 		return fmt.Errorf("agent-guest-binary must be a normalized absolute container path")

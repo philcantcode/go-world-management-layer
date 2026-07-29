@@ -24,7 +24,6 @@ type FakeWorkspaceDriver struct {
 	faults     *FaultInjector
 	tracker    *OwnershipTracker
 	requests   map[string]string
-	results    map[string]ports.WorkspaceHandle
 	workspaces map[domain.WorkspaceID]*fakeWorkspaceRecord
 }
 
@@ -40,7 +39,7 @@ func NewFakeWorkspaceDriver(clock *Clock, faults *FaultInjector, tracker *Owners
 	}
 	return &FakeWorkspaceDriver{
 		clock: clock, faults: faults, tracker: tracker,
-		requests: make(map[string]string), results: make(map[string]ports.WorkspaceHandle),
+		requests:   make(map[string]string),
 		workspaces: make(map[domain.WorkspaceID]*fakeWorkspaceRecord),
 	}
 }
@@ -63,7 +62,11 @@ func (d *FakeWorkspaceDriver) Prepare(ctx context.Context, plan ports.WorkspaceP
 		if previous != signature {
 			return ports.WorkspaceHandle{}, idempotencyConflict("fake_workspace.prepare")
 		}
-		return d.results[plan.IdempotencyKey], nil
+		record, found := d.workspaces[spec.ID]
+		if !found {
+			return ports.WorkspaceHandle{}, domain.NewError(domain.CodeConflict, "fake_workspace.prepare", "idempotency_key", "refers to a workspace that is no longer present", nil)
+		}
+		return record.handle, nil
 	}
 	if _, found := d.workspaces[spec.ID]; found {
 		return ports.WorkspaceHandle{}, domain.NewError(domain.CodeAlreadyExists, "fake_workspace.prepare", "workspace_id", "already exists", nil)
@@ -77,7 +80,6 @@ func (d *FakeWorkspaceDriver) Prepare(ctx context.Context, plan ports.WorkspaceP
 	}
 	d.workspaces[spec.ID] = &fakeWorkspaceRecord{plan: plan, handle: handle, owner: spec.LeaseID.String()}
 	d.requests[plan.IdempotencyKey] = signature
-	d.results[plan.IdempotencyKey] = handle
 	if err := d.faults.Check("workspace.prepare.after"); err != nil {
 		return ports.WorkspaceHandle{}, err
 	}

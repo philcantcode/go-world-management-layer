@@ -80,6 +80,7 @@ testdata/e2e/**/build/
 *.sock
 *.worldd.lock
 *.world-node.lock
+.testtmp/
 
 # Local sealed material / orchestration dumps if created under the tree
 /bundles/

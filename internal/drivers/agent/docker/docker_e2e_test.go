@@ -15,6 +15,7 @@ import (
 
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
 	"github.com/philcantcode/go-world-management-layer/internal/drivers/command"
+	"github.com/philcantcode/go-world-management-layer/internal/drivers/dockercli"
 	workspacedirectory "github.com/philcantcode/go-world-management-layer/internal/drivers/workspace/directory"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
 	"github.com/philcantcode/go-world-management-layer/internal/transport"
@@ -122,6 +123,18 @@ func TestDockerAgentWorkspaceLifecycleEndToEnd(t *testing.T) {
 		}
 	}
 
+	crashProof, err := driver.RecoverInterruptedExecs(ctx, fixture.agent)
+	if err != nil {
+		t.Fatalf("cross real Docker crash-recovery boundary: %v", err)
+	}
+	if err := crashProof.ValidateFor(fixture.agent); err != nil {
+		t.Fatalf("real Docker crash-recovery proof = %#v: %v", crashProof, err)
+	}
+	if crashProof.Status.ContainerID != containerID {
+		t.Fatalf("crash recovery changed container identity: got %q, want %q", crashProof.Status.ContainerID, containerID)
+	}
+	requireSingleWorkspaceMount(t, ctx, containerID, handle.MergedPath)
+
 	ref := ports.AgentWorkspaceRef{ID: fixture.agent.Generation.Spec().AgentWorkspaceID, Generation: fixture.agent.Generation.Spec().Generation}
 	if err := driver.Stop(ctx, ref, ports.StopGraceful); err != nil {
 		t.Fatal(err)
@@ -221,7 +234,7 @@ func requireSingleWorkspaceMount(t *testing.T, ctx context.Context, containerID,
 		t.Fatal(err)
 	}
 	got, err := filepath.Abs(mounts[0].Source)
-	if err != nil || !strings.EqualFold(filepath.Clean(got), filepath.Clean(want)) {
+	if err != nil || !dockercli.CanonicalHostBindSourceEqual(got, want) {
 		t.Fatalf("workspace mount source = %q, want %q (resolve error %v)", mounts[0].Source, want, err)
 	}
 }

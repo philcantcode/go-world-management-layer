@@ -1,6 +1,7 @@
 # Implementation plan
 
-- Status: proposed
+- Status: historical delivery plan; see `README.md` and `docs/design.md` for the
+  shipped boundary
 - Date: 2026-07-24
 - Revised: 2026-07-27
 - Target module: `github.com/philcantcode/go-world-management-layer`
@@ -117,8 +118,9 @@ Purpose: retire high-risk unknowns before production scaffolding.
 ### 4.1 Linux node matrix
 
 Exercise at least Ubuntu LTS and one other cgroup v2 distribution in disposable
-VMs. Record kernel, filesystem, Docker Engine/API, runc, rootless, gVisor, Kata,
-KVM, SELinux/AppArmor, eBPF/BTF, `openat2`, fanotify, and PSI capabilities.
+VMs. Record kernel, filesystem, Docker Engine/API, runc, rootless, KVM,
+SELinux/AppArmor, eBPF/BTF, `openat2`, fanotify, and PSI capabilities. Keep
+gVisor/Kata measurements in a future non-shipping research matrix.
 
 Prove:
 
@@ -190,10 +192,17 @@ Prove the selected stack can start before the specimen, attribute events to the
 correct target run and process identity, maintain a bounded packet ring, seal an
 authoritative target change manifest, report all lost coverage, and finalize a
 raw-plus-normalized observation bundle after success, crash, OOM, cancellation,
-collector death, or daemon restart. Compare the same fixtures under gVisor/Kata
-and document the exact visibility lost or moved into the guest.
+collector death, or daemon restart. As future non-shipping research, compare
+the same fixtures under gVisor/Kata and document the exact visibility lost or
+moved into the guest.
 
 ### 4.5 Android virtual-device spike
+
+Resolution note (2026-07-28): the shipped local backend selects the Android SDK
+Emulator with full-tree image identity, durable exact-port allocation, clean
+boot, one mutable run per generation, and replacement-generation reset.
+Daemon-selected Cuttlefish, snapshot restore, custom-AOSP instrumentation, and
+physical devices remain future work.
 
 On a KVM host, compare Cuttlefish and Android Emulator behind one target-driver
 contract. Boot an instrumented rooted/debuggable AOSP device with isolated state
@@ -209,6 +218,11 @@ MobSF through its API and decide which static/dynamic outputs are reused as
 external evidence without delegating world lifecycle or provenance to it.
 
 ### 4.6 Scoped ADB spike
+
+Resolution note (2026-07-28): the shipped protocol-aware gateway binds one
+literal-loopback upstream and exact serial, denies host-global/cross-serial
+actions, and preserves assigned-device services. Further protocol fuzzing is a
+continuing qualification requirement, not an unimplemented driver seam.
 
 Prototype a protocol-aware proxy that exposes one assigned serial. Verify that
 device listing and transport selection cannot address another attached device
@@ -386,8 +400,8 @@ Implement:
   stderr, authoritative filesystem changes, and crash/OOM evidence;
 - deterministic normalization and observation-bundle finalization with raw refs,
   coverage/gaps, changes, incidents, and a cited derived summary; and
-- optional gVisor/Kata profiles that publish their reduced or guest-provided
-  visibility rather than claiming parity with host eBPF.
+- future, non-shipped gVisor/Kata research that would publish reduced or
+  guest-provided visibility rather than claiming parity with host eBPF.
 
 ### Phase 4 exit gate
 
@@ -483,8 +497,8 @@ test exist:
 
 Implement:
 
-- rootless agent-workspace and optional gVisor/Kata target profiles where phase
-  0 proves compatibility and their visibility contract is explicit;
+- rootless agent-workspace hardening, plus future non-shipped gVisor/Kata
+  research where phase 0 proves compatibility and a new visibility contract;
 - signed/pinned images and policy distribution;
 - node registration, drain, maintenance, quarantine, upgrade, and version skew;
 - backup/snapshot/restore and migration for world state and unfinalized segments;
@@ -590,7 +604,7 @@ those motivate the stronger isolation tier and node containment.
   corpus, and forced host-level failures.
 - KVM runner: Cuttlefish/emulator boot/reset/crash/collector suite.
 - Nightly: race, extended fuzz, Tracee/Inspektor Gadget compatibility fixtures,
-  and gVisor/Kata visibility matrix.
+  plus a non-shipping gVisor/Kata research visibility matrix.
 - Weekly: chaos/soak, high-rate telemetry, pressure/fairness, and disaster
   recovery.
 
@@ -762,14 +776,12 @@ choices:
 - Tracee versus Inspektor Gadget for the required Linux metadata contract,
   including license, embedding/process boundary, startup races, completeness,
   schema stability, drop accounting, and overhead;
-- gVisor/Kata compatibility/performance and the exact target visibility lost or
-  replaced by in-guest collection;
-- Cuttlefish versus Android Emulator for scale, reset, snapshot, instrumentation,
-  and operational behavior, plus whether framework-level intent coverage
-  requires a maintained custom AOSP image;
-- the scoped ADB proxy implementation, protocol-validation strategy, and exact
-  host-global/cross-serial deny boundary while preserving arbitrary assigned-
-  device services;
+- future non-shipping gVisor/Kata compatibility/performance research and the
+  exact target visibility lost or replaced by in-guest collection;
+- Cuttlefish, snapshots, scale-out operation, and custom-AOSP framework
+  instrumentation beyond the shipped Android SDK Emulator clean-boot backend;
+- continuing scoped-ADB protocol fuzzing and qualification of the shipped
+  host-global/cross-serial deny boundary;
 - the exact protobuf segment framing/compression and local segment size;
 - safe provider credential delivery that supports each CLI without mounting a
   general host home directory;

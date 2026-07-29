@@ -194,6 +194,85 @@ func TestCompileEnforcesCommandAuthorityInvariants(t *testing.T) {
 	}
 }
 
+func TestCompileRequiresImplementedAndroidRuntimeContract(t *testing.T) {
+	tests := []struct {
+		name     string
+		oldValue string
+		newValue string
+		path     string
+	}{
+		{
+			name:     "unsupported driver",
+			oldValue: "driver: android-emulator",
+			newValue: "driver: unsupported-driver",
+			path:     "spec.targets.templates[1].runtime.driver",
+		},
+		{
+			name:     "unsupported baseline",
+			oldValue: "baselineState: clean-boot",
+			newValue: "baselineState: snapshot-v1",
+			path:     "spec.targets.templates[1].runtime.baselineState",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := replaceOnce(t, examplePolicy(t), test.oldValue, test.newValue)
+			_, err := Compile(source, CompileOptions{})
+			assertPolicyErrorContains(t, err, test.path, "must be")
+		})
+	}
+}
+
+func TestCompileRejectsUnimplementedLinuxContainerRuntimes(t *testing.T) {
+	for _, runtimeName := range []string{"gvisor", "kata"} {
+		t.Run(runtimeName, func(t *testing.T) {
+			source := replaceOnce(t, examplePolicy(t), "          runtime: runc", "          runtime: "+runtimeName)
+			source = replaceOnce(t, source, "          isolationProfile: observable-container", "          isolationProfile: sandboxed-kernel")
+			_, err := Compile(source, CompileOptions{})
+			assertPolicyErrorContains(t, err, "spec.targets.templates[0].runtime.runtime", "must be")
+		})
+	}
+}
+
+func TestCompileRequiresEnforceableAndroidResources(t *testing.T) {
+	tests := []struct {
+		name     string
+		oldValue string
+		newValue string
+		path     string
+		message  string
+	}{
+		{
+			name:     "fractional host CPU",
+			oldValue: "            cpu: \"4\"\n            memory: 6Gi\n            writableState: 1Gi",
+			newValue: "            cpu: \"1.5\"\n            memory: 6Gi\n            writableState: 1Gi",
+			path:     "spec.targets.templates[1].resources.limits.cpu",
+			message:  "whole-vCPU",
+		},
+		{
+			name:     "unaligned data partition",
+			oldValue: "            writableState: 1Gi",
+			newValue: "            writableState: 1073741825B",
+			path:     "spec.targets.templates[1].resources.limits.writableState",
+			message:  "MiB-aligned",
+		},
+		{
+			name:     "oversized data partition",
+			oldValue: "            writableState: 1Gi",
+			newValue: "            writableState: 2Gi",
+			path:     "spec.targets.templates[1].resources.limits.writableState",
+			message:  "64 to 2047 MiB",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := replaceOnce(t, examplePolicy(t), test.oldValue, test.newValue)
+			_, err := Compile(source, CompileOptions{})
+			assertPolicyErrorContains(t, err, test.path, test.message)
+		})
+	}
+}
+
 func TestCompileCapabilityResolution(t *testing.T) {
 	t.Run("missing required reflink", func(t *testing.T) {
 		source := examplePolicy(t)

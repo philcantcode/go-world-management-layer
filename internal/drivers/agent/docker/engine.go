@@ -31,6 +31,9 @@ type ContainerState struct {
 	ID            string
 	Name          string
 	Running       bool
+	Paused        bool
+	Restarting    bool
+	Dead          bool
 	Status        string
 	Labels        map[string]string
 	CgroupID      string
@@ -47,8 +50,9 @@ type Engine interface {
 	OpenExec(context.Context, string, string, ports.ExecPlan) (ports.ExecTransport, error)
 }
 
-// EngineInventory is optional so existing Engine implementations and focused
-// fakes do not need to claim authoritative physical inventory support.
+// EngineInventory is a separate capability so probe-only engines do not need
+// to claim physical authority. Provision, reconciliation, and restart-safe
+// destruction require it and fail closed when it is unavailable.
 type EngineInventory interface {
 	ListContainers(context.Context) ([]ContainerState, error)
 }
@@ -121,8 +125,8 @@ func (e *CLIEngine) Create(ctx context.Context, plan ContainerPlan) (string, err
 		return "", err
 	}
 	id := strings.TrimSpace(string(result.Stdout))
-	if id == "" {
-		return "", fmt.Errorf("Docker create returned an empty container ID")
+	if err := dockercli.RequireCanonicalContainerID(id); err != nil {
+		return "", fmt.Errorf("Docker create returned an invalid container ID: %w", err)
 	}
 	return id, nil
 }
@@ -190,7 +194,8 @@ var _ EngineInventory = (*CLIEngine)(nil)
 
 func containerState(container dockercli.Container) ContainerState {
 	return ContainerState{
-		ID: container.ID, Name: container.Name, Running: container.Running, Status: container.Status,
+		ID: container.ID, Name: container.Name, Running: container.Running, Paused: container.Paused,
+		Restarting: container.Restarting, Dead: container.Dead, Status: container.Status,
 		Labels: container.Labels, CgroupID: container.CgroupID, Configuration: container.Configuration,
 	}
 }

@@ -6,20 +6,28 @@ operations.
 
 The shipped daemons execute crash-consistent logical control transitions,
 ledger recovery/live projection, local observation-bundle finalization, and an
-opt-in physical Linux composition. A trusted version-2 deployment profile can
-activate directory-copy workspaces, Docker-backed agent and Linux-target
-drivers, deployment-authorized local material, process observers, and ledger
-capture. Startup compiles strict policy against probed capabilities, preflights
+opt-in physical Linux and Android composition. A trusted version-3 deployment
+profile can activate directory-copy workspaces, Docker-backed agent and
+Linux-target drivers, managed Android SDK Emulator targets,
+deployment-authorized local material, process observers, and ledger capture.
+Startup compiles strict policy against probed capabilities, preflights
 every physical plan, and reconciles durable ownership before opening the
 listener. The deployment must still supply and qualify the host, pinned images
 and observer programs, service management, monitoring, and any remote artifact
 backend.
 
-Android remains a package/qualification boundary. The AttachedEmulator real
-test exercises a Cuttlefish-family target and scoped ADB against an externally
-started SDK emulator; the daemon flags accept no Android driver other than
-`none`. Do not treat deterministic package tests or the attached-emulator test
-as managed Cuttlefish production qualification.
+`android-target-driver=android-emulator` owns headless AVD creation, clean boot,
+exact-serial scoped ADB/file transport, quarantine, replacement-generation
+reset, destruction, durable allocation, and startup reconciliation. It accepts
+one exact full-tree system-image digest/package identity per deployment and one
+mutable run per generation. Managed lifecycle resource containment is Windows-
+only: a named Job caps the whole host process tree, guest RAM is configured
+separately, and `writableState` binds exact guest `/data` capacity. Other hosts
+fail closed. The Docker Linux driver has the same one-run rule:
+run stop proves the exact container stopped, and only replacement reset creates
+authority for another run. The
+AttachedEmulator test remains a separate qualification for externally owned
+devices; do not treat it as proof of managed lifecycle behavior.
 
 ## Common rules
 

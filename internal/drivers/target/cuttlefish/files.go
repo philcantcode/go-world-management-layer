@@ -102,6 +102,7 @@ type ScopedFileGateway interface {
 type CommandFileGatewayConfig struct {
 	Runner               command.Runner
 	ADBBinary            string
+	ADBServerEndpoint    string
 	StagingRoot          string
 	MaximumTransferBytes int64
 }
@@ -112,6 +113,7 @@ type CommandFileGatewayConfig struct {
 type CommandFileGateway struct {
 	runner      command.Runner
 	adbBinary   string
+	adbServer   adbServerEndpoint
 	stagingRoot string
 	maximum     int64
 
@@ -128,13 +130,17 @@ func NewCommandFileGateway(config CommandFileGatewayConfig) (*CommandFileGateway
 	if config.StagingRoot == "" {
 		return nil, fmt.Errorf("ADB staging root is required")
 	}
+	adbServer, err := parseADBServerEndpoint(config.ADBServerEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("command file gateway ADB server endpoint: %w", err)
+	}
 	if config.MaximumTransferBytes == 0 {
 		config.MaximumTransferBytes = defaultMaximumADBTransferBytes
 	}
 	if config.MaximumTransferBytes < 0 || config.MaximumTransferBytes == math.MaxInt64 {
 		return nil, fmt.Errorf("maximum ADB transfer bytes must leave room for an overflow sentinel byte")
 	}
-	return &CommandFileGateway{runner: config.Runner, adbBinary: config.ADBBinary, stagingRoot: config.StagingRoot, maximum: config.MaximumTransferBytes}, nil
+	return &CommandFileGateway{runner: config.Runner, adbBinary: config.ADBBinary, adbServer: adbServer, stagingRoot: config.StagingRoot, maximum: config.MaximumTransferBytes}, nil
 }
 
 func (g *CommandFileGateway) PrepareRun(ctx context.Context, scope deviceproxy.Scope, allocation Allocation) error {
@@ -407,7 +413,7 @@ func (g *CommandFileGateway) requireConfinedPathLocked(ctx context.Context, allo
 }
 
 func (g *CommandFileGateway) run(ctx context.Context, serial string, maximumOutput int64, args ...string) (command.Result, error) {
-	return runExactSerialADB(ctx, g.runner, g.adbBinary, serial, maximumOutput, args...)
+	return runExactSerialADBAt(ctx, g.runner, g.adbBinary, g.adbServer, serial, maximumOutput, args...)
 }
 
 func requireExactDeviceScope(scope deviceproxy.Scope, allocation Allocation) error {

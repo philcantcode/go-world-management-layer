@@ -163,26 +163,36 @@ func TargetProvisioningPlanDigest(plan ports.TargetPlan) (domain.Digest, error) 
 	}
 	generation := plan.Generation.Spec()
 	signature, err := requestSignature(struct {
-		LeaseID            string              `json:"lease_id"`
-		TargetID           string              `json:"target_id"`
-		ResearchSessionID  string              `json:"research_session_id"`
-		Generation         uint64              `json:"generation"`
-		Kind               string              `json:"kind"`
-		TemplateName       string              `json:"template_name"`
-		Driver             string              `json:"driver"`
-		Runtime            string              `json:"runtime"`
-		ImageDigest        string              `json:"image_digest"`
-		IsolationProfile   string              `json:"isolation_profile"`
-		PolicyDigest       string              `json:"policy_digest"`
-		CapabilityDigest   string              `json:"capability_digest"`
-		Resources          admission.Resources `json:"resources"`
-		PreviousGeneration uint64              `json:"previous_generation,omitempty"`
-		RecoveryIncidentID string              `json:"recovery_incident_id,omitempty"`
-		GenerationCreated  time.Time           `json:"generation_created_at"`
+		LeaseID                     string              `json:"lease_id"`
+		TargetID                    string              `json:"target_id"`
+		ResearchSessionID           string              `json:"research_session_id"`
+		Generation                  uint64              `json:"generation"`
+		Kind                        string              `json:"kind"`
+		TemplateName                string              `json:"template_name"`
+		Driver                      string              `json:"driver"`
+		Runtime                     string              `json:"runtime"`
+		ImageDigest                 string              `json:"image_digest"`
+		IsolationProfile            string              `json:"isolation_profile"`
+		BaselineState               string              `json:"baseline_state,omitempty"`
+		RequireHardwareAcceleration bool                `json:"require_hardware_acceleration,omitempty"`
+		Headless                    bool                `json:"headless,omitempty"`
+		Rooted                      bool                `json:"rooted,omitempty"`
+		Debuggable                  bool                `json:"debuggable,omitempty"`
+		GuestMemoryBytes            int64               `json:"guest_memory_bytes,omitempty"`
+		BootTimeout                 time.Duration       `json:"boot_timeout,omitempty"`
+		PolicyDigest                string              `json:"policy_digest"`
+		CapabilityDigest            string              `json:"capability_digest"`
+		Resources                   admission.Resources `json:"resources"`
+		PreviousGeneration          uint64              `json:"previous_generation,omitempty"`
+		RecoveryIncidentID          string              `json:"recovery_incident_id,omitempty"`
+		GenerationCreated           time.Time           `json:"generation_created_at"`
 	}{
 		LeaseID: plan.LeaseID.String(), TargetID: plan.Target.ID().String(), ResearchSessionID: plan.Target.ResearchSessionID().String(),
 		Generation: uint64(generation.Generation), Kind: string(plan.Target.Kind()), TemplateName: plan.Template.Name,
 		Driver: plan.Template.Driver, Runtime: plan.Template.Runtime, ImageDigest: plan.Template.ImageDigest.String(), IsolationProfile: plan.Template.IsolationProfile,
+		BaselineState: plan.Template.BaselineState, RequireHardwareAcceleration: plan.Template.RequireHardwareAcceleration,
+		Headless: plan.Template.Headless, Rooted: plan.Template.Rooted, Debuggable: plan.Template.Debuggable,
+		GuestMemoryBytes: plan.Template.GuestMemoryBytes, BootTimeout: plan.Template.BootTimeout,
 		PolicyDigest: plan.PolicyDigest.String(), CapabilityDigest: plan.CapabilityFingerprintDigest.String(), Resources: plan.Resources.Clone(),
 		PreviousGeneration: uint64(generation.PreviousGeneration), RecoveryIncidentID: generation.RecoveryIncidentID.String(), GenerationCreated: generation.CreatedAt,
 	})
@@ -302,7 +312,7 @@ func (p AgentProvisioningPlan) Validate() error {
 	generation := p.Agent.Generation.Spec()
 	if workspace != agentWorkspace || workspace.LeaseID != p.Agent.LeaseID ||
 		workspace.AgentWorkspaceID != generation.AgentWorkspaceID || workspace.AgentGeneration != generation.Generation ||
-		workspace.InputViewID != p.Workspace.InputView.ID() {
+		workspace.InputViewID != p.Workspace.InputView.ID() || workspace.InputViewID != generation.InputViewID {
 		return domain.NewError(domain.CodeConflict, operation, "scope", "workspace and agent plans do not identify the same immutable generation", nil)
 	}
 	return nil

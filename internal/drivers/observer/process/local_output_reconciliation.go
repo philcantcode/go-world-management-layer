@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -216,7 +217,69 @@ func (f *LocalOutputFactory) reconcileCollectorOutput(directory string, binding 
 	if binding.StartCommitted && !hasCompletePartialSet(entries) {
 		return ports.InterruptedCollectorOutput{}, outputIntegrity("collector_transaction", "does not contain both durable stream files after the collector start was committed", nil)
 	}
+	if binding.StartCommitted {
+		return f.finalizeInterruptedCollector(directory, signature, plan)
+	}
 	return abortInterruptedCollector(directory, signature, plan.CollectorID)
+}
+
+func (f *LocalOutputFactory) finalizeInterruptedCollector(directory, signature string, plan ports.CollectorPlan) (ports.InterruptedCollectorOutput, error) {
+	if err := f.syncInterruptedCapturePartials(directory, plan.MaximumBytes); err != nil {
+		return ports.InterruptedCollectorOutput{}, err
+	}
+	contents, totalSize, err := readLocalCaptureContents(directory, plan.MaximumBytes)
+	if err != nil {
+		return ports.InterruptedCollectorOutput{}, err
+	}
+	// The in-memory record of an attempted over-limit write dies with the old
+	// process. Below the boundary is provably complete; at the exact boundary,
+	// conservatively describe the recovered bytes as a truncated prefix rather
+	// than risk claiming complete capture.
+	exceeded := totalSize == plan.MaximumBytes
+	artifacts, err := f.publishFinalizedCapture(directory, signature, plan, contents, exceeded)
+	if err != nil {
+		return ports.InterruptedCollectorOutput{}, err
+	}
+	if err := requireExactCollectorFiles(directory, "finalized.json"); err != nil {
+		return ports.InterruptedCollectorOutput{}, err
+	}
+	return ports.InterruptedCollectorOutput{
+		CollectorID: plan.CollectorID, State: ports.InterruptedCollectorOutputFinalized,
+		Artifacts: append([]domain.ArtifactReference(nil), artifacts...), CaptureLimitExceeded: exceeded,
+	}, nil
+}
+
+func (f *LocalOutputFactory) syncInterruptedCapturePartials(directory string, maximum int64) error {
+	streams := localCaptureStreams()
+	var totalSize int64
+	for _, stream := range streams {
+		path := filepath.Join(directory, stream.file)
+		file, identity, err := openVerifiedRegularFileWithFlags(path, os.O_RDWR)
+		if err != nil {
+			return err
+		}
+		if identity.Size() < 0 || identity.Size() > maximum-totalSize {
+			_ = file.Close()
+			return outputIntegrity("partial_output", "exceeds the collector's shared byte limit", nil)
+		}
+		totalSize += identity.Size()
+		if f.syncFile == nil {
+			_ = file.Close()
+			return outputIntegrity("partial_output", "capture file sync authority is unavailable", nil)
+		}
+		syncErr := f.syncFile(file)
+		closeErr := closeVerifiedRegularFile(file, identity)
+		if syncErr != nil || closeErr != nil {
+			return fmt.Errorf("sync recovered %s: %w", stream.file, errors.Join(syncErr, closeErr))
+		}
+	}
+	if f.syncDir == nil {
+		return outputIntegrity("collector_directory", "capture directory sync authority is unavailable", nil)
+	}
+	if err := f.syncDir(directory); err != nil {
+		return fmt.Errorf("sync recovered collector output directory: %w", err)
+	}
+	return requireExactCollectorFiles(directory, streams[0].file, streams[1].file)
 }
 
 func (f *LocalOutputFactory) reconcileFinalizedCollector(directory, signature string, plan ports.CollectorPlan) (ports.InterruptedCollectorOutput, error) {
@@ -324,11 +387,11 @@ func abortInterruptedCollector(directory, signature string, collectorID domain.C
 
 func validateInterruptedPartials(directory string, entries map[string]os.FileInfo, maximum int64) error {
 	var total int64
-	for _, name := range []string{"stdout.partial", "stderr.partial"} {
-		if _, found := entries[name]; !found {
+	for _, stream := range localCaptureStreams() {
+		if _, found := entries[stream.file]; !found {
 			continue
 		}
-		size, err := verifiedRegularFileSize(filepath.Join(directory, name), maximum)
+		size, err := verifiedRegularFileSize(filepath.Join(directory, stream.file), maximum)
 		if err != nil {
 			return err
 		}
@@ -515,11 +578,11 @@ func (f *LocalOutputFactory) scanRunObjectReachability() (objectReachability, er
 					return objectReachability{}, outputIntegrity("collector_file", "must be regular and non-symlink", nil)
 				}
 			}
-			for _, name := range []string{"stdout.partial", "stderr.partial"} {
-				if _, found := files[name]; !found {
+			for _, stream := range localCaptureStreams() {
+				if _, found := files[stream.file]; !found {
 					continue
 				}
-				path := filepath.Join(collectorDirectory, name)
+				path := filepath.Join(collectorDirectory, stream.file)
 				digest, err := hashVerifiedRegularFile(path)
 				if err != nil {
 					return objectReachability{}, err
@@ -799,6 +862,10 @@ func verifiedRegularFilePrefix(prefixPath, fullPath string) (bool, error) {
 }
 
 func openVerifiedRegularFile(path string) (*os.File, os.FileInfo, error) {
+	return openVerifiedRegularFileWithFlags(path, os.O_RDONLY)
+}
+
+func openVerifiedRegularFileWithFlags(path string, flags int) (*os.File, os.FileInfo, error) {
 	before, err := os.Lstat(path)
 	if err != nil {
 		return nil, nil, err
@@ -806,7 +873,7 @@ func openVerifiedRegularFile(path string) (*os.File, os.FileInfo, error) {
 	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 {
 		return nil, nil, outputIntegrity("file", "must be a regular non-symlink file", nil)
 	}
-	file, err := os.Open(path)
+	file, err := os.OpenFile(path, flags, 0)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -851,14 +918,16 @@ func hasCommittedCollector(bindings []ports.InterruptedCollectorBinding) bool {
 }
 
 func hasPartial(entries map[string]os.FileInfo) bool {
-	_, stdout := entries["stdout.partial"]
-	_, stderr := entries["stderr.partial"]
+	streams := localCaptureStreams()
+	_, stdout := entries[streams[0].file]
+	_, stderr := entries[streams[1].file]
 	return stdout || stderr
 }
 
 func hasCompletePartialSet(entries map[string]os.FileInfo) bool {
-	_, stdout := entries["stdout.partial"]
-	_, stderr := entries["stderr.partial"]
+	streams := localCaptureStreams()
+	_, stdout := entries[streams[0].file]
+	_, stderr := entries[streams[1].file]
 	return stdout && stderr
 }
 

@@ -21,11 +21,26 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/drivers/deviceproxy"
 )
 
+const fileGatewayTestADBServerEndpoint = "127.0.0.1:5041"
+
+func TestValidateManagedADBServerEndpointRequiresLiteralLoopback(t *testing.T) {
+	for _, valid := range []string{"127.0.0.1:5037", "[::1]:5037"} {
+		if err := ValidateManagedADBServerEndpoint(valid); err != nil {
+			t.Fatalf("valid endpoint %q: %v", valid, err)
+		}
+	}
+	for _, invalid := range []string{"", "localhost:5037", "192.0.2.10:5037", "127.0.0.1:0", " 127.0.0.1:5037"} {
+		if err := ValidateManagedADBServerEndpoint(invalid); err == nil {
+			t.Fatalf("invalid endpoint %q was accepted", invalid)
+		}
+	}
+}
+
 func TestCommandFileGatewayUsesOnlyExactSerialAndVerifiesBytes(t *testing.T) {
 	scope, allocation := adbTestScope(t)
 	runner := newFakeADBRunner(t, allocation.Serial)
 	staging := cuttlefishTempDir(t, "world-adb-staging-")
-	gateway, err := NewCommandFileGateway(CommandFileGatewayConfig{Runner: runner, ADBBinary: "test-adb", StagingRoot: staging, MaximumTransferBytes: 64})
+	gateway, err := NewCommandFileGateway(CommandFileGatewayConfig{Runner: runner, ADBBinary: "test-adb", ADBServerEndpoint: fileGatewayTestADBServerEndpoint, StagingRoot: staging, MaximumTransferBytes: 64})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,15 +82,16 @@ func TestCommandFileGatewayUsesOnlyExactSerialAndVerifiesBytes(t *testing.T) {
 	}
 	var pushedHostPath string
 	for _, invocation := range invocations {
-		if invocation.Program != "test-adb" || len(invocation.Args) < 3 || invocation.Args[0] != "-s" || invocation.Args[1] != allocation.Serial {
+		action, exact := exactADBTestAction(invocation.Args, fileGatewayTestADBServerEndpoint, allocation.Serial)
+		if invocation.Program != "test-adb" || !exact {
 			t.Fatalf("invocation escaped exact serial scope: %#v", invocation)
 		}
-		joined := strings.Join(invocation.Args[2:], "\x00")
-		if strings.Contains(joined, "host:") || strings.Contains(joined, "host-serial:") || containsArgument(invocation.Args[2:], "sh") || containsArgument(invocation.Args[2:], "bash") {
+		joined := strings.Join(action, "\x00")
+		if strings.Contains(joined, "host:") || strings.Contains(joined, "host-serial:") || containsArgument(action, "sh") || containsArgument(action, "bash") {
 			t.Fatalf("host-global or shell authority used: %#v", invocation.Args)
 		}
-		if invocation.Args[2] == "push" {
-			pushedHostPath = invocation.Args[3]
+		if action[0] == "push" {
+			pushedHostPath = action[1]
 		}
 	}
 	stagingAbs, _ := filepath.Abs(staging)
@@ -97,7 +113,7 @@ func TestCommandFileGatewayRejectsCrossDeviceOversizeAndCorruption(t *testing.T)
 	scope, allocation := adbTestScope(t)
 	runner := newFakeADBRunner(t, allocation.Serial)
 	staging := cuttlefishTempDir(t, "world-adb-reject-")
-	gateway, err := NewCommandFileGateway(CommandFileGatewayConfig{Runner: runner, StagingRoot: staging, MaximumTransferBytes: 8})
+	gateway, err := NewCommandFileGateway(CommandFileGatewayConfig{Runner: runner, ADBServerEndpoint: fileGatewayTestADBServerEndpoint, StagingRoot: staging, MaximumTransferBytes: 8})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +164,7 @@ func TestCommandFileGatewayRejectsCrossDeviceOversizeAndCorruption(t *testing.T)
 func TestCommandFileGatewayRejectsRemoteShellPathsAndSymlinkParents(t *testing.T) {
 	scope, allocation := adbTestScope(t)
 	runner := newFakeADBRunner(t, allocation.Serial)
-	gateway, err := NewCommandFileGateway(CommandFileGatewayConfig{Runner: runner, StagingRoot: cuttlefishTempDir(t, "world-adb-path-")})
+	gateway, err := NewCommandFileGateway(CommandFileGatewayConfig{Runner: runner, ADBServerEndpoint: fileGatewayTestADBServerEndpoint, StagingRoot: cuttlefishTempDir(t, "world-adb-path-")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,20 +195,41 @@ func TestCommandFileGatewayRejectsRemoteShellPathsAndSymlinkParents(t *testing.T
 	}
 }
 
-func TestExactSerialADBRejectsHostGlobalActionsBeforeRunner(t *testing.T) {
+func TestExactSerialADBRejectsSelectionEscapesBeforeRunner(t *testing.T) {
 	runner := newFakeADBRunner(t, "serial-1")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	for _, action := range []string{"devices", "start-server", "host:version"} {
-		if _, err := runExactSerialADB(ctx, runner, "adb", "serial-1", 128, action); err == nil {
-			t.Fatalf("host-global action %q was accepted", action)
+	server, err := parseADBServerEndpoint(fileGatewayTestADBServerEndpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range []string{
+		"devices", "start-server", "host:version",
+		"-a", "-d", "-e", "-s", "-t", "-H", "-P", "-L", "--one-device", "--exit-on-write-error",
+		"wait-for-any", "wait-for-any-device", "wait-for-local", "wait-for-local-device", "wait-for-usb", "wait-for-usb-device",
+	} {
+		if _, err := runExactSerialADBAt(ctx, runner, "adb", server, "serial-1", 128, action); err == nil {
+			t.Fatalf("selection-escaping action %q was accepted", action)
 		}
 	}
-	if _, err := runExactSerialADB(ctx, runner, "adb", "serial-1\nother", 128, "get-state"); err == nil {
-		t.Fatal("unsafe serial delimiter was accepted")
+	for _, serial := range []string{"serial-1\nother", "-e", "-s", "--help"} {
+		if _, err := runExactSerialADBAt(ctx, runner, "adb", server, serial, 128, "get-state"); err == nil {
+			t.Fatalf("unsafe or option-shaped serial %q was accepted", serial)
+		}
 	}
 	if len(runner.Invocations()) != 0 {
 		t.Fatal("runner was called for a rejected ADB command")
+	}
+	exactAction := []string{"shell", "mkdir", "-p", "--", "/data/local/tmp/exact"}
+	if _, err := runExactSerialADBAt(ctx, runner, "adb", server, "serial-1", 128, exactAction...); err != nil {
+		t.Fatalf("exact serial command was rejected: %v", err)
+	}
+	invocations := runner.Invocations()
+	if len(invocations) != 1 {
+		t.Fatalf("runner invocation count = %d, want 1", len(invocations))
+	}
+	if action, exact := exactADBTestAction(invocations[0].Args, fileGatewayTestADBServerEndpoint, "serial-1"); !exact || !reflect.DeepEqual(action, exactAction) {
+		t.Fatalf("exact ADB invocation = %#v", invocations[0])
 	}
 }
 
@@ -255,10 +292,10 @@ func (r *fakeADBRunner) Run(ctx context.Context, invocation command.Invocation) 
 	defer r.mu.Unlock()
 	invocation.Args = append([]string(nil), invocation.Args...)
 	r.invocations = append(r.invocations, invocation)
-	if len(invocation.Args) < 3 || !reflect.DeepEqual(invocation.Args[:2], []string{"-s", r.serial}) {
+	args, exact := exactADBTestAction(invocation.Args, fileGatewayTestADBServerEndpoint, r.serial)
+	if !exact {
 		return command.Result{}, fmt.Errorf("ADB invocation is not exact-serial: %v", invocation.Args)
 	}
-	args := invocation.Args[2:]
 	switch args[0] {
 	case "push":
 		if len(args) != 3 {
@@ -437,3 +474,15 @@ func (r *fakeADBRunner) resolve(name string) (string, bool) {
 }
 
 var _ command.Runner = (*fakeADBRunner)(nil)
+
+func exactADBTestAction(arguments []string, endpoint, serial string) ([]string, bool) {
+	server, err := parseADBServerEndpoint(endpoint)
+	if err != nil {
+		return nil, false
+	}
+	prefix := server.globalArgs("-s", serial)
+	if len(arguments) <= len(prefix) || !reflect.DeepEqual(arguments[:len(prefix)], prefix) {
+		return nil, false
+	}
+	return arguments[len(prefix):], true
+}

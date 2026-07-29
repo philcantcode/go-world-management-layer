@@ -174,6 +174,87 @@ func (f *coreFixture) runningRun(t *testing.T, target TargetRecord) TargetRunRec
 	return run
 }
 
+func TestStartTargetRunRequiresFreshGenerationAndPreservesIdempotentReplay(t *testing.T) {
+	f := newCoreFixture(t)
+	view, _ := f.acquire(t)
+	f.readyAgent(t, view.Agent)
+	target := f.readyTarget(t, view)
+	request := StartTargetRunRequest{
+		Meta:                  f.meta(t, "run-once-per-generation"),
+		TargetID:              target.ID,
+		MaterializationDigest: domain.NewDigest([]byte("specimen")).String(),
+	}
+	first, err := f.core.StartTargetRun(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := f.core.StartTargetRun(context.Background(), request)
+	if err != nil {
+		t.Fatalf("idempotent replay: %v", err)
+	}
+	if replayed.ID != first.ID {
+		t.Fatalf("idempotent replay returned run %q, want %q", replayed.ID, first.ID)
+	}
+	second := request
+	second.Meta = f.meta(t, "second-run-same-generation")
+	if _, err := f.core.StartTargetRun(context.Background(), second); !domain.IsCode(err, domain.CodeFailedPrecondition) {
+		t.Fatalf("second run in generation error = %v, want failed precondition", err)
+	}
+	bundleID, err := domain.NewObservationBundleID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.core.FinalizeTargetRun(context.Background(), FinalizeTargetRunRequest{
+		Meta: f.meta(t, "finalize-first-run"), TargetID: target.ID, RunID: first.ID,
+		ExpectedRevision: first.Revision, Failed: true, BundleID: bundleID.String(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewCore(context.Background(), CoreOptions{Store: f.store, Clock: func() time.Time { return f.now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.Meta = f.meta(t, "second-run-after-restart")
+	if _, err := reopened.StartTargetRun(context.Background(), second); !domain.IsCode(err, domain.CodeFailedPrecondition) {
+		t.Fatalf("post-restart second run in generation error = %v, want failed precondition", err)
+	}
+	recovered, err := reopened.GetResearchSession(context.Background(), view.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recoveredTarget TargetRecord
+	for _, candidate := range recovered.Targets {
+		if candidate.ID == target.ID {
+			recoveredTarget = candidate
+			break
+		}
+	}
+	if recoveredTarget.ID == "" {
+		t.Fatal("restarted core lost target")
+	}
+	recoveredTarget, err = reopened.ResetTarget(context.Background(), ResetTargetRequest{
+		Meta: f.meta(t, "reset-for-next-run"), TargetID: target.ID,
+		ExpectedRevision: recoveredTarget.Revision, Mode: ports.ResetRecreate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []domain.TargetGenerationState{domain.TargetGenerationInstrumenting, domain.TargetGenerationReady} {
+		generation := recoveredTarget.Generations[len(recoveredTarget.Generations)-1]
+		recoveredTarget, err = reopened.TransitionTargetGeneration(context.Background(), TransitionTargetGenerationRequest{
+			Meta: f.meta(t, "ready-reset-generation"), TargetID: target.ID,
+			Generation: recoveredTarget.CurrentGeneration, ExpectedRevision: generation.Revision, State: state,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	second.Meta = f.meta(t, "run-after-reset")
+	if _, err := reopened.StartTargetRun(context.Background(), second); err != nil {
+		t.Fatalf("fresh generation rejected first run: %v", err)
+	}
+}
+
 func TestFullTargetLifecycleResetKeepsAgentGeneration(t *testing.T) {
 	f := newCoreFixture(t)
 	view, _ := f.acquire(t)
@@ -562,6 +643,25 @@ func TestTargetRecoveryRequiresSealedEvidenceAndKeepsAgentGeneration(t *testing.
 	}
 	if outcome.Incident.State != domain.IncidentRecovering {
 		t.Fatalf("incident did not enter recovering: %#v", outcome.Incident)
+	}
+	completion := TransitionIncidentRequest{
+		Meta: f.meta(t, "complete-recovery"), IncidentID: outcome.Incident.ID,
+		ExpectedRevision: outcome.Incident.Revision, State: domain.IncidentResolved,
+		RecoveryActions:            append(append([]string(nil), outcome.Incident.RecoveryActions...), "physical-target:cold recreate"),
+		VisibilityAcknowledgements: append([]string(nil), outcome.Incident.VisibilityAcknowledgements...),
+	}
+	if _, err := f.core.TransitionIncident(context.Background(), completion); err == nil || !domain.IsCode(err, domain.CodeFailedPrecondition) {
+		t.Fatalf("ordinary transition completed physical recovery: %v", err)
+	}
+	wrongCompletion := completion
+	wrongCompletion.Meta = f.meta(t, "complete-recovery-wrong-action")
+	wrongCompletion.RecoveryActions = append(append([]string(nil), outcome.Incident.RecoveryActions...), "physical-agent:cold recreate")
+	if _, err := f.core.CompleteIncidentRecovery(context.Background(), wrongCompletion); err == nil || !domain.IsCode(err, domain.CodeFailedPrecondition) {
+		t.Fatalf("trusted recovery accepted a different physical action: %v", err)
+	}
+	resolved, err := f.core.CompleteIncidentRecovery(context.Background(), completion)
+	if err != nil || resolved.State != domain.IncidentResolved {
+		t.Fatalf("trusted recovery completion = %#v, %v", resolved, err)
 	}
 	after, err := f.core.GetResearchSession(context.Background(), view.Session.ID)
 	if err != nil {

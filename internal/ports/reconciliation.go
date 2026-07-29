@@ -37,7 +37,12 @@ type AgentWorkspaceReconciliation struct {
 	Ref            AgentWorkspaceRef
 	ContainerID    string
 	Classification PhysicalResourceClassification
-	Diagnostic     string
+	// PlanMatched is true only when the driver proved that the single
+	// identified physical resource matches the complete expected immutable
+	// plan. It does not imply guest readiness or authorize execution; startup
+	// recovery uses it solely to retire or retain a failed predecessor safely.
+	PlanMatched bool
+	Diagnostic  string
 }
 
 type AgentWorkspaceReconciliationReport struct {
@@ -47,10 +52,58 @@ type AgentWorkspaceReconciliationReport struct {
 	ObservedAt time.Time
 }
 
+// AgentWorkspaceReconciliationRequest separates generations that may be
+// adopted for work from generations supplied solely as exact cleanup
+// authority. Cleanup plans must be inventoried and retained only for
+// Stop/Destroy; they must never become executable workspaces.
+type AgentWorkspaceReconciliationRequest struct {
+	Active      []AgentWorkspacePlan
+	CleanupOnly []AgentWorkspacePlan
+}
+
 // AgentWorkspaceReconciler is optional. Callers should feature-detect it so
 // simple AgentWorkspaceDriver fakes and non-inventory backends remain valid.
 type AgentWorkspaceReconciler interface {
-	ReconcileAgentWorkspaces(context.Context, []AgentWorkspacePlan) (AgentWorkspaceReconciliationReport, error)
+	ReconcileAgentWorkspaces(context.Context, AgentWorkspaceReconciliationRequest) (AgentWorkspaceReconciliationReport, error)
+}
+
+// AgentExecCrashRecovery is the proof returned after a driver has crossed a
+// fresh execution boundary for one exact persisted agent workspace plan. A
+// successful result means every process that could have been started through
+// the pre-restart container boundary is gone and the same generation has
+// completed a new guest readiness handshake.
+type AgentExecCrashRecovery struct {
+	Status                     AgentWorkspaceStatus
+	PreviousBoundaryTerminated bool
+}
+
+func (r AgentExecCrashRecovery) ValidateFor(plan AgentWorkspacePlan) error {
+	const operation = "ports.agent_exec_crash_recovery.validate"
+	if err := plan.Validate(); err != nil {
+		return err
+	}
+	spec := plan.Generation.Spec()
+	if !r.PreviousBoundaryTerminated {
+		return domain.NewError(domain.CodeIntegrityViolation, operation, "execution_boundary", "driver did not prove termination of the pre-restart execution boundary", nil)
+	}
+	if r.Status.AgentWorkspaceID != spec.AgentWorkspaceID || r.Status.Generation != spec.Generation {
+		return domain.NewError(domain.CodeIntegrityViolation, operation, "generation", "driver returned proof for a different agent generation", nil)
+	}
+	if r.Status.State != domain.AgentGenerationReady || !r.Status.Ready ||
+		strings.TrimSpace(r.Status.ContainerID) == "" ||
+		r.Status.GuestProtocol == 0 || r.Status.ObservedAt.IsZero() {
+		return domain.NewError(domain.CodeIntegrityViolation, operation, "readiness", "driver did not return a complete fresh-ready agent status", nil)
+	}
+	return nil
+}
+
+// AgentExecCrashReconciler is implemented by agent drivers that can use an
+// exact persisted plan to terminate the execution boundary owned by a dead
+// daemon and then restore fresh guest readiness without changing generation
+// identity. Implementations must fail closed on foreign or ambiguous physical
+// resources.
+type AgentExecCrashReconciler interface {
+	RecoverInterruptedExecs(context.Context, AgentWorkspacePlan) (AgentExecCrashRecovery, error)
 }
 
 // TargetReconciliation is the physical observation for one expected or
@@ -60,7 +113,17 @@ type TargetReconciliation struct {
 	Ref            TargetRef
 	RuntimeID      string
 	Classification PhysicalResourceClassification
-	Diagnostic     string
+	// PlanMatched is true only when the identified resource matches the
+	// complete expected immutable plan. It does not imply readiness or permit
+	// execution; cleanup-only inventory uses it as deletion authority.
+	PlanMatched bool
+	// CleanupRequired is true only when the runtime is authoritatively missing
+	// but the complete expected plan still owns local driver state that Destroy
+	// must retire. It is evidence of residue, not deletion authority by itself:
+	// orchestration may act on it only under a terminal or durable-operation
+	// cleanup decision, never for an unclaimed resource.
+	CleanupRequired bool
+	Diagnostic      string
 }
 
 type TargetReconciliationReport struct {
@@ -68,6 +131,13 @@ type TargetReconciliationReport struct {
 	Unclaimed  []TargetReconciliation
 	Conflicts  []PhysicalResourceConflict
 	ObservedAt time.Time
+}
+
+// TargetReconciliationRequest separates live generations from historical
+// generations that may only be inspected, stopped, and destroyed.
+type TargetReconciliationRequest struct {
+	Active      []TargetPlan
+	CleanupOnly []TargetPlan
 }
 
 // PhysicalResourceConflict reports a world-named or world-labelled resource
@@ -82,7 +152,7 @@ type PhysicalResourceConflict struct {
 // TargetReconciler is optional for the same reason as
 // AgentWorkspaceReconciler.
 type TargetReconciler interface {
-	ReconcileTargets(context.Context, []TargetPlan) (TargetReconciliationReport, error)
+	ReconcileTargets(context.Context, TargetReconciliationRequest) (TargetReconciliationReport, error)
 }
 
 // TargetRunCrashReconciler is implemented only by target drivers that can
@@ -95,13 +165,12 @@ type TargetRunCrashReconciler interface {
 }
 
 // ObserverCrashReconciler is implemented only by observer drivers that can
-// prove each directly spawned collector process from a dead controller is no
-// longer running. The guarantee is recorded before collector ownership begins
-// and checked again by the next process; a driver must return false when a
-// custom starter or platform cannot provide that invariant. An adapter that
-// daemonizes or spawns independently surviving descendants needs a stronger,
-// external process-tree authority (for example, a cgroup) and must not rely on
-// this direct-process guarantee.
+// prove every collector process covered by their platform authority is gone
+// after controller loss. The guarantee is recorded before collector ownership
+// begins and checked again by the next process; a driver must return false when
+// a custom starter or platform cannot provide that invariant. Direct-process
+// parent-death signaling cannot cover independently surviving descendants;
+// those require a process-tree authority such as a Windows Job or cgroup.
 type ObserverCrashReconciler interface {
 	InterruptedCollectorCleanupGuaranteed() bool
 	ReconcileInterruptedCollectors(context.Context, InterruptedCollectorReconciliation) (InterruptedCollectorReconciliationReport, error)

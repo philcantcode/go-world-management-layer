@@ -25,6 +25,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
 	"github.com/philcantcode/go-world-management-layer/internal/ledger"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
+	"github.com/philcantcode/go-world-management-layer/internal/research"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -138,10 +139,14 @@ type Config struct {
 	ControlTimeout   time.Duration
 	StreamBuffer     int
 	AllowRemoteADB   bool
+	// ActionEvidence optionally overrides the default research action store.
+	// When nil, New creates a store under StateRoot/action-evidence.
+	ActionEvidence *research.Store
 }
 
-// Service is safe for concurrent RPC use. The mutex only protects compact
-// control indexes; the ledger and drivers provide their own concurrency.
+// Service is safe for concurrent RPC use. mu protects compact control indexes;
+// targetRunLifecycleMu serializes the cross-component run/quarantine boundary.
+// The ledger and drivers provide their own concurrency.
 type Service struct {
 	worldv1.UnimplementedWorldServiceServer
 
@@ -162,6 +167,7 @@ type Service struct {
 	ids             *domain.IDGenerator
 	clock           func() time.Time
 	stateRoot       string
+	actionEvidence  *research.Store
 
 	maxTransferBytes   int64
 	maxExecBytes       int64
@@ -172,6 +178,11 @@ type Service struct {
 	allowRemoteADB     bool
 	finalizationFaults *finalizationFaultHooks
 
+	// targetRunLifecycleMu serializes target-run admission/finalization with
+	// target quarantine. The durable Ready -> Resettable transition is the
+	// restart-safe admission barrier; this mutex closes the in-process window
+	// where an already-admitted physical start could otherwise cross it.
+	targetRunLifecycleMu   sync.Mutex
 	mu                     sync.RWMutex
 	captureState           map[string]captureRecord
 	exportState            map[string]exportRecord
@@ -183,7 +194,9 @@ type Service struct {
 	publicationRecords     map[string]bundlePublicationRecord
 	completions            map[string]bundleCompletion
 	operations             map[string]operationReservation
+	quarantineContainments map[string]targetQuarantineContainment
 	idempotency            map[string]idempotencyRecord
+	lifecycleFaults        *targetLifecycleFaultHooks
 }
 
 // finalizationFaultHooks are package-private deterministic crash boundaries
@@ -197,6 +210,14 @@ type finalizationFaultHooks struct {
 	afterCoreCommit       func() error
 	afterBundleFile       func() error
 	afterBundleIndexed    func() error
+}
+
+// targetLifecycleFaultHooks expose deterministic process-loss boundaries to
+// package tests. Production compositions never install them.
+type targetLifecycleFaultHooks struct {
+	afterQuarantineReserved  func() error
+	afterQuarantineContained func() error
+	afterDestroyReserved     func() error
 }
 
 type captureRecord struct {
@@ -311,13 +332,36 @@ type bundleCompletion struct {
 }
 
 // operationReservation is the durable ownership boundary for an irreversible
-// service operation. A resource may have only one reservation per namespace;
+// service operation. Target reservations are indexed by exact generation;
 // retries must present the exact original key and request signature.
 type operationReservation struct {
-	Namespace      string `json:"namespace"`
-	ResourceID     string `json:"resource_id"`
-	IdempotencyKey string `json:"idempotency_key"`
-	Signature      string `json:"signature"`
+	Namespace        string                  `json:"namespace"`
+	ResourceID       string                  `json:"resource_id"`
+	TargetGeneration uint64                  `json:"target_generation,omitempty"`
+	IdempotencyKey   string                  `json:"idempotency_key"`
+	Signature        string                  `json:"signature"`
+	Quarantine       *targetQuarantineIntent `json:"quarantine,omitempty"`
+}
+
+// targetQuarantineIntent is the immutable hand-off between RPC admission and
+// physical containment. MutationMeta.Deadline is intentionally zero here: it
+// is attempt-scoped and excluded from application idempotency bytes; recovery
+// supplies the current bounded reconciliation deadline.
+type targetQuarantineIntent struct {
+	Plan       ports.TargetQuarantinePlan `json:"plan"`
+	CommitMeta application.MutationMeta   `json:"commit_meta"`
+}
+
+// targetQuarantineContainment is persisted before logical quarantine is
+// committed. It makes the physical-success/logical-commit crash window
+// restartable without inventing evidence.
+type targetQuarantineContainment struct {
+	Namespace        string                         `json:"namespace"`
+	ResourceID       string                         `json:"resource_id"`
+	TargetGeneration uint64                         `json:"target_generation"`
+	IdempotencyKey   string                         `json:"idempotency_key"`
+	Signature        string                         `json:"signature"`
+	Evidence         ports.TargetQuarantineEvidence `json:"evidence"`
 }
 
 type idempotencyRecord struct {
@@ -339,6 +383,7 @@ type stateEvent struct {
 	StopPreparation *bundleStopPreparationRecord `json:"stop_preparation,omitempty"`
 	Completion      *bundleCompletion            `json:"completion,omitempty"`
 	Operation       *operationReservation        `json:"operation,omitempty"`
+	Quarantine      *targetQuarantineContainment `json:"quarantine,omitempty"`
 }
 
 func New(config Config) (*Service, error) {
@@ -405,12 +450,21 @@ func New(config Config) (*Service, error) {
 		}
 		profiles[name] = cloneCaptureSpec(profile)
 	}
+	actionEvidence := config.ActionEvidence
+	if actionEvidence == nil {
+		// Evidence is best-effort: a default-store failure disables capture
+		// rather than blocking the whole node. Explicit Config.ActionEvidence
+		// is trusted as provided by the caller.
+		if store, err := research.NewStore(research.StoreOptions{Root: filepath.Join(filepath.Clean(absoluteStateRoot), "action-evidence")}); err == nil {
+			actionEvidence = store
+		}
+	}
 	service := &Service{
 		core: config.Core, ledger: config.Ledger, finalization: config.Finalization,
 		agent: config.Agent, targets: targets, workspace: config.Workspace, workspaceScope: config.WorkspaceScope,
 		material: config.Material, captures: config.Captures, policyAdmission: config.PolicyAdmission, observers: config.Observers, profiles: profiles,
 		subject: config.Subject, dialer: config.Dialer, ids: config.IDs,
-		clock: config.Clock, stateRoot: filepath.Clean(absoluteStateRoot),
+		clock: config.Clock, stateRoot: filepath.Clean(absoluteStateRoot), actionEvidence: actionEvidence,
 		maxTransferBytes: config.MaxTransferBytes, maxExecBytes: config.MaxExecBytes,
 		maxADBBytes: config.MaxADBBytes, maxStateBytes: config.MaxStateBytes,
 		controlTimeout: config.ControlTimeout, streamBuffer: config.StreamBuffer,
@@ -420,7 +474,8 @@ func New(config Config) (*Service, error) {
 		stopPreparations: make(map[string]stagedBundleStopPreparation), stopPreparationRecords: make(map[string]bundleStopPreparationRecord),
 		publications: make(map[string]stagedBundlePublication), publicationRecords: make(map[string]bundlePublicationRecord),
 		completions: make(map[string]bundleCompletion),
-		operations:  make(map[string]operationReservation), idempotency: make(map[string]idempotencyRecord),
+		operations:  make(map[string]operationReservation), quarantineContainments: make(map[string]targetQuarantineContainment),
+		idempotency: make(map[string]idempotencyRecord),
 	}
 	if err := service.replayState(); err != nil {
 		return nil, fmt.Errorf("replay orchestration state: %w", err)
@@ -524,15 +579,15 @@ func (s *Service) applyStateEvent(event stateEvent) error {
 		s.idempotency[idempotencyIndex(event.Namespace, event.IdempotencyKey)] = idempotencyRecord{Signature: event.Signature, ResourceID: resourceID}
 	}
 	if event.Operation != nil {
-		reservation := *event.Operation
-		if reservation.Namespace == "" || reservation.ResourceID == "" || !domain.IsCanonicalIdempotencyKey(reservation.IdempotencyKey) || reservation.Signature == "" {
-			return fmt.Errorf("operation reservation is incomplete")
+		reservation := cloneOperationReservation(*event.Operation)
+		if err := validateOperationReservation(reservation); err != nil {
+			return err
 		}
 		if reservation.Namespace != event.Namespace || reservation.IdempotencyKey != event.IdempotencyKey || reservation.Signature != event.Signature {
 			return fmt.Errorf("operation reservation does not match its state envelope")
 		}
-		index := operationIndex(reservation.Namespace, reservation.ResourceID)
-		if previous, found := s.operations[index]; found && previous != reservation {
+		index := operationReservationIndex(reservation.Namespace, reservation.ResourceID, reservation.TargetGeneration)
+		if previous, found := s.operations[index]; found && !sameOperationReservation(previous, reservation) {
 			return fmt.Errorf("operation reservation conflicts with an earlier state event")
 		}
 		s.operations[index] = reservation
@@ -627,6 +682,23 @@ func (s *Service) applyStateEvent(event stateEvent) error {
 		if event.Operation == nil {
 			return fmt.Errorf("operation reservation event is incomplete")
 		}
+	case "target_quarantine.contained":
+		if event.Quarantine == nil {
+			return fmt.Errorf("target quarantine containment event is incomplete")
+		}
+		containment := *event.Quarantine
+		index := operationReservationIndex(containment.Namespace, containment.ResourceID, containment.TargetGeneration)
+		reservation, found := s.operations[index]
+		if !found {
+			return fmt.Errorf("target quarantine containment has no exact durable reservation")
+		}
+		if err := validateTargetQuarantineContainment(reservation, containment); err != nil {
+			return err
+		}
+		if previous, found := s.quarantineContainments[index]; found && previous != containment {
+			return fmt.Errorf("target quarantine containment conflicts with an earlier state event")
+		}
+		s.quarantineContainments[index] = containment
 	default:
 		return fmt.Errorf("unknown state event kind %q", event.Kind)
 	}
@@ -745,6 +817,13 @@ func (s *Service) existingIdempotencyLocked(namespace, key, signature string) (s
 func idempotencyIndex(namespace, key string) string { return namespace + "\x00" + key }
 
 func operationIndex(namespace, resourceID string) string { return namespace + "\x00" + resourceID }
+
+func operationReservationIndex(namespace, resourceID string, targetGeneration uint64) string {
+	if !targetOperationNamespace(namespace) || targetGeneration == 0 {
+		return operationIndex(namespace, resourceID)
+	}
+	return fmt.Sprintf("%s\x00generation:%d", operationIndex(namespace, resourceID), targetGeneration)
+}
 
 func cloneCaptureSpec(value *worldv1.CaptureSpec) *worldv1.CaptureSpec {
 	if value == nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,7 +96,7 @@ func TestPolicyAdmissionAdmitAgentWorkspacePlanBindsExactPhysicalReport(t *testi
 	raw.Resources.CaptureBytes = ports.PhysicalLimitFact{Support: ports.PhysicalSupportUnsupported, Detail: "capture storage is outside the runtime"}
 	rawReporter := &agentPhysicalReporterStub{configured: raw}
 	reporter, err := policyauthority.NewAgentPhysicalPolicyReporter(rawReporter, policyauthority.AgentPhysicalEnforcement{
-		DirectoryWorkspace: true, BoundedLedgerCapture: true,
+		BoundedLedgerCapture: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -134,6 +135,76 @@ func TestPolicyAdmissionAdmitAgentWorkspacePlanBindsExactPhysicalReport(t *testi
 	}
 	if err := resolver.AdmitAgentWorkspacePlan(ctx, plan); err == nil {
 		t.Fatal("agent plan with an unenforced zero-swap limit was admitted")
+	}
+}
+
+func TestDirectoryWorkspaceAdmissionSkipsOnlyLiveWorkspaceByteAndInodeEnforcement(t *testing.T) {
+	source, err := os.ReadFile("../../policy/deployment/e2e-directory-copy.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directoryPolicy := compileSupportedPolicy(t, source)
+	resources := enforcedAgentPhysicalReport().Resources
+	resources.WorkspaceBytes = ports.PhysicalLimitFact{Support: ports.PhysicalSupportUnsupported, Detail: "directory mode has no live byte quota"}
+	resources.Inodes = ports.PhysicalLimitFact{Support: ports.PhysicalSupportUnsupported, Detail: "directory mode has no live inode quota"}
+	if err := requireAgentResourceSupport(directoryPolicy, resources); err != nil {
+		t.Fatalf("directory mode rejected its two explicit non-production omissions: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*ports.ContainerResourcePhysicalFacts){
+		"cpu": func(facts *ports.ContainerResourcePhysicalFacts) {
+			facts.CPUMilli.Support = ports.PhysicalSupportUnsupported
+		},
+		"memory": func(facts *ports.ContainerResourcePhysicalFacts) {
+			facts.MemoryBytes.Support = ports.PhysicalSupportUnsupported
+		},
+		"swap": func(facts *ports.ContainerResourcePhysicalFacts) {
+			facts.SwapBytes.Support = ports.PhysicalSupportUnsupported
+		},
+		"pids": func(facts *ports.ContainerResourcePhysicalFacts) {
+			facts.PIDs.Support = ports.PhysicalSupportUnsupported
+		},
+	} {
+		t.Run("directory still requires "+name, func(t *testing.T) {
+			mutated := resources
+			mutate(&mutated)
+			if err := requireAgentResourceSupport(directoryPolicy, mutated); err == nil {
+				t.Fatalf("directory mode admitted unenforced %s", name)
+			}
+		})
+	}
+
+	for name, mutate := range map[string]func(*ports.AgentWorkspacePhysicalPolicyReport){
+		"container capabilities": func(report *ports.AgentWorkspacePhysicalPolicyReport) {
+			report.Runtime.CapabilitySupport = ports.PhysicalSupportUnsupported
+		},
+		"numeric user": func(report *ports.AgentWorkspacePhysicalPolicyReport) {
+			report.Runtime.UserSupport = ports.PhysicalSupportUnsupported
+		},
+		"seccomp": func(report *ports.AgentWorkspacePhysicalPolicyReport) {
+			report.Runtime.SeccompSupport = ports.PhysicalSupportUnsupported
+		},
+		"no-new-privileges": func(report *ports.AgentWorkspacePhysicalPolicyReport) {
+			report.Runtime.NoNewPrivilegesSupport = ports.PhysicalSupportUnsupported
+		},
+		"network isolation": func(report *ports.AgentWorkspacePhysicalPolicyReport) {
+			report.Network.Support = ports.PhysicalSupportUnsupported
+		},
+	} {
+		t.Run("directory still requires "+name, func(t *testing.T) {
+			report := enforcedAgentPhysicalReport()
+			mutate(&report)
+			if err := requireAgentPhysicalEnforcement(report); err == nil {
+				t.Fatalf("directory mode admitted unenforced %s identity/isolation", name)
+			}
+		})
+	}
+
+	overlaySource := strings.Replace(string(source), "mode: directory-copy-non-production", "mode: overlayfs", 1)
+	overlaySource = strings.Replace(overlaySource, "construction: allow-copy", "construction: require-reflink", 1)
+	overlayPolicy := compileSupportedPolicy(t, []byte(overlaySource))
+	if err := requireAgentResourceSupport(overlayPolicy, resources); err == nil {
+		t.Fatal("production overlay mode admitted unenforced workspace byte and inode limits")
 	}
 }
 

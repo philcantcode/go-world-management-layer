@@ -16,7 +16,7 @@ file is not a valid backup while WAL writes may be active.
    observation ledger segments/indexes; orchestration finalization
    reservations, hash-chain-anchored canonical files in
    `bundle-publications/`, public bundle files/indexes and
-`bundle.completed` records; version-5 run-observer markers; observer
+`bundle.completed` records; version-6 run-observer markers; observer
    `runs/` transactions and content-addressed `objects/`; capture/export state;
    local finalizer seals/commits and other unfinalized staging; the exact
    deployment profile and policy sources; and deployment secrets through their
@@ -42,7 +42,7 @@ file is not a valid backup while WAL writes may be active.
    record any permitted incomplete-tail repair; all other corruption is a hard
    stop. Startup may remove only recognized regular atomic `.staging-*` files.
    It must verify every canonical public stage against its reservation and
-   hash-chain anchor, every public file/index/completion, every version-5
+   hash-chain anchor, every public file/index/completion, every version-6
    observer binding, and every observer transaction/object.
 4. Reconcile external resources. The physical daemon will accept an active
    agent/target container only when the exact durable plan, policy pair, labels,

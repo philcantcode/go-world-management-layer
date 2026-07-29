@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -14,6 +16,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/application"
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
+	"github.com/philcantcode/go-world-management-layer/internal/research"
 	"github.com/philcantcode/go-world-management-layer/internal/store"
 	"github.com/philcantcode/go-world-management-layer/internal/transport"
 )
@@ -254,6 +257,115 @@ func TestExecuteKeepsGuestLeaseAlive(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("execution sent no heartbeat")
+	}
+}
+
+func TestBeginActionRecordsBeginFailureMarker(t *testing.T) {
+	// beginAction records a durable marker on Begin failure (fail-open contract).
+	evidence, err := research.NewStore(research.StoreOptions{Root: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := &Environment{actionEvidence: evidence}
+	ctx := context.Background()
+	start := research.StartFromCommand("exec_marker-1", research.ActionScopeAgentExec, "bin/tool", nil, ".", time.Now().UTC(), research.ResolveObservationLevel(false, "", false))
+	if _, err := evidence.Begin(ctx, start); err != nil {
+		t.Fatal(err)
+	}
+	session, beginErr := env.beginAction(ctx, application.ExecRecord{
+		ID: "exec_marker-1", SessionID: "rs", LeaseID: "lease_1",
+		AgentWorkspaceID: "aw", AgentGeneration: 1,
+		Executable: "bin/tool", WorkingDirectory: ".", CreatedAt: time.Now().UTC(),
+	}, Request{IdempotencyKey: "x", CorrelationID: requestCorrelation(t)})
+	if beginErr == nil || session != nil {
+		t.Fatalf("expected begin conflict, got session=%v err=%v", session, beginErr)
+	}
+	marker := filepath.Join(evidence.Root(), "actions", "exec_marker-1.begin-failed.json")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected begin-failed marker: %v", err)
+	}
+}
+
+func TestExecuteFailsOpenOnActionEvidenceBeginFailure(t *testing.T) {
+	// Fail-open: when Begin cannot open a session, Execute still succeeds.
+	terminal, _ := json.Marshal(transport.Terminal{ExitCode: 0, CleanupConfirmed: true})
+	fixture := newEnvironmentFixture(t, newScriptedExecTransport(transport.Frame{Kind: transport.KindTerminal, Data: terminal}))
+	storeRoot := t.TempDir()
+	evidence, err := research.NewStore(research.StoreOptions{Root: storeRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionsPath := filepath.Join(storeRoot, "actions")
+	if err := os.RemoveAll(actionsPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(actionsPath, []byte("not-a-directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture.environment.actionEvidence = evidence
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, executeErr := fixture.environment.Execute(ctx, Request{
+		IdempotencyKey: "evidence-begin-failure", CorrelationID: requestCorrelation(t),
+		Kind: domain.ExecTool, Executable: "bin/tool", CleanupGrace: time.Second,
+	})
+	if executeErr != nil {
+		t.Fatalf("execution must fail-open on begin failure, got %T %v", executeErr, executeErr)
+	}
+	if result.ExecID == "" || !result.CleanupConfirmed || result.ExitCode != 0 {
+		t.Fatalf("terminal result = %#v", result)
+	}
+	assertOnlyExecState(t, fixture, domain.ExecCompleted)
+}
+
+func TestExecuteFailsOpenOnActionEvidenceSealFailure(t *testing.T) {
+	// Fail-open: Seal failure does not fail a successfully completed Execute.
+	terminal, _ := json.Marshal(transport.Terminal{ExitCode: 0, CleanupConfirmed: true})
+	stream := newScriptedExecTransport(
+		transport.Frame{Kind: transport.KindStdout, Data: []byte("real output")},
+		transport.Frame{Kind: transport.KindTerminal, Data: terminal},
+	)
+	fixture := newEnvironmentFixture(t, stream)
+	evidence, err := research.NewStore(research.StoreOptions{Root: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.environment.actionEvidence = evidence
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, executeErr := fixture.environment.Execute(ctx, Request{
+		IdempotencyKey: "evidence-seal-failure", CorrelationID: requestCorrelation(t),
+		Kind: domain.ExecTool, Executable: "bin/tool", CleanupGrace: time.Second,
+		OnStdout: func([]byte) error {
+			entries, readErr := os.ReadDir(filepath.Join(evidence.Root(), "actions"))
+			if readErr != nil {
+				return readErr
+			}
+			if len(entries) != 1 {
+				return fmt.Errorf("action directories = %d, want 1", len(entries))
+			}
+			return os.Mkdir(filepath.Join(evidence.Root(), "actions", entries[0].Name(), "stdout.bounded"), 0o700)
+		},
+	})
+	if executeErr != nil {
+		t.Fatalf("execution must fail-open on seal failure, got %T %v", executeErr, executeErr)
+	}
+	if result.ExecID == "" || !result.CleanupConfirmed || result.ExitCode != 0 {
+		t.Fatalf("terminal result = %#v", result)
+	}
+	assertOnlyExecState(t, fixture, domain.ExecCompleted)
+}
+
+func assertOnlyExecState(t *testing.T, fixture *environmentFixture, expected domain.ExecState) {
+	t.Helper()
+	view, err := fixture.core.GetResearchSession(context.Background(), fixture.sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Execs) != 1 || view.Execs[0].State != expected {
+		t.Fatalf("persisted executions = %#v, want state %s", view.Execs, expected)
 	}
 }
 

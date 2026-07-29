@@ -15,8 +15,9 @@ import (
 
 type onceFailWorkspaceDriver struct {
 	ports.WorkspaceDriver
-	mountErr   error
-	releaseErr error
+	mountErr        error
+	releaseErr      error
+	retainOnRelease bool
 }
 
 func (d *onceFailWorkspaceDriver) Mount(ctx context.Context, id domain.WorkspaceID) (ports.WorkspaceHandle, error) {
@@ -29,6 +30,10 @@ func (d *onceFailWorkspaceDriver) Mount(ctx context.Context, id domain.Workspace
 }
 
 func (d *onceFailWorkspaceDriver) Release(ctx context.Context, id domain.WorkspaceID) error {
+	if d.retainOnRelease {
+		d.retainOnRelease = false
+		return nil
+	}
 	if d.releaseErr != nil {
 		err := d.releaseErr
 		d.releaseErr = nil
@@ -262,37 +267,51 @@ func TestControllerCleanupSurvivesCallerCancellation(t *testing.T) {
 	assertFailedAcquisitionReleased(t, fixture, harness, view)
 }
 
-func TestControllerReleaseRetryStaysReleasingUntilWorkspaceCleanupSucceeds(t *testing.T) {
-	fixture := newIntegrationFixture(t)
-	harness := newControllerHarness(t, fixture, nil, nil)
-	view := harness.acquire(t, fixture)
-	harness.controller.workspace = &onceFailWorkspaceDriver{WorkspaceDriver: harness.workspace, releaseErr: errors.New("release failed")}
-	request := application.ReleaseResearchSessionRequest{
-		Meta: fixture.meta("retry-release"), LeaseID: view.Lease.ID,
-		ExpectedRevision: view.Lease.Revision, Reason: "done",
+func TestControllerReleaseRetryStaysReleasingUntilWorkspaceCleanupIsProven(t *testing.T) {
+	tests := []struct {
+		name            string
+		releaseErr      error
+		retainOnRelease bool
+	}{
+		{name: "release_error", releaseErr: errors.New("release failed")},
+		{name: "silent_noop", retainOnRelease: true},
 	}
-	if _, err := harness.controller.ReleaseResearchSession(context.Background(), request); err == nil {
-		t.Fatal("release unexpectedly succeeded despite workspace failure")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newIntegrationFixture(t)
+			harness := newControllerHarness(t, fixture, nil, nil)
+			view := harness.acquire(t, fixture)
+			harness.controller.workspace = &onceFailWorkspaceDriver{
+				WorkspaceDriver: harness.workspace, releaseErr: test.releaseErr, retainOnRelease: test.retainOnRelease,
+			}
+			request := application.ReleaseResearchSessionRequest{
+				Meta: fixture.meta("retry-release"), LeaseID: view.Lease.ID,
+				ExpectedRevision: view.Lease.Revision, Reason: "done",
+			}
+			if _, err := harness.controller.ReleaseResearchSession(context.Background(), request); err == nil {
+				t.Fatal("release unexpectedly succeeded despite unproven workspace cleanup")
+			}
+			intermediate, err := fixture.core.GetResearchSession(context.Background(), view.Session.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if intermediate.Lease.State != domain.LeaseReleasing || intermediate.Session.State != domain.ResearchSessionReleasing {
+				t.Fatalf("failed cleanup manufactured terminal release: %#v", intermediate)
+			}
+			agentGeneration, _ := currentAgentGeneration(intermediate.Agent)
+			if agentGeneration.State != domain.AgentGenerationReady {
+				t.Fatalf("failed cleanup retired logical agent before completion: %s", agentGeneration.State)
+			}
+			outcome, err := harness.controller.ReleaseResearchSession(context.Background(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if outcome.SessionID != view.Session.ID {
+				t.Fatalf("release outcome = %#v", outcome)
+			}
+			assertReleasedWithoutLeaks(t, fixture, harness, view.Session.ID)
+		})
 	}
-	intermediate, err := fixture.core.GetResearchSession(context.Background(), view.Session.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if intermediate.Lease.State != domain.LeaseReleasing || intermediate.Session.State != domain.ResearchSessionReleasing {
-		t.Fatalf("failed cleanup manufactured terminal release: %#v", intermediate)
-	}
-	agentGeneration, _ := currentAgentGeneration(intermediate.Agent)
-	if agentGeneration.State != domain.AgentGenerationReady {
-		t.Fatalf("failed cleanup retired logical agent before completion: %s", agentGeneration.State)
-	}
-	outcome, err := harness.controller.ReleaseResearchSession(context.Background(), request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if outcome.SessionID != view.Session.ID {
-		t.Fatalf("release outcome = %#v", outcome)
-	}
-	assertReleasedWithoutLeaks(t, fixture, harness, view.Session.ID)
 }
 
 func TestControllerReleaseRetryStaysReleasingUntilTargetCleanupSucceeds(t *testing.T) {

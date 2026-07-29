@@ -49,7 +49,7 @@ func TestAttachedEmulatorBackendLifecycleOnlyAttachesAndDetaches(t *testing.T) {
 		t.Fatal(err)
 	}
 	allocation := Allocation{InstanceNumber: 5554, InstanceName: "attached-emulator-5554", Serial: "emulator-5554", ADBAddress: "emulator-5554"}
-	plan := VirtualDevicePlan{StateDirectory: "state", SystemImageDirectory: "image", Allocation: allocation, Fingerprint: ResetFingerprint{}}
+	plan := VirtualDevicePlan{StateDirectory: "state", SystemImageDirectory: "image", Allocation: allocation, ADBServer: ports.ADBServerEndpoint{Host: "127.0.0.1", Port: 5037}, Fingerprint: ResetFingerprint{}}
 	instance, err := backend.Create(context.Background(), plan)
 	if err != nil {
 		t.Fatal(err)
@@ -169,6 +169,9 @@ func newAttachedADBRunner(serial string) *attachedADBRunner {
 		"ro.build.fingerprint":  "google/sdk_gphone64_x86_64/test:userdebug/test-keys",
 		"ro.build.version.sdk":  "35",
 		"ro.product.cpu.abi":    "x86_64",
+		"ro.serialno":           "EMULATOR5554",
+		"ro.debuggable":         "1",
+		"ro.secure":             "0",
 		"ro.boot.qemu.avd_name": "",
 		"ro.product.model":      "sdk_gphone64_x86_64",
 	}}
@@ -178,17 +181,29 @@ func (r *attachedADBRunner) Run(_ context.Context, invocation command.Invocation
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, invocation)
-	if len(invocation.Args) < 3 || !reflect.DeepEqual(invocation.Args[:2], []string{"-s", r.serial}) {
+	action, exact := exactADBTestAction(invocation.Args, DefaultADBServerEndpoint, r.serial)
+	if !exact {
 		return command.Result{}, os.ErrInvalid
 	}
-	switch invocation.Args[2] {
+	switch action[0] {
 	case "get-state":
 		return command.Result{Stdout: []byte("device\n")}, nil
-	case "shell":
-		if len(invocation.Args) != 5 || invocation.Args[3] != "getprop" {
+	case "emu":
+		if !reflect.DeepEqual(action[1:], []string{"avd", "name"}) {
 			return command.Result{}, os.ErrInvalid
 		}
-		return command.Result{Stdout: []byte(r.properties[invocation.Args[4]] + "\n")}, nil
+		return command.Result{Stdout: []byte("World_Test\nOK\n")}, nil
+	case "shell":
+		if len(action) == 3 && action[1] == "getprop" {
+			return command.Result{Stdout: []byte(r.properties[action[2]] + "\n")}, nil
+		}
+		if reflect.DeepEqual(action[1:], []string{"id", "-u"}) {
+			return command.Result{Stdout: []byte("0\n")}, nil
+		}
+		if reflect.DeepEqual(action[1:], []string{"cmd", "package", "path", "android"}) {
+			return command.Result{Stdout: []byte("package:/system/framework/framework-res.apk\n")}, nil
+		}
+		return command.Result{}, os.ErrInvalid
 	default:
 		return command.Result{}, os.ErrInvalid
 	}
@@ -208,7 +223,7 @@ func (r *attachedADBRunner) requireExactSerial(t *testing.T) {
 		t.Fatal("ADB was not invoked")
 	}
 	for _, invocation := range r.calls {
-		if invocation.Program != "adb" || len(invocation.Args) < 3 || !reflect.DeepEqual(invocation.Args[:2], []string{"-s", r.serial}) {
+		if _, exact := exactADBTestAction(invocation.Args, DefaultADBServerEndpoint, r.serial); invocation.Program != "adb" || !exact {
 			t.Fatalf("non-exact ADB invocation: %#v", invocation)
 		}
 	}

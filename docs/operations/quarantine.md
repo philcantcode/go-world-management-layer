@@ -36,5 +36,14 @@ driver proves execution stopped, networking unreachable, writable state
 preserved, and the exact runtime identity. It also revokes active target
 transports and run deadlines. If the runtime cannot provide that evidence, the
 operation fails closed and logical state is not presented as contained.
-Android/physical-device containment and node scheduling remain unavailable in
-the daemon composition and are deployment-owned.
+The managed Android composition applies the same fail-closed rule: after
+durable exact host-process ownership it first force-stops the AVD and proves
+the serial unreachable, then boundedly revokes/drains the run-scoped ADB and
+file endpoints while preserving private state and allocation for evidence.
+The durable stopped authority is adopted as the expected quarantined
+generation after restart and is not destroyed by orphan cleanup. Launch intent without either
+committed ownership or a live candidate that passes the exact image/PID-file
+binding is unresolved, not proof of containment; quarantine, destruction, and
+new admission remain closed until the operator provides exact containment or
+reboots the host. Physical-device containment and node scheduling remain
+unavailable and deployment-owned.

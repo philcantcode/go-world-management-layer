@@ -118,7 +118,11 @@ func logPhysicalReconciliation(report orchestration.PhysicalReconciliationReport
 		targetConflicts += len(item.Conflicts)
 		removedTargets += len(report.RemovedTargetOrphans[kind])
 	}
-	log.Printf("startup physical reconciliation agent_expected=%d agent_unclaimed=%d agent_conflicts=%d agent_orphans_removed=%d target_expected=%d target_unclaimed=%d target_conflicts=%d target_orphans_removed=%d interrupted_runs_failed=%d target_operations_lost=%d",
+	log.Printf("startup physical reconciliation agent_expected=%d agent_unclaimed=%d agent_conflicts=%d agent_orphans_removed=%d agent_provisionings_recovered=%d agent_provisionings_pending=%d interrupted_execs_lost=%d target_expected=%d target_unclaimed=%d target_conflicts=%d target_orphans_removed=%d target_provisionings_recovered=%d target_provisionings_pending=%d target_quarantines_recovered=%d target_destructions_recovered=%d target_destructions_deferred=%d target_runs_pending=%d interrupted_runs_failed=%d target_operations_lost=%d",
 		len(report.Agent.Expected), len(report.Agent.Unclaimed), len(report.Agent.Conflicts), len(report.RemovedAgentOrphans),
-		targetExpected, targetUnclaimed, targetConflicts, removedTargets, len(report.RecoveredRuns), len(report.LostTargetOperations))
+		len(report.RecoveredAgentProvisionings), len(report.PendingAgentProvisionings), len(report.RecoveredExecs),
+		targetExpected, targetUnclaimed, targetConflicts, removedTargets,
+		len(report.RecoveredTargetProvisionings), len(report.PendingTargetProvisionings),
+		len(report.RecoveredTargetQuarantines), len(report.RecoveredTargetDestructions), len(report.DeferredTargetDestructions),
+		len(report.PendingTargetRuns), len(report.RecoveredRuns), len(report.LostTargetOperations))
 }

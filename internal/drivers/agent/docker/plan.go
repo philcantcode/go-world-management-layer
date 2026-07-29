@@ -96,8 +96,8 @@ func (p ContainerPlan) Validate(workspaceRoot string) error {
 	if len(p.Mounts) != 1 || p.Mounts[0].Target != WorkspaceMount || p.Mounts[0].ReadOnly {
 		return fmt.Errorf("exactly one writable workspace mount is required")
 	}
-	if p.ExpectedWorkspaceSource == "" || filepath.Clean(p.Mounts[0].Source) != filepath.Clean(p.ExpectedWorkspaceSource) {
-		return fmt.Errorf("workspace mount does not match the resolved workspace source")
+	if p.ExpectedWorkspaceSource == "" {
+		return fmt.Errorf("resolved workspace source is required")
 	}
 	if err := requirePathBeneath(workspaceRoot, p.ExpectedWorkspaceSource); err != nil {
 		return fmt.Errorf("expected workspace source: %w", err)
@@ -105,11 +105,17 @@ func (p ContainerPlan) Validate(workspaceRoot string) error {
 	if err := requirePathBeneath(workspaceRoot, p.Mounts[0].Source); err != nil {
 		return fmt.Errorf("workspace mount: %w", err)
 	}
+	if !dockercli.CanonicalHostBindSourceEqual(p.Mounts[0].Source, p.ExpectedWorkspaceSource) {
+		return fmt.Errorf("workspace mount does not match the resolved workspace source")
+	}
 	for _, mount := range p.Mounts {
 		lowerSource := strings.ToLower(filepath.ToSlash(mount.Source))
 		lowerTarget := strings.ToLower(filepath.ToSlash(mount.Target))
 		if strings.Contains(lowerSource, "docker.sock") || strings.Contains(lowerTarget, "docker.sock") || strings.Contains(lowerTarget, "containerd.sock") {
 			return fmt.Errorf("runtime sockets may not be mounted")
+		}
+		if _, err := dockercli.RestrictedBindMountArgument(mount.Source, mount.Target, mount.ReadOnly); err != nil {
+			return fmt.Errorf("workspace mount: %w", err)
 		}
 	}
 	if len(p.Entrypoint) == 0 || !isCanonicalAbsoluteGuestPath(p.Entrypoint[0]) {
@@ -224,6 +230,21 @@ func containerPlanDigest(plan ContainerPlan) (domain.Digest, error) {
 	})
 }
 
+// sameAgentWorkspacePlanIdentity compares the complete semantic Provision
+// payload. The physical container digest remains an independent runtime
+// authority boundary and deliberately cannot erase higher-level provenance.
+func sameAgentWorkspacePlanIdentity(existing, requested ports.AgentWorkspacePlan) (bool, error) {
+	existingDigest, err := ports.AgentWorkspacePlanIdentityDigest(existing)
+	if err != nil {
+		return false, err
+	}
+	requestedDigest, err := ports.AgentWorkspacePlanIdentityDigest(requested)
+	if err != nil {
+		return false, err
+	}
+	return existingDigest == requestedDigest, nil
+}
+
 func validatePlanLabels(plan ContainerPlan) error {
 	digest, err := containerPlanDigest(plan)
 	if err != nil {
@@ -264,15 +285,16 @@ func (p ContainerPlan) DockerCreateArgs() ([]string, error) {
 		return nil, err
 	}
 	args := []string{"create", "--name", p.Name, "--runtime", p.Runtime, "--init", "--interactive", "--read-only"}
+	args = append(args, dockercli.RestrictedLifecycleArguments(p.Name)...)
 	args = append(args, dockercli.PrivateNamespaceArguments()...)
 	args = append(args, "--cap-drop", "ALL")
 	args = append(args, dockercli.HardenedSecurityArguments()...)
 	args = append(args, "--user", p.User, "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,mode=1777")
 	args = append(args, resourceArguments...)
 	for _, mount := range p.Mounts {
-		value := "type=bind,src=" + mount.Source + ",dst=" + mount.Target
-		if mount.ReadOnly {
-			value += ",readonly"
+		value, err := dockercli.RestrictedBindMountArgument(mount.Source, mount.Target, mount.ReadOnly)
+		if err != nil {
+			return nil, err
 		}
 		args = append(args, "--mount", value)
 	}

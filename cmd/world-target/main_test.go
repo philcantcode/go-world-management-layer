@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -181,14 +182,14 @@ func TestADBProxyRequiresLoopbackAndConnectionBound(t *testing.T) {
 	if _, err := parseADBProxy(scopedArguments("-listen", "0.0.0.0:5037"), &bytes.Buffer{}); err == nil {
 		t.Fatal("expected non-loopback rejection")
 	}
-	if _, err := parseADBProxy(scopedArguments("-connections", "17"), &bytes.Buffer{}); err == nil {
+	if _, err := parseADBProxy(scopedArguments("-connections", strconv.Itoa(maxADBProxyConnections+1)), &bytes.Buffer{}); err == nil {
 		t.Fatal("expected connection bound rejection")
 	}
-	options, err := parseADBProxy(scopedArguments("-listen", "127.0.0.1:0", "-connections", "2"), &bytes.Buffer{})
+	options, err := parseADBProxy(scopedArguments("-listen", "127.0.0.1:0", "-connections", strconv.Itoa(maxADBProxyConnections)), &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if options.connections != 2 {
+	if options.connections != maxADBProxyConnections {
 		t.Fatalf("unexpected options: %#v", options)
 	}
 }

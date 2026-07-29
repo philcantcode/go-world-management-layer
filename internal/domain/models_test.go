@@ -296,6 +296,18 @@ func TestObservationTypesDistinguishUnavailableZeroAndProtectPayloads(t *testing
 	}
 }
 
+func TestChangeEntryAllowsOnlyOpaqueDirectoryAtTargetRoot(t *testing.T) {
+	if _, err := NewChangeEntry(ChangeEntrySpec{Kind: ChangeOpaqueDirectory, Path: "."}); err != nil {
+		t.Fatalf("root opaque-directory entry: %v", err)
+	}
+	if _, err := NewChangeEntry(ChangeEntrySpec{Kind: ChangeOpaqueDirectory, Path: "data"}); err != nil {
+		t.Fatalf("nested opaque-directory entry: %v", err)
+	}
+	if _, err := NewChangeEntry(ChangeEntrySpec{Kind: ChangeModified, Path: "."}); err == nil {
+		t.Fatal("root path must remain invalid for non-opaque change entries")
+	}
+}
+
 func TestIncidentCaptureExportAndBundleModels(t *testing.T) {
 	ids := newFixtureIDs(t)
 	now := time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)

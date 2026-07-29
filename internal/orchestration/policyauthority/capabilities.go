@@ -93,6 +93,14 @@ func BuildCapabilityFingerprint(facts CapabilityFacts) (policy.CapabilityFingerp
 	}
 	addCapability(capabilities, "runtime.isolation.observable-container", visibilitySupported, nil, nil)
 
+	androidVirtual, androidFound := findComponentCapability(components, "target.android-virtual")
+	androidManaged := androidFound && androidVirtual.Status() == policy.CapabilitySupported && componentEvidenceEquals(components, "target.android-virtual", "managed", "true")
+	androidAccelerated := androidManaged && (strings.EqualFold(androidVirtual.Constraints()["hardware_acceleration"], "true") || strings.EqualFold(androidVirtual.Constraints()["kvm"], "true"))
+	addCapability(capabilities, "target.kind.android-virtual-device", androidManaged, nil, nil)
+	addCapability(capabilities, "runtime.driver.android-emulator", androidManaged, nil, nil)
+	addCapability(capabilities, "runtime.isolation.instrumented-android", androidManaged, nil, nil)
+	addCapability(capabilities, "android.hardware-acceleration", androidAccelerated, nil, nil)
+
 	for _, component := range components {
 		adapter := strings.TrimSpace(component.Adapter)
 		if adapter == "" {
@@ -144,6 +152,16 @@ func findComponentCapability(components []CapabilityComponent, name string) (pol
 		}
 	}
 	return policy.Capability{}, false
+}
+
+func componentEvidenceEquals(components []CapabilityComponent, capabilityName, key, expected string) bool {
+	for _, component := range components {
+		capability, found := component.Fingerprint.Capability(capabilityName)
+		if found && capability.Status() == policy.CapabilitySupported && strings.EqualFold(strings.TrimSpace(component.Fingerprint.Evidence()[key]), expected) {
+			return true
+		}
+	}
+	return false
 }
 
 func validCapabilityComponentName(value string) bool {

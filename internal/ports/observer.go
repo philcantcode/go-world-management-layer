@@ -2,6 +2,10 @@ package ports
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/philcantcode/go-world-management-layer/internal/admission"
@@ -100,17 +104,106 @@ func collectorNameEdge(value byte) bool {
 	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
 }
 
-// ObservationAttachment is a target-driver observation handle. RuntimeID is
-// authority-produced by PrepareRun and is never accepted from a public run
-// request.
+// ADBServerEndpoint is the canonical identity of one explicitly selected ADB
+// server. Only literal loopback endpoints are representable: observation must
+// never escape to DNS, a remote server, or adb's ambient server selection.
+type ADBServerEndpoint struct {
+	Host string
+	Port uint16
+}
+
+func ParseADBServerEndpoint(value string) (ADBServerEndpoint, error) {
+	if value == "" || value != strings.TrimSpace(value) {
+		return ADBServerEndpoint{}, fmt.Errorf("ADB server endpoint is required and must be trimmed")
+	}
+	host, portText, err := net.SplitHostPort(value)
+	if err != nil {
+		return ADBServerEndpoint{}, err
+	}
+	ip := net.ParseIP(host)
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil || port == 0 || ip == nil || !ip.IsLoopback() {
+		return ADBServerEndpoint{}, fmt.Errorf("ADB server endpoint must use a literal loopback address and valid port")
+	}
+	return ADBServerEndpoint{Host: ip.String(), Port: uint16(port)}, nil
+}
+
+func (e ADBServerEndpoint) Validate() error {
+	ip := net.ParseIP(e.Host)
+	if e.Port == 0 || ip == nil || !ip.IsLoopback() || e.Host != ip.String() {
+		return fmt.Errorf("ADB server endpoint must use a canonical literal loopback address and valid port")
+	}
+	return nil
+}
+
+// ADBDeviceSelection is the exact target-driver-owned ADB authority supplied
+// to a trusted observer. Serial is an argv value, never an option or template.
+type ADBDeviceSelection struct {
+	Server ADBServerEndpoint
+	Serial string
+}
+
+func NewADBDeviceSelection(server ADBServerEndpoint, serial string) (ADBDeviceSelection, error) {
+	selection := ADBDeviceSelection{Server: server, Serial: serial}
+	if err := selection.Validate(); err != nil {
+		return ADBDeviceSelection{}, err
+	}
+	return selection, nil
+}
+
+func (s ADBDeviceSelection) Validate() error {
+	if err := s.Server.Validate(); err != nil {
+		return err
+	}
+	return ValidateExactADBSerial(s.Serial)
+}
+
+func (s ADBDeviceSelection) IsZero() bool {
+	return s.Server == (ADBServerEndpoint{}) && s.Serial == ""
+}
+
+// ValidateExactADBSerial accepts one bounded literal selector which cannot be
+// interpreted as an adb option. It is shared by target and observer drivers so
+// the authority producer and consumer cannot drift on selector safety.
+func ValidateExactADBSerial(serial string) error {
+	if serial == "" || len(serial) > 1024 || strings.HasPrefix(serial, "-") {
+		return fmt.Errorf("safe exact ADB serial is required")
+	}
+	for _, character := range serial {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' {
+			continue
+		}
+		switch character {
+		case '.', '_', '-', ':':
+			continue
+		default:
+			return fmt.Errorf("safe exact ADB serial is required")
+		}
+	}
+	return nil
+}
+
+// ObservationAttachment is a target-driver observation handle. RuntimeID and
+// any ADB device selection are authority-produced by PrepareRun and are never
+// accepted from a public run request.
 type ObservationAttachment struct {
 	TargetKind domain.TargetKind
 	RuntimeID  string
+	ADBDevice  ADBDeviceSelection
 }
 
 func (a ObservationAttachment) Validate() error {
 	if !a.TargetKind.IsValid() || a.RuntimeID == "" {
 		return domain.NewError(domain.CodeInvalidArgument, "ports.observation_attachment.validate", "attachment", "target kind and runtime identity are required", nil)
+	}
+	if a.ADBDevice.IsZero() {
+		return nil
+	}
+	if a.TargetKind != domain.TargetAndroidVirtualDevice {
+		return domain.NewError(domain.CodeInvalidArgument, "ports.observation_attachment.validate", "adb_device", "is valid only for an Android virtual-device target", nil)
+	}
+	if err := a.ADBDevice.Validate(); err != nil {
+		return domain.NewError(domain.CodeInvalidArgument, "ports.observation_attachment.validate", "adb_device", "exact ADB server and serial are invalid", err)
 	}
 	return nil
 }
@@ -181,10 +274,15 @@ type CollectorResult struct {
 }
 
 // ObserverDriver keeps privileged collector mechanics outside the target
-// compromise domain. Coverage is queried independently of collector output.
+// compromise domain. PrepareStop arms the target's terminal boundary while
+// leaving collection active; CancelStopPreparation rolls that arm back when
+// the target produces no stop receipt. Coverage is queried independently of
+// collector output.
 type ObserverDriver interface {
 	Probe(context.Context, ObservationRequirement) (domain.CapabilityFingerprint, error)
 	Start(context.Context, CollectorPlan) (Collector, error)
+	PrepareStop(context.Context, domain.CollectorID) error
+	CancelStopPreparation(context.Context, domain.CollectorID) error
 	Stop(context.Context, domain.CollectorID) (CollectorResult, error)
 	Coverage(context.Context, domain.CollectorID) (domain.CollectorCoverage, error)
 }

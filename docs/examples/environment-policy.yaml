@@ -116,15 +116,18 @@ spec:
       - name: android-apk-visible
         kind: android-virtual-device
         runtime:
-          driver: cuttlefish
+          driver: android-emulator
           systemImageDigest: sha256:3333333333333333333333333333333333333333333333333333333333333333
           isolationProfile: instrumented-android
-          baselineState: clean-v1
+          baselineState: clean-boot
           requireHardwareAcceleration: true
           headless: true
           rooted: true
           debuggable: true
+          guestMemory: 2Gi
           bootTimeout: 3m
+        material:
+          writableState: guest-data-partition
         interaction:
           commandAuthority: arbitrary-inside-assigned-device
           adb: scoped-gateway
@@ -139,7 +142,7 @@ spec:
           limits:
             cpu: "4"
             memory: 6Gi
-            writableState: 16Gi
+            writableState: 1Gi
         reset:
           afterEveryRun: true
           mode: baseline-new-target-generation

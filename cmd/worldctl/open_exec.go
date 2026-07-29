@@ -40,7 +40,7 @@ func openExec(ctx context.Context, client *world.Client, arguments []string, std
 		nil,
 		func(frame *worldv1.ExecFrame) error {
 			return output.Handle(stdout, stderr, frame.Stdout, frame.Stderr, frame.Outcome)
-		})
+		}, worldcli.PumpBidiOptions{})
 	if err != nil {
 		return err
 	}

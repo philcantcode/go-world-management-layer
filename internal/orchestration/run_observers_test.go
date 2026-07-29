@@ -295,6 +295,11 @@ func TestRunObserverCoordinatorRejectsTamperedPersistedCollectorBinding(t *testi
 		t.Fatal(err)
 	}
 	input := observerTestStart(t, clock.Now())
+	input.TargetKind = domain.TargetAndroidVirtualDevice
+	input.Prepared.Attachment = ports.ObservationAttachment{
+		TargetKind: domain.TargetAndroidVirtualDevice, RuntimeID: "world-android-generation-2",
+		ADBDevice: ports.ADBDeviceSelection{Server: ports.ADBServerEndpoint{Host: "127.0.0.1", Port: 5041}, Serial: "emulator-5578"},
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := coordinator.Start(ctx, input); err != nil {
@@ -304,7 +309,7 @@ func TestRunObserverCoordinatorRejectsTamperedPersistedCollectorBinding(t *testi
 	if err != nil || len(markers) != 1 {
 		t.Fatalf("load marker = %#v, %v", markers, err)
 	}
-	markers[0].Collectors[0].Plan.Adapter = "tampered-adapter"
+	markers[0].Collectors[0].Plan.Attachment.ADBDevice.Serial = "emulator-5580"
 	if err := coordinator.writeMarker(markers[0]); err != nil {
 		t.Fatal(err)
 	}
@@ -323,6 +328,38 @@ func TestRunObserverCoordinatorRejectsTamperedPersistedCollectorBinding(t *testi
 	}
 	if err := restarted.RecoverInterrupted(ctx, input, domain.TargetRunRunning); !domain.IsCode(err, domain.CodeIntegrityViolation) {
 		t.Fatalf("tampered collector binding recovery error = %v", err)
+	}
+}
+
+func TestObserverStartSignatureBindsExactADBObservationAuthority(t *testing.T) {
+	input := observerTestStart(t, time.Unix(1_800_075_000, 0).UTC())
+	input.TargetKind = domain.TargetAndroidVirtualDevice
+	input.Prepared.Attachment = ports.ObservationAttachment{
+		TargetKind: domain.TargetAndroidVirtualDevice, RuntimeID: "world-android-generation-2",
+		ADBDevice: ports.ADBDeviceSelection{Server: ports.ADBServerEndpoint{Host: "127.0.0.1", Port: 5041}, Serial: "emulator-5578"},
+	}
+	if err := validateRunObserverStart(input); err != nil {
+		t.Fatal(err)
+	}
+	base, err := observerStartSignature(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*RunObserverStart){
+		"server": func(value *RunObserverStart) { value.Prepared.Attachment.ADBDevice.Server.Port = 5043 },
+		"serial": func(value *RunObserverStart) { value.Prepared.Attachment.ADBDevice.Serial = "emulator-5580" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := input
+			mutate(&changed)
+			signature, err := observerStartSignature(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if signature == base {
+				t.Fatalf("%s mutation did not change observer signature %s", name, signature)
+			}
+		})
 	}
 }
 
@@ -595,6 +632,14 @@ func (d *crashSafeObserverDriver) Start(ctx context.Context, plan ports.Collecto
 		}
 	}
 	return d.inner.Start(ctx, plan)
+}
+
+func (d *crashSafeObserverDriver) PrepareStop(ctx context.Context, id domain.CollectorID) error {
+	return d.inner.PrepareStop(ctx, id)
+}
+
+func (d *crashSafeObserverDriver) CancelStopPreparation(ctx context.Context, id domain.CollectorID) error {
+	return d.inner.CancelStopPreparation(ctx, id)
 }
 
 func (d *crashSafeObserverDriver) Stop(ctx context.Context, id domain.CollectorID) (ports.CollectorResult, error) {

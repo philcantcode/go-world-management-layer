@@ -594,7 +594,7 @@ func (s *Service) beginExportCommit(ctx context.Context, namespace string, recor
 		return exportRecord{}, status.Error(codes.DataLoss, "export state disappeared while reserving commit")
 	}
 	current = cloneExportRecord(current)
-	reserved, err := s.requireOperationReservationLocked(namespace, current.Export.ExportId, key, signature)
+	reserved, err := s.requireOperationReservationLocked(namespace, current.Export.ExportId, key, signature, 0)
 	if err != nil {
 		return exportRecord{}, err
 	}
@@ -699,7 +699,7 @@ func (s *Service) completeExportCommit(ctx context.Context, namespace string, re
 		return nil, status.Error(codes.DataLoss, "export state disappeared while completing commit")
 	}
 	current = cloneExportRecord(current)
-	reserved, err := s.requireOperationReservationLocked(namespace, current.Export.ExportId, key, signature)
+	reserved, err := s.requireOperationReservationLocked(namespace, current.Export.ExportId, key, signature, 0)
 	if err != nil {
 		return nil, err
 	}

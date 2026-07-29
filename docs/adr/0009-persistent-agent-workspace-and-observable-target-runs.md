@@ -48,9 +48,10 @@ summary.
 
 The default Linux target uses a hardened standard OCI/runc runtime so host-owned
 eBPF, namespace, cgroup, network, and filesystem collectors retain high-fidelity
-visibility. gVisor, Kata, or another stronger boundary is an optional capability
-profile. Admission fails if that runtime cannot satisfy policy-required
-visibility; the manager never silently trades away observation completeness.
+visibility. The shipped policy and Linux target driver accept only runc.
+gVisor, Kata, or another stronger boundary remains future research, not an
+optional selectable profile; adding one requires a new explicit visibility and
+collector contract rather than a compatibility path.
 
 ## Consequences
 

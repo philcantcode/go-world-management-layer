@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/philcantcode/go-world-management-layer/internal/admission"
+	"github.com/philcantcode/go-world-management-layer/internal/androidcontract"
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
 	"github.com/philcantcode/go-world-management-layer/internal/safepath"
 )
@@ -23,7 +24,19 @@ type TargetTemplate struct {
 	Runtime          string
 	ImageDigest      domain.Digest
 	IsolationProfile string
+	// Android virtual-device fields are carried in the resolved physical plan
+	// rather than being re-read from policy inside a driver. They are zero for
+	// Linux-container templates.
+	BaselineState               string
+	RequireHardwareAcceleration bool
+	Headless                    bool
+	Rooted                      bool
+	Debuggable                  bool
+	GuestMemoryBytes            int64
+	BootTimeout                 time.Duration
 }
+
+const AndroidBaselineCleanBoot = "clean-boot"
 
 func (t TargetTemplate) Validate() error {
 	const operation = "ports.target_template.validate"
@@ -32,6 +45,28 @@ func (t TargetTemplate) Validate() error {
 	}
 	if t.ImageDigest.IsZero() {
 		return domain.NewError(domain.CodeInvalidArgument, operation, "image_digest", "must be set", nil)
+	}
+	switch t.Kind {
+	case domain.TargetLinuxContainer:
+		if strings.TrimSpace(t.Runtime) == "" || t.Runtime != strings.TrimSpace(t.Runtime) {
+			return domain.NewError(domain.CodeInvalidArgument, operation, "runtime", "must be non-blank and trimmed for a Linux container", nil)
+		}
+		if t.BaselineState != "" || t.RequireHardwareAcceleration || t.Headless || t.Rooted || t.Debuggable || t.GuestMemoryBytes != 0 || t.BootTimeout != 0 {
+			return domain.NewError(domain.CodeInvalidArgument, operation, "template", "contains Android-only runtime fields", nil)
+		}
+	case domain.TargetAndroidVirtualDevice:
+		if t.Runtime != "" {
+			return domain.NewError(domain.CodeInvalidArgument, operation, "runtime", "must be empty for an Android virtual device", nil)
+		}
+		if t.BaselineState != AndroidBaselineCleanBoot {
+			return domain.NewError(domain.CodeInvalidArgument, operation, "baseline_state", "must be clean-boot", nil)
+		}
+		if !t.RequireHardwareAcceleration || !t.Headless || !t.Rooted || !t.Debuggable || t.GuestMemoryBytes <= 0 || t.BootTimeout <= 0 {
+			return domain.NewError(domain.CodeInvalidArgument, operation, "template", "Android hardware acceleration, headless, rooted, debuggable, positive guest memory, and a positive boot timeout are required", nil)
+		}
+		if err := androidcontract.ValidateGuestMemoryBytes(t.GuestMemoryBytes); err != nil {
+			return domain.NewError(domain.CodeInvalidArgument, operation, "guest_memory_bytes", "is invalid", err)
+		}
 	}
 	return nil
 }

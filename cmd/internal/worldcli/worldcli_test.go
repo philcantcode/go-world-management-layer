@@ -12,6 +12,8 @@ import (
 	"time"
 
 	worldv1 "github.com/philcantcode/go-world-management-layer/api/world/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -63,6 +65,14 @@ type immediateEOFExecFrameStream struct{}
 func (immediateEOFExecFrameStream) Send(*worldv1.ExecFrame) error     { return nil }
 func (immediateEOFExecFrameStream) Recv() (*worldv1.ExecFrame, error) { return nil, io.EOF }
 func (immediateEOFExecFrameStream) CloseSend() error                  { return nil }
+
+type recvErrorExecFrameStream struct{ recvErr error }
+
+func (recvErrorExecFrameStream) Send(*worldv1.ExecFrame) error { return nil }
+func (stream recvErrorExecFrameStream) Recv() (*worldv1.ExecFrame, error) {
+	return nil, stream.recvErr
+}
+func (recvErrorExecFrameStream) CloseSend() error { return nil }
 
 type releasedReader struct{ release <-chan struct{} }
 
@@ -184,7 +194,7 @@ func TestPumpBidiCompletesInputAndPropagatesHalfCloseError(t *testing.T) {
 	err := PumpBidi(stream, &worldv1.ExecFrame{Start: &worldv1.ExecStart{}}, strings.NewReader("input"),
 		func(data []byte) *worldv1.ExecFrame { return &worldv1.ExecFrame{Stdin: data} },
 		func() *worldv1.ExecFrame { return &worldv1.ExecFrame{Heartbeat: true} },
-		func(*worldv1.ExecFrame) error { return nil })
+		func(*worldv1.ExecFrame) error { return nil }, PumpBidiOptions{})
 	if !errors.Is(err, closeErr) {
 		t.Fatalf("PumpBidi error = %v, want %v", err, closeErr)
 	}
@@ -199,10 +209,33 @@ func TestPumpBidiRejectsServerEOFBeforeClientHalfClose(t *testing.T) {
 	release := make(chan struct{})
 	err := PumpBidi(immediateEOFExecFrameStream{}, &worldv1.ExecFrame{Start: &worldv1.ExecStart{}}, releasedReader{release: release},
 		func(data []byte) *worldv1.ExecFrame { return &worldv1.ExecFrame{Stdin: data} }, nil,
-		func(*worldv1.ExecFrame) error { return nil })
+		func(*worldv1.ExecFrame) error { return nil }, PumpBidiOptions{})
 	close(release)
 	if err == nil || !strings.Contains(err.Error(), "before client input was half-closed") {
 		t.Fatalf("premature EOF error = %v", err)
+	}
+}
+
+func TestPumpBidiAllowsServerEOFBeforeClientHalfCloseWhenConfigured(t *testing.T) {
+	release := make(chan struct{})
+	err := PumpBidi(immediateEOFExecFrameStream{}, &worldv1.ExecFrame{Start: &worldv1.ExecStart{}}, releasedReader{release: release},
+		func(data []byte) *worldv1.ExecFrame { return &worldv1.ExecFrame{Stdin: data} }, nil,
+		func(*worldv1.ExecFrame) error { return nil }, PumpBidiOptions{AllowServerEOFBeforeInputHalfClose: true})
+	close(release)
+	if err != nil {
+		t.Fatalf("configured server-first EOF error = %v", err)
+	}
+}
+
+func TestPumpBidiPropagatesUnavailableBeforeClientHalfCloseWhenEOFIsAllowed(t *testing.T) {
+	release := make(chan struct{})
+	recvErr := status.Error(codes.Unavailable, "daemon unavailable")
+	err := PumpBidi(recvErrorExecFrameStream{recvErr: recvErr}, &worldv1.ExecFrame{Start: &worldv1.ExecStart{}}, releasedReader{release: release},
+		func(data []byte) *worldv1.ExecFrame { return &worldv1.ExecFrame{Stdin: data} }, nil,
+		func(*worldv1.ExecFrame) error { return nil }, PumpBidiOptions{AllowServerEOFBeforeInputHalfClose: true})
+	close(release)
+	if !errors.Is(err, recvErr) || status.Code(err) != codes.Unavailable {
+		t.Fatalf("PumpBidi error = %v, want propagated Unavailable error %v", err, recvErr)
 	}
 }
 
@@ -303,14 +336,14 @@ func TestEncoderAndStreamsRejectNilGeneratedMessages(t *testing.T) {
 		return &worldv1.ExecFrame{Stdin: data}
 	}, nil, func(*worldv1.ExecFrame) error {
 		return nil
-	}); err == nil {
+	}, PumpBidiOptions{}); err == nil {
 		t.Fatal("nil start frame was accepted")
 	}
 	if err := PumpBidi(nilExecFrameStream{}, &worldv1.ExecFrame{}, strings.NewReader(""), func(data []byte) *worldv1.ExecFrame {
 		return &worldv1.ExecFrame{Stdin: data}
 	}, nil, func(*worldv1.ExecFrame) error {
 		return nil
-	}); err == nil {
+	}, PumpBidiOptions{}); err == nil {
 		t.Fatal("nil received frame was accepted")
 	}
 	if err := WriteTop(&output, &worldv1.LiveSnapshot{Metrics: []*worldv1.MetricSample{nil}}); err == nil {

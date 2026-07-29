@@ -149,11 +149,54 @@ func TestDockerDriverLifecycleEndToEnd(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(record.plan.writableRoot(), "result.json")); err != nil {
 		t.Fatalf("writable result missing from target-private state: %v", err)
 	}
-	if stopped, err := driver.StopRun(ctx, firstRun.Run.ID(), ports.StopGraceful); err != nil || stopped.Outcome != ports.RunCompleted || stopped.FailureKind != ports.TargetRunFailureNone {
+	const detachedMutationDelay = 3 * time.Second
+	detachedReadyPath := filepath.Join(record.plan.writableRoot(), "daemon", "ready.txt")
+	detachedOutputPath := filepath.Join(record.plan.writableRoot(), "daemon", "escaped-after-stop.txt")
+	detachedPlan := dockerExecPlan(t, scope, 1, firstRun.Run.ID(), "/target/tools/native-specimen", []string{
+		"-detached-ready", "/target/daemon/ready.txt",
+		"-detached-output", "/target/daemon/escaped-after-stop.txt",
+		"-detached-delay", detachedMutationDelay.String(),
+	}, time.Now().Add(20*time.Second))
+	if _, terminal, err := receiveDockerExec(ctx, targetTransport, detachedPlan); err != nil || terminal.ExitCode != 0 || !terminal.CleanupConfirmed {
+		t.Fatalf("detached setsid launch terminal = %#v, %v", terminal, err)
+	}
+	requireFileAppears(t, detachedReadyPath, time.Second)
+	if _, err := os.Stat(detachedOutputPath); !os.IsNotExist(err) {
+		t.Fatalf("detached mutation occurred before StopRun: %v", err)
+	}
+	stopped, err := driver.StopRun(ctx, firstRun.Run.ID(), ports.StopGraceful)
+	if err != nil || stopped.Outcome != ports.RunCompleted || stopped.FailureKind != ports.TargetRunFailureNone {
 		t.Fatalf("first run stop = %#v, %v", stopped, err)
 	}
+	requireAddedTargetChanges(t, stopped.TargetChanges, map[string]domain.Digest{
+		"default-mode.txt":      domain.NewDigest([]byte("default mode")),
+		"daemon/ready.txt":      domain.NewDigest([]byte("ready\n")),
+		"result.json":           domain.NewDigest(resultBytes),
+		"tools/native-specimen": domain.NewDigest(nativeBinary),
+	})
+	if state, err := dockerRuntime.Inspect(ctx, created.Status.RuntimeID); err != nil || state.Running {
+		t.Fatalf("stopped run container state = %#v, %v", state, err)
+	}
+	withoutReset := dockerRunPlan(t, scope, 1, material, "docker-e2e-run-without-reset", 30*time.Second)
+	if _, err := driver.PrepareRun(ctx, withoutReset); !domain.IsCode(err, domain.CodeInvalidState) {
+		t.Fatalf("second run reused stopped generation without reset: %v", err)
+	}
+	time.Sleep(detachedMutationDelay + time.Second)
+	if _, err := os.Stat(detachedOutputPath); !os.IsNotExist(err) {
+		t.Fatalf("setsid daemon mutated target state after the sealed boundary: %v", err)
+	}
 
-	deadlineRun := dockerRunPlan(t, scope, 1, material, "docker-e2e-run-deadline", 8*time.Second)
+	firstReset := ports.ResetPlan{IdempotencyKey: "docker-e2e-reset-one", LeaseID: scope.leaseID, Previous: ports.TargetRef{ID: scope.targetID, Generation: 1}, NextGeneration: 2, Mode: ports.ResetRecreate}
+	firstResetResult, err := driver.Reset(ctx, scope.targetID, firstReset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	knownRuntimeIDs = append(knownRuntimeIDs, firstResetResult.Status.RuntimeID)
+	if _, err := dockerRuntime.Inspect(ctx, created.Status.RuntimeID); err == nil {
+		t.Fatal("first reset left the consumed generation runtime reachable")
+	}
+
+	deadlineRun := dockerRunPlan(t, scope, 2, material, "docker-e2e-run-deadline", 8*time.Second)
 	if _, err := driver.PrepareRun(ctx, deadlineRun); err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +208,11 @@ func TestDockerDriverLifecycleEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	longExec := dockerExecPlan(t, scope, 1, deadlineRun.Run.ID(), "/target/tools/native-specimen", []string{"-sleep", "30s", "-input", "/target/input/payload.txt"}, time.Now().Add(45*time.Second))
+	deadlinePush := dockerTransferPlan(t, scope, 2, deadlineRun.Run.ID(), domain.TargetOperationPush, "tools/native-specimen", domain.NewDigest(nativeBinary), 0o555, int64(len(nativeBinary)))
+	if _, err := deadlineTransport.PushFile(ctx, deadlinePush, bytes.NewReader(nativeBinary)); err != nil {
+		t.Fatal(err)
+	}
+	longExec := dockerExecPlan(t, scope, 2, deadlineRun.Run.ID(), "/target/tools/native-specimen", []string{"-sleep", "30s", "-input", "/target/input/payload.txt"}, time.Now().Add(45*time.Second))
 	longSession, err := deadlineTransport.OpenExec(ctx, longExec)
 	if err != nil {
 		t.Fatal(err)
@@ -186,18 +233,20 @@ func TestDockerDriverLifecycleEndToEnd(t *testing.T) {
 	if _, err := driver.OpenTransport(ctx, deadlineRun.Run.ID()); !domain.IsCode(err, domain.CodeFailedPrecondition) {
 		t.Fatalf("expired run reopened transport: %v", err)
 	}
-	requireNoGuestProcesses(t, ctx, created.Status.RuntimeID)
+	if state, err := dockerRuntime.Inspect(ctx, firstResetResult.Status.RuntimeID); err != nil || state.Running {
+		t.Fatalf("expired run container state = %#v, %v", state, err)
+	}
 
-	reset := ports.ResetPlan{IdempotencyKey: "docker-e2e-reset", LeaseID: scope.leaseID, Previous: ports.TargetRef{ID: scope.targetID, Generation: 1}, NextGeneration: 2, Mode: ports.ResetRecreate}
+	reset := ports.ResetPlan{IdempotencyKey: "docker-e2e-reset-two", LeaseID: scope.leaseID, Previous: ports.TargetRef{ID: scope.targetID, Generation: 2}, NextGeneration: 3, Mode: ports.ResetRecreate}
 	resetResult, err := driver.Reset(ctx, scope.targetID, reset)
 	if err != nil {
 		t.Fatal(err)
 	}
 	knownRuntimeIDs = append(knownRuntimeIDs, resetResult.Status.RuntimeID)
-	if resetResult.Status.Generation != 2 || !resetResult.Status.Ready {
+	if resetResult.Status.Generation != 3 || !resetResult.Status.Ready {
 		t.Fatalf("reset result = %#v", resetResult)
 	}
-	if _, err := dockerRuntime.Inspect(ctx, created.Status.RuntimeID); err == nil {
+	if _, err := dockerRuntime.Inspect(ctx, firstResetResult.Status.RuntimeID); err == nil {
 		t.Fatal("reset left the previous runtime reachable")
 	}
 	if state, err := dockerRuntime.Inspect(ctx, resetResult.Status.RuntimeID); err != nil || !state.Running {
@@ -207,7 +256,70 @@ func TestDockerDriverLifecycleEndToEnd(t *testing.T) {
 		t.Fatalf("reset replay = %#v, %v", replay, err)
 	}
 
-	if err := driver.Destroy(ctx, ports.TargetRef{ID: scope.targetID, Generation: 2}); err != nil {
+	// Prove the reset receipt is sufficient after complete driver state loss,
+	// then quarantine and independently adopt the exact stopped realization.
+	expectedGeneration2 := successorTargetPlan(t, targetPlan, firstReset)
+	expectedGeneration2.IdempotencyKey = "docker-e2e-generation-two"
+	expectedGeneration3 := successorTargetPlan(t, expectedGeneration2, reset)
+	expectedGeneration3.IdempotencyKey = "docker-e2e-generation-three"
+	restarted, err := New(Config{
+		Build:      BuildConfig{TargetRoot: root, ImageRepository: repository},
+		Runtime:    dockerRuntime,
+		Collectors: CollectorReadinessFunc(func(context.Context, domain.TargetRunID, []ports.ObservationRequirement) error { return nil }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartReport, err := restarted.ReconcileTargets(ctx, ports.TargetReconciliationRequest{Active: []ports.TargetPlan{expectedGeneration3}})
+	if err != nil || len(restartReport.Expected) != 1 || restartReport.Expected[0].Classification != ports.PhysicalResourceAdopted {
+		t.Fatalf("reset receipt restart reconciliation = %#v, %v", restartReport, err)
+	}
+	if replay, err := restarted.Reset(ctx, scope.targetID, reset); err != nil || replay.Status.RuntimeID != resetResult.Status.RuntimeID {
+		t.Fatalf("restart reset replay = %#v, %v", replay, err)
+	}
+	restartedRecord, err := restarted.requireTarget(scope.targetID, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preservedPath := filepath.Join(restartedRecord.plan.writableRoot(), "quarantine-preserved.txt")
+	preservedBytes := []byte("real quarantine evidence state\n")
+	if err := os.WriteFile(preservedPath, preservedBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	quarantinePlan := ports.TargetQuarantinePlan{
+		IdempotencyKey: "docker-e2e-quarantine", Target: ports.TargetRef{ID: scope.targetID, Generation: 3}, Reason: "restart custody qualification",
+	}
+	quarantineEvidence, err := restarted.Quarantine(ctx, quarantinePlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !quarantineEvidence.ExecutionStopped || !quarantineEvidence.NetworkUnreachable || !quarantineEvidence.StatePreserved {
+		t.Fatalf("quarantine evidence = %#v", quarantineEvidence)
+	}
+	quarantineRestart, err := New(Config{
+		Build:      BuildConfig{TargetRoot: root, ImageRepository: repository},
+		Runtime:    dockerRuntime,
+		Collectors: CollectorReadinessFunc(func(context.Context, domain.TargetRunID, []ports.ObservationRequirement) error { return nil }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantineReport, err := quarantineRestart.ReconcileTargets(ctx, ports.TargetReconciliationRequest{Active: []ports.TargetPlan{expectedGeneration3}})
+	if err != nil || len(quarantineReport.Expected) != 1 || quarantineReport.Expected[0].Classification != ports.PhysicalResourceAdopted {
+		t.Fatalf("quarantine restart reconciliation = %#v, %v", quarantineReport, err)
+	}
+	quarantinedRecord, err := quarantineRestart.requireTarget(scope.targetID, 3)
+	if err != nil || quarantinedRecord.status.State != domain.TargetGenerationQuarantined || quarantinedRecord.status.Ready {
+		t.Fatalf("restart quarantined record = %#v, %v", quarantinedRecord, err)
+	}
+	if contents, err := os.ReadFile(preservedPath); err != nil || !bytes.Equal(contents, preservedBytes) {
+		t.Fatalf("quarantined state was not preserved: bytes=%q err=%v", contents, err)
+	}
+	if replay, err := quarantineRestart.Quarantine(ctx, quarantinePlan); err != nil || replay != quarantineEvidence {
+		t.Fatalf("restart quarantine replay = %#v, %v; want %#v", replay, err, quarantineEvidence)
+	}
+
+	if err := quarantineRestart.Destroy(ctx, ports.TargetRef{ID: scope.targetID, Generation: 3}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := dockerRuntime.Inspect(ctx, resetResult.Status.RuntimeID); err == nil {
@@ -351,15 +463,19 @@ func requireProcessStarted(t *testing.T, ctx context.Context, session ports.Exec
 	}
 }
 
-func requireNoGuestProcesses(t *testing.T, ctx context.Context, runtimeID string) {
+func requireFileAppears(t *testing.T, path string, timeout time.Duration) {
 	t.Helper()
-	result, err := (command.OS{}).Run(ctx, command.Invocation{Program: "docker", Args: []string{"top", runtimeID, "-eo", "pid,comm,args"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	listing := string(result.Stdout)
-	if strings.Contains(listing, "native-specimen") || strings.Contains(listing, "world-guest") {
-		t.Fatalf("run deadline left guest processes behind:\n%s", listing)
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("file %q did not appear within %s", path, timeout)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -394,4 +510,25 @@ func splitPinnedImage(image string) (string, domain.Digest, bool) {
 		return "", domain.Digest{}, false
 	}
 	return image[:separator], digest, true
+}
+
+func requireAddedTargetChanges(t *testing.T, changes domain.ChangeSet, expected map[string]domain.Digest) {
+	t.Helper()
+	if changes.Scope() != domain.ChangeScopeTarget {
+		t.Fatalf("target change scope = %q, want %q", changes.Scope(), domain.ChangeScopeTarget)
+	}
+	entries := changes.Entries()
+	if len(entries) != len(expected) {
+		t.Fatalf("target changes = %#v, want %d exact additions", entries, len(expected))
+	}
+	for _, entry := range entries {
+		spec := entry.Spec()
+		want, found := expected[spec.Path]
+		if !found {
+			t.Fatalf("unexpected target change %q", spec.Path)
+		}
+		if spec.Kind != domain.ChangeAdded || !spec.BeforeDigest.IsZero() || spec.AfterDigest != want {
+			t.Fatalf("target change %q = %#v, want added digest %s", spec.Path, spec, want)
+		}
+	}
 }

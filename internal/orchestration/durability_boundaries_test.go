@@ -110,6 +110,37 @@ func TestObserverMarkerAcceptsExactLimitAndRejectsOneByteOverflowWithoutReplacem
 	}
 }
 
+func TestObserverMarkerVersionSixContract(t *testing.T) {
+	_, config := observerNamespaceSecurityConfig(t)
+	coordinator, err := NewRunObserverCoordinator(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID, err := config.IDs.TargetRunID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := observerStateMarker{
+		Version: 6, RunID: runID.String(), PlanDigest: domain.NewDigest([]byte("plan")).String(),
+		Signature: "signature", Phase: "active", Collectors: []ports.InterruptedCollectorBinding{}, UpdatedAt: config.Clock().UTC(),
+	}
+	if err := coordinator.writeMarker(marker); err != nil {
+		t.Fatal(err)
+	}
+	markers, err := coordinator.loadMarkers()
+	if err != nil || len(markers) != 1 || markers[0].Version != 6 {
+		t.Fatalf("load literal v6 marker = %#v, %v", markers, err)
+	}
+
+	marker.Version = 5
+	if err := coordinator.writeMarker(marker); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.loadMarkers(); !domain.IsCode(err, domain.CodeIntegrityViolation) {
+		t.Fatalf("load literal v5 marker error = %v, want integrity violation", err)
+	}
+}
+
 func TestObserverMarkerBindsEntireStopPreparationDigest(t *testing.T) {
 	_, config := observerNamespaceSecurityConfig(t)
 	coordinator, err := NewRunObserverCoordinator(config)

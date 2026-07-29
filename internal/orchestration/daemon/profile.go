@@ -18,6 +18,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/application"
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
 	observerprocess "github.com/philcantcode/go-world-management-layer/internal/drivers/observer/process"
+	"github.com/philcantcode/go-world-management-layer/internal/drivers/target/cuttlefish"
 	"github.com/philcantcode/go-world-management-layer/internal/localmaterial"
 	"github.com/philcantcode/go-world-management-layer/internal/orchestration"
 	"github.com/philcantcode/go-world-management-layer/internal/orchestration/policyauthority"
@@ -26,7 +27,7 @@ import (
 )
 
 const (
-	deploymentProfileVersion   = 2
+	deploymentProfileVersion   = 3
 	maxDeploymentProfileBytes  = int64(4 << 20)
 	maximumConfiguredRunWindow = 24 * time.Hour
 	maximumMaterialEntries     = 1024
@@ -91,30 +92,40 @@ type targetProfile struct {
 }
 
 type targetTemplateProfile struct {
-	Name             string            `json:"name"`
-	Kind             domain.TargetKind `json:"kind"`
-	Driver           string            `json:"driver"`
-	Runtime          string            `json:"runtime"`
-	Image            string            `json:"image"`
-	IsolationProfile string            `json:"isolation_profile"`
+	Name                        string            `json:"name"`
+	Kind                        domain.TargetKind `json:"kind"`
+	Driver                      string            `json:"driver"`
+	Runtime                     string            `json:"runtime,omitempty"`
+	Image                       string            `json:"image,omitempty"`
+	SystemImageDigest           string            `json:"system_image_digest,omitempty"`
+	SystemImagePackage          string            `json:"system_image_package,omitempty"`
+	IsolationProfile            string            `json:"isolation_profile"`
+	BaselineState               string            `json:"baseline_state,omitempty"`
+	RequireHardwareAcceleration bool              `json:"require_hardware_acceleration,omitempty"`
+	Headless                    bool              `json:"headless,omitempty"`
+	Rooted                      bool              `json:"rooted,omitempty"`
+	Debuggable                  bool              `json:"debuggable,omitempty"`
+	GuestMemoryBytes            int64             `json:"guest_memory_bytes,omitempty"`
+	BootTimeout                 string            `json:"boot_timeout,omitempty"`
 }
 
 type observerProfile struct {
-	Reference           string                    `json:"reference"`
-	Adapter             string                    `json:"adapter"`
-	Version             string                    `json:"version"`
-	ConfigurationDigest string                    `json:"configuration_digest"`
-	SignalFamily        string                    `json:"signal_family"`
-	Placement           domain.CollectorPlacement `json:"placement"`
-	CoverageLevel       domain.CoverageLevel      `json:"coverage_level"`
-	Required            bool                      `json:"required"`
-	Program             string                    `json:"program"`
-	Args                []string                  `json:"args,omitempty"`
-	Environment         map[string]string         `json:"environment,omitempty"`
-	VersionArgs         []string                  `json:"version_args,omitempty"`
-	Readiness           observerReadinessProfile  `json:"readiness"`
-	Resources           admission.Resources       `json:"resources"`
-	MaximumBytes        int64                     `json:"maximum_bytes"`
+	Reference           string                         `json:"reference"`
+	Adapter             string                         `json:"adapter"`
+	Version             string                         `json:"version"`
+	ConfigurationDigest string                         `json:"configuration_digest"`
+	SignalFamily        string                         `json:"signal_family"`
+	Placement           domain.CollectorPlacement      `json:"placement"`
+	CoverageLevel       domain.CoverageLevel           `json:"coverage_level"`
+	RuntimeBinding      observerprocess.RuntimeBinding `json:"runtime_binding,omitempty"`
+	Required            bool                           `json:"required"`
+	Program             string                         `json:"program"`
+	Args                []string                       `json:"args,omitempty"`
+	Environment         map[string]string              `json:"environment,omitempty"`
+	VersionArgs         []string                       `json:"version_args,omitempty"`
+	Readiness           observerReadinessProfile       `json:"readiness"`
+	Resources           admission.Resources            `json:"resources"`
+	MaximumBytes        int64                          `json:"maximum_bytes"`
 }
 
 type observerReadinessProfile struct {
@@ -146,6 +157,9 @@ type builtDeployment struct {
 	agentRepository  string
 	targetRepository string
 	targetTemplates  []ports.TargetTemplate
+	linuxTargets     []ports.TargetTemplate
+	androidTargets   []ports.TargetTemplate
+	androidImages    map[string]string
 	runCount         int
 	imageReferences  []string
 	profileDigest    domain.Digest
@@ -203,6 +217,7 @@ type pinnedImage struct {
 	repository string
 	digest     domain.Digest
 	reference  string
+	packageID  string
 }
 
 type authorityContentSource struct {
@@ -330,15 +345,36 @@ func loadDeployment(ctx context.Context, path, publicationRoot string, maximumOb
 	}
 	var targetRepository string
 	targetTemplates := make([]ports.TargetTemplate, 0, len(profile.Targets))
+	linuxTargets := make([]ports.TargetTemplate, 0, len(profile.Targets))
+	androidTargets := make([]ports.TargetTemplate, 0, len(profile.Targets))
+	androidImages := make(map[string]string)
+	var requiredAndroidImage pinnedImage
+	hasAndroidImage := false
 	for index, configured := range profile.Targets {
 		reference, plan, image, err := buildTargetPlan(configured)
 		if err != nil {
 			return builtDeployment{}, fmt.Errorf("target %d: %w", index, err)
 		}
-		if targetRepository == "" {
-			targetRepository = image.repository
-		} else if targetRepository != image.repository {
-			return builtDeployment{}, fmt.Errorf("target %d uses repository %q; all Linux targets must use %q", index, image.repository, targetRepository)
+		if plan.Template.Kind == domain.TargetLinuxContainer {
+			if targetRepository == "" {
+				targetRepository = image.repository
+			} else if targetRepository != image.repository {
+				return builtDeployment{}, fmt.Errorf("target %d uses repository %q; all Linux targets must use %q", index, image.repository, targetRepository)
+			}
+			linuxTargets = append(linuxTargets, plan.Template)
+		} else {
+			androidTargets = append(androidTargets, plan.Template)
+			if hasAndroidImage && (image.digest != requiredAndroidImage.digest || image.packageID != requiredAndroidImage.packageID) {
+				return builtDeployment{}, fmt.Errorf(
+					"target %d uses Android system-image identity (%s, %q); all Android targets must use one system-image digest/package identity (%s, %q)",
+					index, image.digest, image.packageID, requiredAndroidImage.digest, requiredAndroidImage.packageID,
+				)
+			}
+			if !hasAndroidImage {
+				requiredAndroidImage = image
+				hasAndroidImage = true
+			}
+			androidImages[image.digest.String()] = image.packageID
 		}
 		if _, duplicate := static.Targets[reference]; duplicate {
 			return builtDeployment{}, fmt.Errorf("target %d duplicates reference %q", index, reference)
@@ -349,7 +385,9 @@ func loadDeployment(ctx context.Context, path, publicationRoot string, maximumOb
 		}
 		targetPolicies[reference] = configured.Policy
 		targetTemplates = append(targetTemplates, plan.Template)
-		imageReferences[image.reference] = struct{}{}
+		if image.reference != "" {
+			imageReferences[image.reference] = struct{}{}
+		}
 	}
 	observerAdapters, observerSpecs, err := buildObserverPlans(profile.Observers, maximumObjectBytes)
 	if err != nil {
@@ -390,15 +428,22 @@ func loadDeployment(ctx context.Context, path, publicationRoot string, maximumOb
 		images = append(images, reference)
 	}
 	sort.Strings(images)
-	sort.Slice(targetTemplates, func(i, j int) bool { return targetTemplates[i].Name < targetTemplates[j].Name })
+	sortTargetTemplates(targetTemplates)
+	sortTargetTemplates(linuxTargets)
+	sortTargetTemplates(androidTargets)
 	return builtDeployment{
 		authority: authority, sourceRoot: filepath.Clean(profile.Material.SourceRoot),
 		agentRepository:  agentRepository,
 		targetRepository: targetRepository, targetTemplates: targetTemplates,
+		linuxTargets: linuxTargets, androidTargets: androidTargets, androidImages: androidImages,
 		runCount: len(profile.Runs), imageReferences: images, profileDigest: domain.NewDigest(raw),
 		observerAdapters: observerAdapters, policySources: policySources, static: static,
 		agentPolicies: agentPolicies, targetPolicies: targetPolicies, runTargets: runTargets,
 	}, nil
+}
+
+func sortTargetTemplates(values []ports.TargetTemplate) {
+	sort.Slice(values, func(i, j int) bool { return values[i].Name < values[j].Name })
 }
 
 func readDeploymentProfile(path string) ([]byte, deploymentProfile, error) {
@@ -763,20 +808,62 @@ func buildTargetPlan(configured targetProfile) (string, orchestration.StaticTarg
 	if reference != configured.Template.Name {
 		return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("reference must exactly match template.name")
 	}
-	image, err := parsePinnedImage(configured.Template.Image)
-	if err != nil {
-		return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("template.image: %w", err)
-	}
-	if configured.Template.Kind != domain.TargetLinuxContainer || configured.Template.Driver != "docker" || configured.Template.Runtime != "runc" {
-		return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("local target templates require kind=linux_container, driver=docker, and runtime=runc")
-	}
-	if err := requireTargetResources(configured.Resources); err != nil {
-		return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("resources: %w", err)
-	}
+	var image pinnedImage
 	template := ports.TargetTemplate{
 		Name: configured.Template.Name, Kind: configured.Template.Kind,
 		Driver: configured.Template.Driver, Runtime: configured.Template.Runtime,
-		ImageDigest: image.digest, IsolationProfile: configured.Template.IsolationProfile,
+		IsolationProfile: configured.Template.IsolationProfile,
+	}
+	switch configured.Template.Kind {
+	case domain.TargetLinuxContainer:
+		var err error
+		image, err = parsePinnedImage(configured.Template.Image)
+		if err != nil {
+			return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("template.image: %w", err)
+		}
+		if configured.Template.Driver != "docker" || configured.Template.Runtime != "runc" {
+			return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("Linux target templates require driver=docker and runtime=runc")
+		}
+		if configured.Template.SystemImageDigest != "" || configured.Template.SystemImagePackage != "" || configured.Template.BaselineState != "" || configured.Template.RequireHardwareAcceleration || configured.Template.Headless || configured.Template.Rooted || configured.Template.Debuggable || configured.Template.GuestMemoryBytes != 0 || configured.Template.BootTimeout != "" {
+			return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("Linux target template contains Android-only fields")
+		}
+		if err := requireTargetResources(configured.Resources); err != nil {
+			return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("resources: %w", err)
+		}
+		template.ImageDigest = image.digest
+	case domain.TargetAndroidVirtualDevice:
+		if configured.Template.Driver != "android-emulator" {
+			return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("Android target templates require driver=android-emulator")
+		}
+		if configured.Template.Runtime != "" || configured.Template.Image != "" {
+			return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("Android target template contains Linux-only runtime/image fields")
+		}
+		if err := cuttlefish.ValidateManagedSystemImagePackage(configured.Template.SystemImagePackage); err != nil {
+			return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("template.system_image_package: %w", err)
+		}
+		digest, err := domain.ParseDigest(configured.Template.SystemImageDigest)
+		if err != nil {
+			return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("template.system_image_digest: %w", err)
+		}
+		bootTimeout, err := time.ParseDuration(configured.Template.BootTimeout)
+		if err != nil || bootTimeout <= 0 || bootTimeout > maximumConfiguredRunWindow {
+			return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("template.boot_timeout must be a positive Go duration no greater than %s", maximumConfiguredRunWindow)
+		}
+		if err := requireAndroidTargetResources(configured.Resources, configured.Template.GuestMemoryBytes); err != nil {
+			return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("resources: %w", err)
+		}
+		template.ImageDigest = digest
+		template.BaselineState = configured.Template.BaselineState
+		template.RequireHardwareAcceleration = configured.Template.RequireHardwareAcceleration
+		template.Headless = configured.Template.Headless
+		template.Rooted = configured.Template.Rooted
+		template.Debuggable = configured.Template.Debuggable
+		template.GuestMemoryBytes = configured.Template.GuestMemoryBytes
+		template.BootTimeout = bootTimeout
+		image.digest = digest
+		image.packageID = configured.Template.SystemImagePackage
+	default:
+		return "", orchestration.StaticTargetPlan{}, pinnedImage{}, fmt.Errorf("unsupported target kind %q", configured.Template.Kind)
 	}
 	if err := template.Validate(); err != nil {
 		return "", orchestration.StaticTargetPlan{}, pinnedImage{}, err
@@ -785,8 +872,6 @@ func buildTargetPlan(configured targetProfile) (string, orchestration.StaticTarg
 		Template: template, Resources: configured.Resources,
 	}, image, nil
 }
-
-var observerEnvironmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func buildObserverPlans(configured []observerProfile, maximumBytes int64) ([]observerAdapterPlan, map[string]ports.CollectorSpec, error) {
 	plans := make([]observerAdapterPlan, 0, len(configured))
@@ -835,31 +920,16 @@ func buildObserverPlans(configured []observerProfile, maximumBytes int64) ([]obs
 		if !value.Resources.IsZero() {
 			return nil, nil, fmt.Errorf("observer %d resources must be zero because the local process supervisor does not enforce CPU, memory, storage, inode, PID, or device limits", index)
 		}
-		if err := validateObserverArguments("args", value.Args); err != nil {
-			return nil, nil, fmt.Errorf("observer %d: %w", index, err)
-		}
-		if err := validateObserverArguments("version_args", value.VersionArgs); err != nil {
-			return nil, nil, fmt.Errorf("observer %d: %w", index, err)
-		}
-		if err := validateObserverArguments("readiness.args", value.Readiness.Args); err != nil {
-			return nil, nil, fmt.Errorf("observer %d: %w", index, err)
-		}
-		if len(value.Environment) > 128 {
-			return nil, nil, fmt.Errorf("observer %d environment permits at most 128 entries", index)
-		}
-		for name, environmentValue := range value.Environment {
-			if !observerEnvironmentNamePattern.MatchString(name) || strings.HasPrefix(name, "WORLD_") || strings.ContainsRune(environmentValue, '\x00') {
-				return nil, nil, fmt.Errorf("observer %d environment entry %q is invalid or reserved", index, name)
-			}
+		configuration := observerAdapterConfiguration(value, interval)
+		adapter, err := observerprocess.BuildAdapter(configuration)
+		if err != nil {
+			return nil, nil, fmt.Errorf("observer %d configuration: %w", index, err)
 		}
 		declaredConfiguration, err := domain.ParseDigest(value.ConfigurationDigest)
 		if err != nil {
 			return nil, nil, fmt.Errorf("observer %d configuration_digest: %w", index, err)
 		}
-		computedConfiguration, err := observerConfigurationDigest(value, interval)
-		if err != nil {
-			return nil, nil, fmt.Errorf("observer %d configuration: %w", index, err)
-		}
+		computedConfiguration := adapter.ConfigurationDigest
 		if declaredConfiguration != computedConfiguration {
 			return nil, nil, fmt.Errorf("observer %d configuration_digest does not identify the exact adapter configuration", index)
 		}
@@ -870,15 +940,6 @@ func buildObserverPlans(configured []observerProfile, maximumBytes int64) ([]obs
 		if err := spec.Validate(); err != nil {
 			return nil, nil, fmt.Errorf("observer %d: %w", index, err)
 		}
-		adapter := observerprocess.Adapter{
-			Name: adapterName, Version: version, ConfigurationDigest: declaredConfiguration,
-			SignalFamily: value.SignalFamily, Placement: value.Placement, CoverageLevel: value.CoverageLevel,
-			Program: value.Program, Args: append([]string(nil), value.Args...), Environment: cloneStringMap(value.Environment),
-			VersionArgs: append([]string(nil), value.VersionArgs...),
-			Readiness: observerprocess.CommandReadiness{
-				Program: value.Readiness.Program, Args: append([]string(nil), value.Readiness.Args...), Interval: interval,
-			},
-		}
 		plans = append(plans, observerAdapterPlan{Reference: reference, Spec: spec, Adapter: adapter})
 		specs[reference] = spec
 	}
@@ -886,42 +947,13 @@ func buildObserverPlans(configured []observerProfile, maximumBytes int64) ([]obs
 	return plans, specs, nil
 }
 
-func validateObserverArguments(name string, values []string) error {
-	if len(values) > 256 {
-		return fmt.Errorf("%s permits at most 256 values", name)
-	}
-	for index, value := range values {
-		if strings.ContainsRune(value, '\x00') || len(value) > 32<<10 {
-			return fmt.Errorf("%s[%d] contains NUL or exceeds 32 KiB", name, index)
-		}
-	}
-	return nil
-}
-
-func observerConfigurationDigest(value observerProfile, interval time.Duration) (domain.Digest, error) {
-	encoded, err := json.Marshal(struct {
-		Adapter, Version, SignalFamily, Placement, CoverageLevel, Program, ReadinessProgram string
-		Args, VersionArgs, ReadinessArgs                                                    []string
-		Environment                                                                         map[string]string
-		ReadinessInterval                                                                   int64
-	}{
+func observerAdapterConfiguration(value observerProfile, interval time.Duration) observerprocess.AdapterConfiguration {
+	return observerprocess.AdapterConfiguration{
 		Adapter: value.Adapter, Version: value.Version, SignalFamily: value.SignalFamily,
-		Placement: string(value.Placement), CoverageLevel: string(value.CoverageLevel), Program: value.Program,
+		Placement: value.Placement, CoverageLevel: value.CoverageLevel, RuntimeBinding: value.RuntimeBinding, Program: value.Program,
 		Args: value.Args, Environment: value.Environment, VersionArgs: value.VersionArgs,
-		ReadinessProgram: value.Readiness.Program, ReadinessArgs: value.Readiness.Args, ReadinessInterval: int64(interval),
-	})
-	if err != nil {
-		return domain.Digest{}, err
+		ReadinessProgram: value.Readiness.Program, ReadinessArgs: value.Readiness.Args, ReadinessInterval: interval,
 	}
-	return domain.NewDigest(encoded), nil
-}
-
-func cloneStringMap(values map[string]string) map[string]string {
-	result := make(map[string]string, len(values))
-	for name, value := range values {
-		result[name] = value
-	}
-	return result
 }
 
 func buildRunPlan(ctx context.Context, authority *localmaterial.Authority, scope string, configured runProfile, observerSpecs map[string]ports.CollectorSpec, maximumObserverBytes int64) (domain.Digest, orchestration.StaticRunPlan, error) {
@@ -1135,6 +1167,19 @@ func requireTargetResources(resources admission.Resources) error {
 	}
 	if resources.CaptureBytes != 0 || resources.Inodes != 0 || len(resources.Devices) != 0 {
 		return fmt.Errorf("target capture_bytes, inodes, and devices must be zero because the Linux target driver does not enforce them")
+	}
+	return nil
+}
+
+func requireAndroidTargetResources(resources admission.Resources, guestMemoryBytes int64) error {
+	if err := resources.Validate(); err != nil {
+		return err
+	}
+	if err := cuttlefish.ValidateManagedEmulatorResources(resources, guestMemoryBytes); err != nil {
+		return err
+	}
+	if resources.SwapBytes != 0 || resources.CaptureBytes != 0 || resources.Inodes != 0 || resources.PIDs != 0 || len(resources.Devices) != 0 {
+		return fmt.Errorf("swap_bytes, capture_bytes, inodes, pids, and devices must be zero for Android virtual devices")
 	}
 	return nil
 }

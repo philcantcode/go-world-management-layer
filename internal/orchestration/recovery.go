@@ -252,7 +252,7 @@ func requirePreviousAgentResource(agent application.AgentWorkspaceRecord) (agent
 }
 
 func (c *Controller) completePhysicalRecovery(ctx context.Context, request application.RecoverIncidentRequest, outcome application.RecoveryOutcome, action string) (application.RecoveryOutcome, error) {
-	incident, err := c.Core.TransitionIncident(ctx, application.TransitionIncidentRequest{
+	incident, err := c.Core.CompleteIncidentRecovery(ctx, application.TransitionIncidentRequest{
 		Meta:                       childMeta(request.Meta, "physical/recovery/resolved", request.Meta.Deadline),
 		IncidentID:                 outcome.Incident.ID,
 		ExpectedRevision:           outcome.Incident.Revision,

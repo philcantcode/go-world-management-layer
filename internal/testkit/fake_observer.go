@@ -11,11 +11,12 @@ import (
 )
 
 type fakeCollectorRecord struct {
-	plan      ports.CollectorPlan
-	collector ports.Collector
-	coverage  domain.CollectorCoverage
-	result    ports.CollectorResult
-	stopped   bool
+	plan         ports.CollectorPlan
+	collector    ports.Collector
+	coverage     domain.CollectorCoverage
+	result       ports.CollectorResult
+	stopPrepared bool
+	stopped      bool
 }
 
 // FakeObserverDriver models collectors as resources owned by their target run.
@@ -103,21 +104,58 @@ func (d *FakeObserverDriver) Start(ctx context.Context, plan ports.CollectorPlan
 	return collector, nil
 }
 
-func (d *FakeObserverDriver) Stop(ctx context.Context, collectorID domain.CollectorID) (ports.CollectorResult, error) {
-	if err := ports.RequireDeadline(ctx, "fake_observer.stop"); err != nil {
-		return ports.CollectorResult{}, err
+func (d *FakeObserverDriver) PrepareStop(ctx context.Context, collectorID domain.CollectorID) error {
+	if err := requireFakeCollectorOperation(ctx, collectorID, "fake_observer.prepare_stop"); err != nil {
+		return err
 	}
-	if collectorID.IsZero() {
-		return ports.CollectorResult{}, domain.NewError(domain.CodeInvalidArgument, "fake_observer.stop", "collector_id", "must be set", nil)
+	if err := d.faults.Check("observer.prepare_stop.before"); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	record, err := d.requireCollector(collectorID, "fake_observer.prepare_stop")
+	if err != nil {
+		return err
+	}
+	if record.stopped {
+		return nil
+	}
+	record.stopPrepared = true
+	return d.faults.Check("observer.prepare_stop.after")
+}
+
+func (d *FakeObserverDriver) CancelStopPreparation(ctx context.Context, collectorID domain.CollectorID) error {
+	if err := requireFakeCollectorOperation(ctx, collectorID, "fake_observer.cancel_stop_preparation"); err != nil {
+		return err
+	}
+	if err := d.faults.Check("observer.cancel_stop_preparation.before"); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	record, err := d.requireCollector(collectorID, "fake_observer.cancel_stop_preparation")
+	if err != nil {
+		return err
+	}
+	if record.stopped {
+		return nil
+	}
+	record.stopPrepared = false
+	return d.faults.Check("observer.cancel_stop_preparation.after")
+}
+
+func (d *FakeObserverDriver) Stop(ctx context.Context, collectorID domain.CollectorID) (ports.CollectorResult, error) {
+	if err := requireFakeCollectorOperation(ctx, collectorID, "fake_observer.stop"); err != nil {
+		return ports.CollectorResult{}, err
 	}
 	if err := d.faults.Check("observer.stop.before"); err != nil {
 		return ports.CollectorResult{}, err
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	record, found := d.collectors[collectorID]
-	if !found {
-		return ports.CollectorResult{}, domain.NewError(domain.CodeNotFound, "fake_observer.stop", "collector_id", "not found", nil)
+	record, err := d.requireCollector(collectorID, "fake_observer.stop")
+	if err != nil {
+		return ports.CollectorResult{}, err
 	}
 	if record.stopped {
 		return record.result, nil
@@ -141,6 +179,7 @@ func (d *FakeObserverDriver) Stop(ctx context.Context, collectorID domain.Collec
 		CollectorID: collectorID, Coverage: coverage, Artifacts: []domain.ArtifactReference{artifact},
 		StoppedAt: stoppedAt, TeardownConfirmed: true,
 	}
+	record.stopPrepared = false
 	record.stopped = true
 	_ = d.tracker.Release("collector", collectorID.String(), record.plan.TargetRunID.String())
 	if err := d.faults.Check("observer.stop.after"); err != nil {
@@ -150,7 +189,7 @@ func (d *FakeObserverDriver) Stop(ctx context.Context, collectorID domain.Collec
 }
 
 func (d *FakeObserverDriver) Coverage(ctx context.Context, collectorID domain.CollectorID) (domain.CollectorCoverage, error) {
-	if err := ports.RequireDeadline(ctx, "fake_observer.coverage"); err != nil {
+	if err := requireFakeCollectorOperation(ctx, collectorID, "fake_observer.coverage"); err != nil {
 		return domain.CollectorCoverage{}, err
 	}
 	if err := d.faults.Check("observer.coverage"); err != nil {
@@ -158,11 +197,29 @@ func (d *FakeObserverDriver) Coverage(ctx context.Context, collectorID domain.Co
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	record, found := d.collectors[collectorID]
-	if !found {
-		return domain.CollectorCoverage{}, domain.NewError(domain.CodeNotFound, "fake_observer.coverage", "collector_id", "not found", nil)
+	record, err := d.requireCollector(collectorID, "fake_observer.coverage")
+	if err != nil {
+		return domain.CollectorCoverage{}, err
 	}
 	return record.coverage, nil
+}
+
+func requireFakeCollectorOperation(ctx context.Context, collectorID domain.CollectorID, operation string) error {
+	if err := ports.RequireDeadline(ctx, operation); err != nil {
+		return err
+	}
+	if collectorID.IsZero() {
+		return domain.NewError(domain.CodeInvalidArgument, operation, "collector_id", "must be set", nil)
+	}
+	return nil
+}
+
+func (d *FakeObserverDriver) requireCollector(collectorID domain.CollectorID, operation string) (*fakeCollectorRecord, error) {
+	record, found := d.collectors[collectorID]
+	if !found {
+		return nil, domain.NewError(domain.CodeNotFound, operation, "collector_id", "not found", nil)
+	}
+	return record, nil
 }
 
 func collectorCoverageStatus(level domain.CoverageLevel) domain.CoverageStatus {

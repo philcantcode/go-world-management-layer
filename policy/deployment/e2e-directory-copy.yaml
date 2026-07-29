@@ -102,7 +102,7 @@ spec:
             pids: 128
             writableState: 16Mi
         reset:
-          afterEveryRun: false
+          afterEveryRun: true
           mode: recreate-new-target-generation
   resources:
     aggregateLimits:

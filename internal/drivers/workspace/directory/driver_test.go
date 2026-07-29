@@ -237,6 +237,14 @@ func TestPrepareIsPersistentAndConflictAware(t *testing.T) {
 	if err != nil || restartedReplay.MergedPath != first.MergedPath {
 		t.Fatalf("Prepare(restart replay) = %#v, %v", restartedReplay, err)
 	}
+	mounted, err := restarted.Mount(testContext(t), plan.Workspace.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mountedReplay, err := testDriver(t, root).Prepare(testContext(t), plan)
+	if err != nil || mountedReplay.WorkspaceID != mounted.WorkspaceID || mountedReplay.MergedPath != mounted.MergedPath || mountedReplay.State != domain.WorkspaceMounted {
+		t.Fatalf("Prepare(mounted restart replay) = %#v, %v; want mounted handle %#v", mountedReplay, err, mounted)
+	}
 
 	differentWorkspace := planWithNewWorkspace(t, plan)
 	if _, err := restarted.Prepare(testContext(t), differentWorkspace); !domain.IsCode(err, domain.CodeConflict) {
@@ -420,6 +428,144 @@ func TestCorruptAuthorityFailsClosedOnRestart(t *testing.T) {
 	if _, err := New(Config{Root: root}); err == nil {
 		t.Fatal("New() accepted corrupt workspace authority")
 	}
+}
+
+func TestStartupRemovesIncompletePrepareDirectoryAndProvesAbsence(t *testing.T) {
+	root := t.TempDir()
+	plan := newTestPlan(t, map[string][]byte{"input.bin": []byte("input")})
+	staging := filepath.Join(root, "."+plan.Workspace.ID().String()+".prepare-crash_residue")
+	if err := os.MkdirAll(filepath.Join(staging, mergedDirectory), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, mergedDirectory, "partial.bin"), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(Config{Root: root}); err != nil {
+		t.Fatalf("New() could not recover an exact staging residue: %v", err)
+	}
+	if _, err := os.Lstat(staging); !os.IsNotExist(err) {
+		t.Fatalf("staging residue remains after startup: %v", err)
+	}
+}
+
+func TestStartupRemovesNestedSealedSnapshotStagingAndPreservesWorkspace(t *testing.T) {
+	root := t.TempDir()
+	plan := newTestPlan(t, map[string][]byte{"input.bin": []byte("input")})
+	handle, err := testDriver(t, root).Prepare(testContext(t), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceRoot := filepath.Dir(handle.MergedPath)
+	staging := filepath.Join(workspaceRoot, ".sealed-crash_residue")
+	if err := os.MkdirAll(filepath.Join(staging, "partial"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "partial", "result.bin"), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := New(Config{Root: root})
+	if err != nil {
+		t.Fatalf("New() could not recover exact nested snapshot staging: %v", err)
+	}
+	if _, err := os.Lstat(staging); !os.IsNotExist(err) {
+		t.Fatalf("nested snapshot staging remains after startup: %v", err)
+	}
+	if _, err := restarted.Inspect(testContext(t), handle.WorkspaceID); err != nil {
+		t.Fatalf("recovered workspace is unusable: %v", err)
+	}
+}
+
+func TestStartupRejectsInvalidNestedSnapshotStagingWithoutMutation(t *testing.T) {
+	tests := map[string]func(*testing.T, string) string{
+		"staging-shaped file": func(t *testing.T, workspaceRoot string) string {
+			path := filepath.Join(workspaceRoot, ".sealed-file")
+			if err := os.WriteFile(path, []byte("retain"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		},
+		"malformed staging directory": func(t *testing.T, workspaceRoot string) string {
+			path := filepath.Join(workspaceRoot, ".sealed-invalid!")
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		},
+		"staging-shaped symlink": func(t *testing.T, workspaceRoot string) string {
+			outside := t.TempDir()
+			path := filepath.Join(workspaceRoot, ".sealed-link")
+			if err := os.Symlink(outside, path); err != nil {
+				t.Skipf("directory links unavailable: %v", err)
+			}
+			return path
+		},
+	}
+	for name, inject := range tests {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			handle, err := testDriver(t, root).Prepare(testContext(t), newTestPlan(t, map[string][]byte{"input.bin": []byte("input")}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			invalid := inject(t, filepath.Dir(handle.MergedPath))
+			if _, err := New(Config{Root: root}); err == nil {
+				t.Fatal("New() accepted invalid nested snapshot staging")
+			}
+			if _, err := os.Lstat(invalid); err != nil {
+				t.Fatalf("invalid nested entry was mutated: %v", err)
+			}
+		})
+	}
+}
+
+func TestStartupRejectsEveryForeignRootEntry(t *testing.T) {
+	t.Run("ordinary file", func(t *testing.T) {
+		root := t.TempDir()
+		foreign := filepath.Join(root, "foreign.txt")
+		if err := os.WriteFile(foreign, []byte("retain"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := New(Config{Root: root}); err == nil {
+			t.Fatal("New() silently skipped a foreign root file")
+		}
+		if content, err := os.ReadFile(foreign); err != nil || string(content) != "retain" {
+			t.Fatalf("foreign file was mutated: %q, %v", content, err)
+		}
+	})
+
+	t.Run("arbitrary symlink", func(t *testing.T) {
+		root := t.TempDir()
+		outside := t.TempDir()
+		marker := filepath.Join(outside, "keep.txt")
+		if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(root, "foreign-link")); err != nil {
+			t.Skipf("directory links unavailable: %v", err)
+		}
+		if _, err := New(Config{Root: root}); err == nil {
+			t.Fatal("New() silently skipped a foreign root symlink")
+		}
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("foreign symlink target was mutated: %v", err)
+		}
+	})
+
+	t.Run("staging-shaped symlink", func(t *testing.T) {
+		root := t.TempDir()
+		outside := t.TempDir()
+		plan := newTestPlan(t, map[string][]byte{"input.bin": []byte("input")})
+		staging := filepath.Join(root, "."+plan.Workspace.ID().String()+".prepare-link")
+		if err := os.Symlink(outside, staging); err != nil {
+			t.Skipf("directory links unavailable: %v", err)
+		}
+		if _, err := New(Config{Root: root}); err == nil {
+			t.Fatal("New() accepted a staging-shaped root symlink")
+		}
+		if _, err := os.Stat(outside); err != nil {
+			t.Fatalf("staging-shaped symlink target was mutated: %v", err)
+		}
+	})
 }
 
 func TestAllOperationsRequireDeadlines(t *testing.T) {

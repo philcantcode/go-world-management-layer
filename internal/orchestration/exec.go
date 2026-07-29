@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	worldv1 "github.com/philcantcode/go-world-management-layer/api/world/v1"
 	"github.com/philcantcode/go-world-management-layer/internal/application"
@@ -149,9 +150,11 @@ func (s *Service) OpenExec(stream worldv1.WorldService_OpenExecServer) error {
 	if err != nil {
 		return err
 	}
+	// Begin failures are fail-open: marker recorded inside beginAgentAction.
+	actionSession, _ := s.beginAgentAction(ctx, starting, meta)
 	model, err := domainExec(starting)
 	if err != nil {
-		return s.finalizeExecFailure(ctx, meta, starting, err)
+		return s.finalizeExecFailure(ctx, meta, starting, s.sealActionOnFailure(ctx, actionSession, transport.ProcessLifecycle{}, err))
 	}
 	transportStart := transport.ExecStart{
 		ExecID: starting.ID, IdempotencyKey: meta.IdempotencyKey, Executable: starting.Executable,
@@ -165,22 +168,31 @@ func (s *Service) OpenExec(stream worldv1.WorldService_OpenExecServer) error {
 		AgentGeneration: domain.AgentGeneration(starting.AgentGeneration), Exec: model, Start: transportStart,
 	})
 	if err != nil {
-		return s.finalizeExecFailure(ctx, meta, starting, err)
+		return s.finalizeExecFailure(ctx, meta, starting, s.sealActionOnFailure(ctx, actionSession, transport.ProcessLifecycle{}, err))
 	}
 	defer connection.Close()
 	running, err := s.core.TransitionExec(ctx, application.TransitionExecRequest{Meta: childMeta(meta, "running", deadline(ctx)), ExecID: starting.ID, ExpectedRevision: starting.Revision, State: domain.ExecRunning})
 	if err != nil {
-		return errors.Join(err, connection.Close())
+		cause := errors.Join(err, connection.Close())
+		return s.finalizeExecFailure(ctx, meta, starting, s.sealActionOnFailure(ctx, actionSession, transport.ProcessLifecycle{}, cause))
 	}
-	terminal, exchangeErr := exchangeExec(ctx, connection, agentExecWire{stream: stream}, s.maxExecBytes)
+	wire := execWire(agentExecWire{stream: stream})
+	if actionSession != nil {
+		wire = capturingExecWire{inner: wire, session: actionSession}
+	}
+	exchange, exchangeErr := exchangeExec(ctx, connection, wire, s.maxExecBytes, ports.DefaultExecHeartbeatInterval)
 	closeErr := connection.Close()
 	if exchangeErr != nil {
-		return s.finalizeExecFailure(ctx, meta, running, errors.Join(exchangeErr, closeErr))
+		cause := errors.Join(exchangeErr, closeErr)
+		return s.finalizeExecFailure(ctx, meta, running, s.sealActionOnFailure(ctx, actionSession, exchange.Lifecycle, cause))
 	}
+	terminal := exchange.Terminal
 	if closeErr != nil {
 		terminal.CleanupConfirmed = false
 		terminal.Error = joinMessage(terminal.Error, closeErr)
 	}
+	// Fail-open at API boundary: seal errors never fail a successful command.
+	_ = s.sealActionSession(ctx, actionSession, terminal, exchange.Lifecycle)
 	finalized, err := s.finalizeExec(ctx, meta, running, terminal)
 	if err != nil {
 		return err
@@ -226,30 +238,50 @@ func (s *Service) OpenTargetExec(stream worldv1.WorldService_OpenTargetExecServe
 	if operation.State != domain.TargetOperationRequested {
 		return status.Errorf(codes.FailedPrecondition, "target operation %s is already in progress", operation.ID)
 	}
+	// Begin failures are fail-open: marker recorded inside beginTargetAction.
+	actionSession, _ := s.beginTargetAction(ctx, target, run, operation, transportStart.Executable, transportStart.Argv, transportStart.WorkingDirectory, meta)
 	model, err := domainTargetOperation(target, operation)
 	if err != nil {
-		return s.finalizeOperationFailure(ctx, meta, target.ID, operation, err)
+		return s.finalizeOperationFailure(ctx, meta, target.ID, operation, s.sealActionOnFailure(ctx, actionSession, transport.ProcessLifecycle{}, err))
 	}
 	transportStart.ExecID = operation.ID
 	connection, err := driver.OpenTransport(ctx, model.Spec().TargetRunID)
 	if err != nil {
-		return s.finalizeOperationFailure(ctx, meta, target.ID, operation, err)
+		return s.finalizeOperationFailure(ctx, meta, target.ID, operation, s.sealActionOnFailure(ctx, actionSession, transport.ProcessLifecycle{}, err))
 	}
 	defer connection.Close()
 	execTransport, err := connection.OpenExec(ctx, ports.TargetExecPlan{Operation: model, Start: transportStart})
 	if err != nil {
-		return s.finalizeOperationFailure(ctx, meta, target.ID, operation, errors.Join(err, connection.Close()))
+		cause := errors.Join(err, connection.Close())
+		return s.finalizeOperationFailure(ctx, meta, target.ID, operation, s.sealActionOnFailure(ctx, actionSession, transport.ProcessLifecycle{}, cause))
 	}
 	defer execTransport.Close()
 	running, err := s.core.TransitionTargetOperation(ctx, application.TransitionTargetOperationRequest{Meta: childMeta(meta, "operation-running", deadline(ctx)), TargetID: target.ID, OperationID: operation.ID, ExpectedRevision: operation.Revision, State: domain.TargetOperationRunning})
 	if err != nil {
-		return errors.Join(err, execTransport.Close(), connection.Close())
+		cause := errors.Join(err, execTransport.Close(), connection.Close())
+		return s.finalizeOperationFailure(ctx, meta, target.ID, operation, s.sealActionOnFailure(ctx, actionSession, transport.ProcessLifecycle{}, cause))
 	}
-	terminal, exchangeErr := exchangeExec(ctx, execTransport, targetExecWire{stream: stream}, s.maxExecBytes)
+	wire := execWire(targetExecWire{stream: stream})
+	if actionSession != nil {
+		wire = capturingExecWire{inner: wire, session: actionSession}
+	}
+	exchange, exchangeErr := exchangeExec(ctx, execTransport, wire, s.maxExecBytes, ports.DefaultExecHeartbeatInterval)
 	closeErr := errors.Join(execTransport.Close(), connection.Close())
-	if exchangeErr != nil || closeErr != nil {
-		return s.finalizeOperationFailure(ctx, meta, target.ID, running, errors.Join(exchangeErr, closeErr))
+	if exchangeErr != nil {
+		// Pure exchange failure: no known process exit. Evidence is fail-open.
+		cause := errors.Join(exchangeErr, closeErr)
+		return s.finalizeOperationFailure(ctx, meta, target.ID, running, s.sealActionOnFailure(ctx, actionSession, exchange.Lifecycle, cause))
 	}
+	// Preserve real terminal exit/signal/cleanup when only close fails.
+	terminal := exchange.Terminal
+	if closeErr != nil {
+		terminal.CleanupConfirmed = false
+		terminal.Error = joinMessage(terminal.Error, closeErr)
+		_ = s.sealActionSession(ctx, actionSession, terminal, exchange.Lifecycle)
+		return s.finalizeOperationFailure(ctx, meta, target.ID, running, closeErr)
+	}
+	// Fail-open at API boundary: seal errors never fail a successful operation.
+	_ = s.sealActionSession(ctx, actionSession, terminal, exchange.Lifecycle)
 	terminalState := domain.TargetOperationCompleted
 	if terminal.ExitCode != 0 || terminal.Signal != "" || terminal.Error != "" || !terminal.CleanupConfirmed {
 		terminalState = domain.TargetOperationFailed
@@ -310,9 +342,17 @@ func (s *Service) targetExecStart(start *worldv1.TargetExecStart, meta applicati
 	return domain.TargetOperationExec, display, "", result, nil
 }
 
-func exchangeExec(ctx context.Context, connection ports.ExecTransport, wire execWire, maxBytes int64) (transport.Terminal, error) {
+// execExchange is the ordered result of a completed exec stream exchange.
+type execExchange struct {
+	Terminal  transport.Terminal
+	Lifecycle transport.ProcessLifecycle
+}
+
+func exchangeExec(ctx context.Context, connection ports.ExecTransport, wire execWire, maxBytes int64, heartbeatInterval time.Duration) (execExchange, error) {
 	child, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stopHeartbeat := ports.MaintainExecHeartbeat(child, connection, heartbeatInterval)
+	defer stopHeartbeat()
 	inputErrors := make(chan error, 1)
 	go func() {
 		err := forwardExecInput(child, connection, wire, maxBytes)
@@ -326,45 +366,51 @@ func exchangeExec(ctx context.Context, connection ports.ExecTransport, wire exec
 	for {
 		frame, err := connection.Receive(child)
 		if err != nil {
+			if heartbeatErr := stopHeartbeat(); heartbeatErr != nil {
+				return execExchange{Lifecycle: lifecycle}, heartbeatErr
+			}
 			select {
 			case inputErr := <-inputErrors:
 				if inputErr != nil {
-					return transport.Terminal{}, inputErr
+					return execExchange{Lifecycle: lifecycle}, inputErr
 				}
 			default:
 			}
-			return transport.Terminal{}, err
+			return execExchange{Lifecycle: lifecycle}, err
 		}
 		switch frame.Kind {
 		case transport.KindStdout, transport.KindStderr:
 			if int64(len(frame.Data)) > maxBytes-outputBytes {
-				return transport.Terminal{}, transport.ErrOutputLimit
+				return execExchange{Lifecycle: lifecycle}, transport.ErrOutputLimit
 			}
 			outputBytes += int64(len(frame.Data))
 			if err := wire.SendOutput(frame.Kind, frame.Data); err != nil {
-				return transport.Terminal{}, err
+				return execExchange{Lifecycle: lifecycle}, err
 			}
 		case transport.KindHeartbeat:
 			if err := wire.SendOutput(frame.Kind, nil); err != nil {
-				return transport.Terminal{}, err
+				return execExchange{Lifecycle: lifecycle}, err
 			}
 		case transport.KindProcess:
 			if err := lifecycle.Observe(frame); err != nil {
-				return transport.Terminal{}, status.Errorf(codes.Internal, "exec driver returned invalid process lifecycle: %v", err)
+				return execExchange{Lifecycle: lifecycle}, status.Errorf(codes.Internal, "exec driver returned invalid process lifecycle: %v", err)
 			}
 		case transport.KindTerminal:
+			if heartbeatErr := stopHeartbeat(); heartbeatErr != nil {
+				return execExchange{Lifecycle: lifecycle}, heartbeatErr
+			}
 			terminal, err := transport.DecodeJSON[transport.Terminal](frame)
 			if err != nil {
-				return transport.Terminal{}, err
+				return execExchange{Lifecycle: lifecycle}, err
 			}
 			if err := lifecycle.ValidateTerminal(terminal); err != nil {
-				return transport.Terminal{}, status.Errorf(codes.Internal, "exec driver returned invalid process lifecycle: %v", err)
+				return execExchange{Lifecycle: lifecycle}, status.Errorf(codes.Internal, "exec driver returned invalid process lifecycle: %v", err)
 			}
-			return terminal, nil
+			return execExchange{Terminal: terminal, Lifecycle: lifecycle}, nil
 		case transport.KindError:
-			return transport.Terminal{}, fmt.Errorf("exec transport: %s", frame.Data)
+			return execExchange{Lifecycle: lifecycle}, fmt.Errorf("exec transport: %s", frame.Data)
 		default:
-			return transport.Terminal{}, status.Errorf(codes.Internal, "exec driver returned unknown control frame kind %d", frame.Kind)
+			return execExchange{Lifecycle: lifecycle}, status.Errorf(codes.Internal, "exec driver returned unknown control frame kind %d", frame.Kind)
 		}
 	}
 }

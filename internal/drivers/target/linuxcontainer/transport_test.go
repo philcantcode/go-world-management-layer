@@ -68,6 +68,58 @@ func TestTargetTransportScopesOperationsAndCleansFailedPush(t *testing.T) {
 	}
 }
 
+func TestTargetTransportCloseWaitsForInFlightMutation(t *testing.T) {
+	lease, _ := domain.NewLeaseID()
+	target, _ := domain.NewTargetID()
+	run, _ := domain.NewTargetRunID()
+	authority := RunAuthority{LeaseID: lease, TargetID: target, Generation: 1, RunID: run}
+	root := writableTempDir(t)
+	scoped := &targetTransport{runtime: noopRuntime{}, runtimeID: "runtime", root: root, authority: authority}
+	reader := &gatedTargetReader{entered: make(chan struct{}), release: make(chan struct{})}
+	push := transferPlan(t, authority, domain.TargetOperationPush, "late.bin", 64)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	pushDone := make(chan error, 1)
+	go func() {
+		_, err := scoped.PushFile(ctx, push, reader)
+		pushDone <- err
+	}()
+	<-reader.entered
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- scoped.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before the active mutation drained: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(reader.release)
+	if err := <-pushDone; err == nil {
+		t.Fatal("in-flight push succeeded after transport revocation")
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "late.bin")); !os.IsNotExist(err) {
+		t.Fatalf("revoked in-flight push published target state: %v", err)
+	}
+}
+
+type gatedTargetReader struct {
+	entered chan struct{}
+	release chan struct{}
+	sent    bool
+}
+
+func (r *gatedTargetReader) Read(buffer []byte) (int, error) {
+	if r.sent {
+		return 0, io.EOF
+	}
+	r.sent = true
+	close(r.entered)
+	<-r.release
+	return copy(buffer, []byte("late mutation")), nil
+}
+
 func TestMaterializationPublishesOnlyVerifiedBytes(t *testing.T) {
 	targetRoot := writableTempDir(t)
 	plan := ContainerPlan{TargetDirectory: filepath.Join(targetRoot, "target", "generations", "1")}
@@ -276,5 +328,5 @@ func (noopRuntime) Inspect(context.Context, string) (RuntimeState, error) { retu
 func (noopRuntime) Stop(context.Context, string, ports.StopMode) error    { return nil }
 func (noopRuntime) Remove(context.Context, string) error                  { return nil }
 func (noopRuntime) OpenExec(context.Context, string, ports.TargetExecPlan) (ports.ExecTransport, error) {
-	return nil, nil
+	return successfulTargetReadinessTransport(), nil
 }

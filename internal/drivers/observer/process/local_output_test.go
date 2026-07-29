@@ -53,14 +53,18 @@ func TestLocalOutputOpenDurablyPublishesBothStreamsBeforeReturn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report.Outputs) != 1 || report.Outputs[0].State != ports.InterruptedCollectorOutputAborted {
+	if len(report.Outputs) != 1 || report.Outputs[0].State != ports.InterruptedCollectorOutputFinalized || report.Outputs[0].CaptureLimitExceeded {
 		t.Fatalf("reconciled durable empty capture = %#v", report)
 	}
+	assertLocalArtifacts(t, root, plan.CollectorID, report.Outputs[0].Artifacts, map[string]string{
+		CollectorStdoutRole: "",
+		CollectorStderrRole: "",
+	})
 	entries, err := verifiedDirectoryEntries(collectorOutputDirectory(root, plan))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, found := entries["aborted"]; len(entries) != 1 || !found {
+	if _, found := entries["finalized.json"]; len(entries) != 1 || !found {
 		t.Fatalf("reconciled collector entries = %v", reflect.ValueOf(entries).MapKeys())
 	}
 }
@@ -219,7 +223,7 @@ func TestLocalOutputPersistsAndVerifiesImmutableStreamArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertLocalArtifacts(t, root, artifacts, map[string]string{
+	assertLocalArtifacts(t, root, plan.CollectorID, artifacts, map[string]string{
 		CollectorStdoutRole: "stdout evidence",
 		CollectorStderrRole: "stderr evidence",
 	})
@@ -273,7 +277,7 @@ func TestLocalOutputPublishesBoundedPrefixAndDurablyReportsLimit(t *testing.T) {
 	if !errors.Is(err, ErrCaptureLimit) || len(artifacts) != 2 {
 		t.Fatalf("bounded finalize = %#v, %v", artifacts, err)
 	}
-	assertLocalArtifacts(t, root, artifacts, map[string]string{
+	assertLocalArtifacts(t, root, plan.CollectorID, artifacts, map[string]string{
 		CollectorStdoutRole: "1234",
 		CollectorStderrRole: "x",
 	})
@@ -357,7 +361,7 @@ func TestLocalOutputFinalizationOnlyPersistsCaptureLimitAtExactBoundary(t *testi
 	}
 }
 
-func assertLocalArtifacts(t *testing.T, root string, artifacts []domain.ArtifactReference, wanted map[string]string) {
+func assertLocalArtifacts(t *testing.T, root string, collectorID domain.CollectorID, artifacts []domain.ArtifactReference, wanted map[string]string) {
 	t.Helper()
 	if len(artifacts) != len(wanted) {
 		t.Fatalf("artifacts = %#v", artifacts)
@@ -375,6 +379,10 @@ func assertLocalArtifacts(t *testing.T, root string, artifacts []domain.Artifact
 		}
 		if string(stored) != content || int64(len(stored)) != spec.Size || domain.NewDigest(stored) != spec.Digest {
 			t.Fatalf("artifact %q does not identify its stored bytes", spec.Role)
+		}
+		expectedReference := "observer://collectors/" + collectorID.String() + "/" + strings.TrimPrefix(spec.Role, "collector.") + "/" + spec.Digest.String()
+		if spec.Reference != expectedReference || spec.Sensitivity != domain.SensitivityInternal {
+			t.Fatalf("artifact %q metadata = %#v, want reference %q and internal sensitivity", spec.Role, spec, expectedReference)
 		}
 	}
 }

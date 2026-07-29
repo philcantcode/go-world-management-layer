@@ -10,10 +10,11 @@ import (
 )
 
 type CommandReadiness struct {
-	Runner   command.Runner
-	Program  string
-	Args     []string
-	Interval time.Duration
+	Runner         command.Runner
+	Program        string
+	Args           []string
+	Interval       time.Duration
+	RuntimeBinding RuntimeBinding
 }
 
 // Await polls a trusted adapter-specific command. The probe receives the same
@@ -29,7 +30,11 @@ func (r CommandReadiness) Await(ctx context.Context, plan ports.CollectorPlan) e
 	if r.Interval <= 0 {
 		r.Interval = 100 * time.Millisecond
 	}
-	invocation := command.Invocation{Program: r.Program, Args: append([]string(nil), r.Args...), Environment: observerEnvironment(nil, plan), MaximumOutput: 64 << 10}
+	arguments, err := bindRuntimeArguments(r.RuntimeBinding, r.Args, plan)
+	if err != nil {
+		return err
+	}
+	invocation := command.Invocation{Program: r.Program, Args: arguments, Environment: observerEnvironment(nil, plan), MaximumOutput: 64 << 10}
 	for {
 		if _, err := r.Runner.Run(ctx, invocation); err == nil {
 			return nil

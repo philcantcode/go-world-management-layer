@@ -167,6 +167,27 @@ func RunObserverDriverContract(t *testing.T, contract ObserverDriverContract) {
 	if _, err := contract.Driver.Coverage(ctx, collector.ID); err != nil {
 		t.Fatalf("Coverage() error = %v", err)
 	}
+	requireDeadlineRejected(t, func(ctx context.Context) error {
+		return contract.Driver.PrepareStop(ctx, collector.ID)
+	})
+	if err := contract.Driver.PrepareStop(ctx, collector.ID); err != nil {
+		t.Fatalf("PrepareStop() error = %v", err)
+	}
+	if err := contract.Driver.PrepareStop(ctx, collector.ID); err != nil {
+		t.Fatalf("PrepareStop(replay) error = %v", err)
+	}
+	requireDeadlineRejected(t, func(ctx context.Context) error {
+		return contract.Driver.CancelStopPreparation(ctx, collector.ID)
+	})
+	if err := contract.Driver.CancelStopPreparation(ctx, collector.ID); err != nil {
+		t.Fatalf("CancelStopPreparation() error = %v", err)
+	}
+	if err := contract.Driver.CancelStopPreparation(ctx, collector.ID); err != nil {
+		t.Fatalf("CancelStopPreparation(replay) error = %v", err)
+	}
+	if err := contract.Driver.PrepareStop(ctx, collector.ID); err != nil {
+		t.Fatalf("PrepareStop(after cancel) error = %v", err)
+	}
 	result, err := contract.Driver.Stop(ctx, collector.ID)
 	if err != nil || !result.TeardownConfirmed {
 		t.Fatalf("Stop() = %#v, %v", result, err)

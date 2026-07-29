@@ -9,6 +9,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -69,6 +70,66 @@ func TestSupervisorCapturesArtifactsAndConfirmsCleanup(t *testing.T) {
 func TestSupervisorRejectsMissingOutputAuthority(t *testing.T) {
 	if _, err := New(Config{Adapters: testAdapters(nil)}); err == nil || !strings.Contains(err.Error(), "output authority") {
 		t.Fatalf("New error = %v", err)
+	}
+}
+
+func TestProbeBindsExactAdapterConfigurationIdentity(t *testing.T) {
+	adapter := testAdapters(nil)[0]
+	adapter.Environment = map[string]string{"OBSERVER_MODE": "probe"}
+	t.Setenv("WORLD_AMBIENT_SECRET", "must-not-be-inherited")
+	var invocation command.Invocation
+	driver, err := New(Config{
+		Runner: runnerFunc(func(_ context.Context, value command.Invocation) (command.Result, error) {
+			invocation = value
+			return command.Result{Stdout: []byte("collector-v1\r\n")}, nil
+		}),
+		Adapters: []Adapter{adapter}, Outputs: &memoryOutputFactory{capture: newMemoryCapture()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := testContext(t)
+	defer cancel()
+	fingerprint, err := driver.Probe(ctx, ports.ObservationRequirement{
+		SignalFamily: adapter.SignalFamily, Placement: adapter.Placement,
+		MinimumLevel: adapter.CoverageLevel, Required: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability, found := fingerprint.Capability("observer." + adapter.Name)
+	if !found || capability.Status() != domain.CapabilitySupported {
+		t.Fatalf("probe capability = %#v, found=%t", capability, found)
+	}
+	constraints := capability.Constraints()
+	if constraints["version"] != adapter.Version || constraints["configuration_digest"] != adapter.ConfigurationDigest.String() ||
+		constraints["placement"] != string(adapter.Placement) || constraints["coverage"] != string(adapter.CoverageLevel) || constraints["runtime_binding"] != adapter.RuntimeBinding.String() {
+		t.Fatalf("probe constraints = %#v", constraints)
+	}
+	evidence := fingerprint.Evidence()
+	if evidence[adapter.Name+".configuration_digest"] != adapter.ConfigurationDigest.String() ||
+		evidence[adapter.Name+".configured_version"] != adapter.Version || evidence[adapter.Name+".runtime_binding"] != adapter.RuntimeBinding.String() || evidence[adapter.Name+".version"] != "collector-v1\r\n" {
+		t.Fatalf("probe evidence = %#v", evidence)
+	}
+	if invocation.Program != adapter.Program || !slices.Equal(invocation.Args, adapter.VersionArgs) {
+		t.Fatalf("version probe invocation = %#v", invocation)
+	}
+	if !slices.Contains(invocation.Environment, "OBSERVER_MODE=probe") || slices.Contains(invocation.Environment, "WORLD_AMBIENT_SECRET=must-not-be-inherited") {
+		t.Fatalf("version probe environment = %v", invocation.Environment)
+	}
+}
+
+func TestObserverEnvironmentIncludesExplicitRuntimeAndScopeOnly(t *testing.T) {
+	t.Setenv("WORLD_AMBIENT_SECRET", "must-not-be-inherited")
+	plan := validCollectorPlan(t)
+	environment := observerEnvironment(map[string]string{"EXPLICIT_SETTING": "value"}, plan)
+	if !slices.Contains(environment, "EXPLICIT_SETTING=value") ||
+		!slices.Contains(environment, "WORLD_TARGET_RUN_ID="+plan.TargetRunID.String()) ||
+		slices.Contains(environment, "WORLD_AMBIENT_SECRET=must-not-be-inherited") {
+		t.Fatalf("observer environment = %v", environment)
+	}
+	if !sort.StringsAreSorted(environment) {
+		t.Fatalf("observer environment is not canonical: %v", environment)
 	}
 }
 
@@ -187,6 +248,96 @@ func TestSupervisorReportsEarlyExitAndWaitErrorWithArtifacts(t *testing.T) {
 	}
 	if capture.finalizeCount() != 1 {
 		t.Fatalf("finalize calls = %d", capture.finalizeCount())
+	}
+}
+
+func TestPreparedStopTreatsTargetDrivenProcessExitAsExpected(t *testing.T) {
+	process := newObserverProcess()
+	capture := newMemoryCapture()
+	driver, _ := newTestDriver(t, process, capture, nil)
+	plan := validCollectorPlan(t)
+	ctx, cancel := testContext(t)
+	defer cancel()
+	if _, err := driver.Start(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := driver.PrepareStop(ctx, plan.CollectorID); err != nil {
+		t.Fatal(err)
+	}
+	if err := driver.PrepareStop(ctx, plan.CollectorID); err != nil {
+		t.Fatalf("idempotent PrepareStop: %v", err)
+	}
+	process.exit(errors.New("adb stream closed with target"))
+	waitForProcessExit(t, ctx, driver, plan.CollectorID)
+	coverage, err := driver.Coverage(ctx, plan.CollectorID)
+	if err != nil || coverage.Spec().Status != domain.CoverageAvailable || coverage.Level() != domain.CoverageLevelComplete {
+		t.Fatalf("prepared-exit coverage = %#v, %v", coverage, err)
+	}
+	result, err := driver.Stop(ctx, plan.CollectorID)
+	if err != nil {
+		t.Fatalf("prepared Stop retained target-driven exit: %v", err)
+	}
+	if !result.TeardownConfirmed || result.Coverage.Spec().Status != domain.CoverageAvailable || result.Coverage.Level() != domain.CoverageLevelComplete || len(result.Artifacts) != 2 {
+		t.Fatalf("prepared Stop result = %#v", result)
+	}
+	if process.signalCount() != 0 || process.killCount() != 0 || capture.finalizeCount() != 1 {
+		t.Fatalf("signal=%d kill=%d finalize=%d", process.signalCount(), process.killCount(), capture.finalizeCount())
+	}
+}
+
+func TestCancelStopPreparationReclassifiesPreparedExitUnexpected(t *testing.T) {
+	process := newObserverProcess()
+	driver, _ := newTestDriver(t, process, newMemoryCapture(), nil)
+	plan := validCollectorPlan(t)
+	ctx, cancel := testContext(t)
+	defer cancel()
+	if _, err := driver.Start(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := driver.PrepareStop(ctx, plan.CollectorID); err != nil {
+		t.Fatal(err)
+	}
+	process.exit(errors.New("collector exited during rolled-back target stop"))
+	waitForProcessExit(t, ctx, driver, plan.CollectorID)
+	if err := driver.CancelStopPreparation(ctx, plan.CollectorID); err != nil {
+		t.Fatal(err)
+	}
+	if err := driver.CancelStopPreparation(ctx, plan.CollectorID); err != nil {
+		t.Fatalf("idempotent CancelStopPreparation: %v", err)
+	}
+	coverage, err := driver.Coverage(ctx, plan.CollectorID)
+	if err != nil || coverage.Spec().Status != domain.CoverageLost || coverage.Level() != domain.CoverageLevelPartial {
+		t.Fatalf("cancelled prepared-exit coverage = %#v, %v", coverage, err)
+	}
+	result, err := driver.Stop(ctx, plan.CollectorID)
+	if err == nil || !strings.Contains(err.Error(), "collector exited during rolled-back target stop") {
+		t.Fatalf("cancelled prepared-exit Stop = %#v, %v", result, err)
+	}
+	if !result.TeardownConfirmed || result.Coverage.Spec().Status != domain.CoverageLost {
+		t.Fatalf("cancelled prepared-exit result = %#v", result)
+	}
+}
+
+func TestSignalFailureWithSuccessfulKillDoesNotLoseCoverage(t *testing.T) {
+	process := newObserverProcess()
+	process.signalErr = errors.New("interrupt is unsupported")
+	capture := newMemoryCapture()
+	driver, _ := newTestDriver(t, process, capture, nil)
+	plan := validCollectorPlan(t)
+	ctx, cancel := testContext(t)
+	defer cancel()
+	if _, err := driver.Start(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	result, err := driver.Stop(ctx, plan.CollectorID)
+	if err != nil {
+		t.Fatalf("successful kill retained graceful-signal failure: %v", err)
+	}
+	if !result.TeardownConfirmed || result.Coverage.Spec().Status != domain.CoverageAvailable || result.Coverage.Level() != domain.CoverageLevelComplete {
+		t.Fatalf("signal fallback result = %#v", result)
+	}
+	if process.signalCount() != 1 || process.killCount() != 1 || capture.finalizeCount() != 1 {
+		t.Fatalf("signal=%d kill=%d finalize=%d", process.signalCount(), process.killCount(), capture.finalizeCount())
 	}
 }
 
@@ -484,6 +635,19 @@ func waitForLostCoverage(t *testing.T, ctx context.Context, driver *Driver, id d
 	}
 }
 
+func waitForProcessExit(t *testing.T, ctx context.Context, driver *Driver, id domain.CollectorID) {
+	t.Helper()
+	record, err := driver.requireRecord(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-record.exited:
+	case <-ctx.Done():
+		t.Fatal("collector process exit was not observed")
+	}
+}
+
 type runnerFunc func(context.Context, command.Invocation) (command.Result, error)
 
 func (f runnerFunc) Run(ctx context.Context, value command.Invocation) (command.Result, error) {
@@ -511,6 +675,8 @@ type observerProcess struct {
 
 	mu             sync.Mutex
 	waitErr        error
+	signalErr      error
+	killErr        error
 	signals        int
 	kills          int
 	finishOnSignal bool
@@ -545,21 +711,23 @@ func (p *observerProcess) Signal(os.Signal) error {
 	p.mu.Lock()
 	p.signals++
 	finish := p.finishOnSignal
+	err := p.signalErr
 	p.mu.Unlock()
-	if finish {
+	if err == nil && finish {
 		p.finish()
 	}
-	return nil
+	return err
 }
 func (p *observerProcess) Kill() error {
 	p.mu.Lock()
 	p.kills++
 	finish := p.finishOnKill
+	err := p.killErr
 	p.mu.Unlock()
-	if finish {
+	if err == nil && finish {
 		p.finish()
 	}
-	return nil
+	return err
 }
 func (p *observerProcess) exit(err error) {
 	p.mu.Lock()

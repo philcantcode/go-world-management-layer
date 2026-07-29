@@ -13,6 +13,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/admission"
 	"github.com/philcantcode/go-world-management-layer/internal/application"
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
+	observerprocess "github.com/philcantcode/go-world-management-layer/internal/drivers/observer/process"
 	"github.com/philcantcode/go-world-management-layer/internal/localmaterial"
 	"github.com/philcantcode/go-world-management-layer/internal/orchestration/policyauthority"
 	"github.com/philcantcode/go-world-management-layer/internal/policyregistry"
@@ -105,6 +106,120 @@ func TestLoadDeploymentBuildsExactImmutablePlans(t *testing.T) {
 	}
 	if _, err := source.Open(ctx); err == nil {
 		t.Fatal("staged material corruption was not detected")
+	}
+}
+
+func TestBuildTargetPlanPropagatesCompleteAndroidRuntime(t *testing.T) {
+	digest := domain.NewDigest([]byte("android-system-image"))
+	configured := targetProfile{
+		Reference: "android-instrumented",
+		Template: targetTemplateProfile{
+			Name: "android-instrumented", Kind: domain.TargetAndroidVirtualDevice,
+			Driver: "android-emulator", SystemImageDigest: digest.String(), IsolationProfile: "instrumented-android",
+			SystemImagePackage: "system-images;android-35;google_apis;x86_64",
+			BaselineState:      "clean-boot", RequireHardwareAcceleration: true, Headless: true,
+			Rooted: true, Debuggable: true, GuestMemoryBytes: 2 << 30, BootTimeout: "2m",
+		},
+		Resources: admission.Resources{CPUMilli: 2000, MemoryBytes: 2 << 30, StorageBytes: 1 << 30},
+	}
+	reference, plan, image, err := buildTargetPlan(configured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reference != configured.Reference || image.reference != "" || image.digest != digest || image.packageID != configured.Template.SystemImagePackage {
+		t.Fatalf("Android image identity = %q %#v", reference, image)
+	}
+	template := plan.Template
+	if template.ImageDigest != digest || template.BaselineState != "clean-boot" || template.GuestMemoryBytes != 2<<30 || template.BootTimeout != 2*time.Minute ||
+		!template.RequireHardwareAcceleration || !template.Headless || !template.Rooted || !template.Debuggable {
+		t.Fatalf("Android template fields were not propagated: %#v", template)
+	}
+
+	configured.Template.Image = "example.invalid/android@" + digest.String()
+	if _, _, _, err := buildTargetPlan(configured); err == nil || !strings.Contains(err.Error(), "Linux-only") {
+		t.Fatalf("Android template accepted a Docker image field: %v", err)
+	}
+}
+
+func TestLoadDeploymentRequiresSingleAndroidSystemImageIdentity(t *testing.T) {
+	firstDigest := domain.NewDigest([]byte("android-system-image-1"))
+	secondDigest := domain.NewDigest([]byte("android-system-image-2"))
+	const firstPackage = "system-images;android-35;google_apis;x86_64"
+	const secondPackage = "system-images;android-35;google_apis_playstore;x86_64"
+	tests := []struct {
+		name          string
+		secondDigest  domain.Digest
+		secondPackage string
+		wantError     bool
+	}{
+		{name: "shared identity", secondDigest: firstDigest, secondPackage: firstPackage},
+		{name: "distinct digest", secondDigest: secondDigest, secondPackage: firstPackage, wantError: true},
+		{name: "distinct package", secondDigest: firstDigest, secondPackage: secondPackage, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newProfileFixture(t, false)
+			policyReference := fixture.profile.Policies[0].Reference
+			fixture.profile.Targets = []targetProfile{
+				managedAndroidTargetProfile("android-primary", policyReference, firstDigest, firstPackage),
+				managedAndroidTargetProfile("android-secondary", policyReference, test.secondDigest, test.secondPackage),
+			}
+			writeProfile(t, fixture.profilePath, fixture.profile)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			deployment, err := loadDeployment(ctx, fixture.profilePath, fixture.publicationRoot, 1<<20)
+			if test.wantError {
+				if err == nil || !strings.Contains(err.Error(), "all Android targets must use one system-image digest/package identity") {
+					t.Fatalf("loadDeployment() error = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(deployment.androidTargets) != 2 || len(deployment.androidImages) != 1 || deployment.androidImages[firstDigest.String()] != firstPackage {
+				t.Fatalf("shared Android identity was not retained exactly: targets=%d images=%#v", len(deployment.androidTargets), deployment.androidImages)
+			}
+		})
+	}
+}
+
+func managedAndroidTargetProfile(reference, policyReference string, digest domain.Digest, packageID string) targetProfile {
+	return targetProfile{
+		Reference: reference, Policy: policyReference,
+		Template: targetTemplateProfile{
+			Name: reference, Kind: domain.TargetAndroidVirtualDevice, Driver: "android-emulator",
+			SystemImageDigest: digest.String(), SystemImagePackage: packageID,
+			IsolationProfile: "instrumented-android", BaselineState: "clean-boot",
+			RequireHardwareAcceleration: true, Headless: true, Rooted: true, Debuggable: true,
+			GuestMemoryBytes: 2 << 30, BootTimeout: "2m",
+		},
+		Resources: admission.Resources{CPUMilli: 2000, MemoryBytes: 6 << 30, StorageBytes: 1 << 30},
+	}
+}
+
+func TestBuildTargetPlanRejectsManagedAndroidResourcesTheBackendCannotEnforce(t *testing.T) {
+	digest := domain.NewDigest([]byte("android-system-image"))
+	valid := managedAndroidTargetProfile("android-instrumented", "policy", digest, "system-images;android-35;google_apis;x86_64")
+	tests := []struct {
+		name      string
+		resources admission.Resources
+		want      string
+	}{
+		{name: "fractional CPU", resources: admission.Resources{CPUMilli: 1500, MemoryBytes: 2 << 30, StorageBytes: 1 << 30}, want: "whole-vCPU"},
+		{name: "memory must be positive", resources: admission.Resources{CPUMilli: 2000, MemoryBytes: 0, StorageBytes: 1 << 30}, want: "memory limit must be positive"},
+		{name: "storage below minimum", resources: admission.Resources{CPUMilli: 2000, MemoryBytes: 6 << 30, StorageBytes: 63 << 20}, want: "from 64 to 2047 MiB"},
+		{name: "unaligned storage", resources: admission.Resources{CPUMilli: 2000, MemoryBytes: 6 << 30, StorageBytes: (64 << 20) + 1}, want: "MiB-aligned"},
+		{name: "storage above maximum", resources: admission.Resources{CPUMilli: 2000, MemoryBytes: 6 << 30, StorageBytes: 2 << 30}, want: "from 64 to 2047 MiB"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configured := valid
+			configured.Resources = test.resources
+			if _, _, _, err := buildTargetPlan(configured); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("buildTargetPlan() error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -232,6 +347,115 @@ func TestBuildObserverPlansRejectsNonCanonicalCollectorReferencesEarly(t *testin
 	}
 }
 
+func TestBuildObserverPlansUsesSharedExactProcessConfiguration(t *testing.T) {
+	program := filepath.Join(t.TempDir(), "adb.exe")
+	configuration := observerprocess.AdapterConfiguration{
+		Adapter: "logcat", Version: "1", SignalFamily: "android.logcat",
+		Placement: domain.CollectorPlacementGuest, CoverageLevel: domain.CoverageLevelPartial,
+		RuntimeBinding: observerprocess.RuntimeBindingAndroidExactADB,
+		Program:        program,
+		Args:           []string{"logcat"},
+		VersionArgs:    []string{"version"}, ReadinessProgram: program,
+		ReadinessArgs:     []string{"get-state"},
+		ReadinessInterval: 250 * time.Millisecond,
+	}
+	digest, err := observerprocess.ConfigurationDigest(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := observerProfile{
+		Reference: "android-logcat", Adapter: configuration.Adapter, Version: configuration.Version,
+		ConfigurationDigest: digest.String(), SignalFamily: configuration.SignalFamily,
+		Placement: configuration.Placement, CoverageLevel: configuration.CoverageLevel, RuntimeBinding: configuration.RuntimeBinding, Required: true,
+		Program: configuration.Program, Args: configuration.Args, VersionArgs: configuration.VersionArgs,
+		Readiness: observerReadinessProfile{
+			Program: configuration.ReadinessProgram, Args: configuration.ReadinessArgs,
+			Interval: configuration.ReadinessInterval.String(),
+		},
+		MaximumBytes: 64 << 10,
+	}
+	plans, specs, err := buildObserverPlans([]observerProfile{profile}, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 1 || len(specs) != 1 || plans[0].Adapter.ConfigurationDigest != digest ||
+		plans[0].Spec.ConfigurationDigest != digest || plans[0].Adapter.Name != configuration.Adapter {
+		t.Fatalf("observer plans = %#v specs=%#v", plans, specs)
+	}
+	readiness, ok := plans[0].Adapter.Readiness.(observerprocess.CommandReadiness)
+	if !ok || readiness.Program != configuration.ReadinessProgram || readiness.Interval != configuration.ReadinessInterval {
+		t.Fatalf("observer readiness = %#v", plans[0].Adapter.Readiness)
+	}
+	profile.Environment = map[string]string{}
+	if _, _, err := buildObserverPlans([]observerProfile{profile}, 1<<20); err == nil || !strings.Contains(err.Error(), "configuration_digest") {
+		t.Fatalf("nil-to-empty configuration drift was accepted: %v", err)
+	}
+}
+
+func TestDeploymentProfileAcceptsGenericBindingEmittedByWorldCapabilities(t *testing.T) {
+	fixture := newProfileFixture(t, true)
+	program := filepath.Join(t.TempDir(), "observer.exe")
+	configuration := observerprocess.AdapterConfiguration{
+		Adapter: "process", Version: "1", SignalFamily: "process.stdout",
+		Placement: domain.CollectorPlacementHost, CoverageLevel: domain.CoverageLevelPartial,
+		RuntimeBinding: observerprocess.RuntimeBindingNone,
+		Program:        program, VersionArgs: []string{"--version"}, ReadinessProgram: program,
+		ReadinessArgs: []string{"ready"}, ReadinessInterval: 250 * time.Millisecond,
+	}
+	digest, err := observerprocess.ConfigurationDigest(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.profile.Observers = []observerProfile{{
+		Reference: "process-stdout", Adapter: configuration.Adapter, Version: configuration.Version,
+		ConfigurationDigest: digest.String(), SignalFamily: configuration.SignalFamily,
+		Placement: configuration.Placement, CoverageLevel: configuration.CoverageLevel, Required: true,
+		Program: configuration.Program, VersionArgs: configuration.VersionArgs,
+		Readiness: observerReadinessProfile{
+			Program: configuration.ReadinessProgram, Args: configuration.ReadinessArgs,
+			Interval: configuration.ReadinessInterval.String(),
+		},
+		MaximumBytes: 64 << 10,
+	}}
+	fixture.profile.Runs[0].CollectorReferences = []string{"process-stdout"}
+	fixture.profile.Runs[0].RequiredCoverage = append(fixture.profile.Runs[0].RequiredCoverage, configuration.SignalFamily)
+
+	encoded, err := json.Marshal(fixture.profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &document); err != nil {
+		t.Fatal(err)
+	}
+	var observers []map[string]any
+	if err := json.Unmarshal(document["observers"], &observers); err != nil {
+		t.Fatal(err)
+	}
+	observers[0]["runtime_binding"] = configuration.RuntimeBinding.String()
+	document["observers"], err = json.Marshal(observers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fixture.profilePath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	deployment, err := loadDeployment(ctx, fixture.profilePath, fixture.publicationRoot, 1<<20)
+	if err != nil {
+		t.Fatalf("load profile containing world-capabilities runtime binding %q: %v", configuration.RuntimeBinding.String(), err)
+	}
+	if len(deployment.observerAdapters) != 1 || deployment.observerAdapters[0].Adapter.RuntimeBinding != observerprocess.RuntimeBindingNone {
+		t.Fatalf("generic runtime binding was not normalized exactly: %#v", deployment.observerAdapters)
+	}
+}
+
 func TestReadDeploymentProfileIsStrictAndBounded(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "profile.json")
@@ -264,6 +488,35 @@ func TestReadDeploymentProfileIsStrictAndBounded(t *testing.T) {
 	}
 	if _, _, err := readDeploymentProfile(path); err == nil || !strings.Contains(err.Error(), "no larger") {
 		t.Fatalf("oversized profile error = %v", err)
+	}
+}
+
+func TestDeploymentProfileVersionThreeContract(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		version   int
+		wantError string
+	}{
+		{name: "version 2 rejected", version: 2, wantError: "deployment profile version must be 3"},
+		{name: "version 3 accepted", version: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newProfileFixture(t, false)
+			fixture.profile.Version = test.version
+			writeProfile(t, fixture.profilePath, fixture.profile)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, err := loadDeployment(ctx, fixture.profilePath, fixture.publicationRoot, 1<<20)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("loadDeployment(version=%d) error = %v, want %q", test.version, err, test.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadDeployment(version=%d): %v", test.version, err)
+			}
+		})
 	}
 }
 

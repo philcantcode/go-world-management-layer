@@ -15,22 +15,26 @@ import (
 )
 
 type expectedAgentContainer struct {
-	input ports.AgentWorkspacePlan
-	plan  ContainerPlan
-	ref   ports.AgentWorkspaceRef
+	input       ports.AgentWorkspacePlan
+	plan        ContainerPlan
+	ref         ports.AgentWorkspaceRef
+	cleanupOnly bool
 }
 
 // ReconcileAgentWorkspaces inventories Docker and rebuilds the driver's
 // generation and request maps from exact physical matches. It only observes
 // and adopts; it never destroys or quarantines a resource.
-func (d *Driver) ReconcileAgentWorkspaces(ctx context.Context, expected []ports.AgentWorkspacePlan) (ports.AgentWorkspaceReconciliationReport, error) {
+// ReconcileAgentWorkspaces keeps cleanup-only generations out of the
+// executable workspace map while retaining their complete immutable plans as
+// Stop/Destroy authority.
+func (d *Driver) ReconcileAgentWorkspaces(ctx context.Context, request ports.AgentWorkspaceReconciliationRequest) (ports.AgentWorkspaceReconciliationReport, error) {
 	if err := requireContext(ctx, "docker.reconcile"); err != nil {
 		return ports.AgentWorkspaceReconciliationReport{}, err
 	}
 	d.lifecycleMu.Lock()
 	defer d.lifecycleMu.Unlock()
 
-	prepared, err := d.prepareExpectedAgentContainers(expected)
+	prepared, err := d.prepareExpectedAgentContainers(request)
 	if err != nil {
 		return ports.AgentWorkspaceReconciliationReport{}, err
 	}
@@ -52,6 +56,7 @@ func (d *Driver) ReconcileAgentWorkspaces(ctx context.Context, expected []ports.
 
 	claimed := make([]bool, len(states))
 	adopted := make([]workspaceRecord, 0, len(prepared))
+	cleanupOnly := make([]workspaceRecord, 0, len(prepared))
 	for expectedIndex, item := range prepared {
 		candidates := agentCandidates(states, item)
 		for _, candidate := range candidates {
@@ -66,9 +71,33 @@ func (d *Driver) ReconcileAgentWorkspaces(ctx context.Context, expected []ports.
 				report.Expected[expectedIndex] = ports.AgentWorkspaceReconciliation{Ref: item.ref, ContainerID: state.ID, Classification: ports.PhysicalResourceForeign, Diagnostic: err.Error()}
 				continue
 			}
-			status := adoptedAgentStatus(item.plan, state, d.now().UTC())
-			adopted = append(adopted, workspaceRecord{plan: item.input, containerPlan: item.plan, containerID: state.ID, status: status})
-			report.Expected[expectedIndex] = ports.AgentWorkspaceReconciliation{Ref: item.ref, ContainerID: state.ID, Classification: ports.PhysicalResourceAdopted, Diagnostic: "exact persisted plan and physical configuration match"}
+			if err := requireCoherentContainerState(state, "docker.reconcile"); err != nil {
+				report.Expected[expectedIndex] = ports.AgentWorkspaceReconciliation{Ref: item.ref, ContainerID: state.ID, Classification: ports.PhysicalResourceForeign, Diagnostic: err.Error()}
+				continue
+			}
+			if item.cleanupOnly {
+				cleanupOnly = append(cleanupOnly, cleanupOnlyAgentRecord(item, state, report.ObservedAt))
+				report.Expected[expectedIndex] = ports.AgentWorkspaceReconciliation{
+					Ref: item.ref, ContainerID: state.ID, Classification: ports.PhysicalResourceUncertain, PlanMatched: true,
+					Diagnostic: "exact persisted cleanup plan and physical configuration match; generation was not adopted for work",
+				}
+				continue
+			}
+			record, proven, err := d.provenReconciledAgentRecord(item, state, report.ObservedAt)
+			if err != nil {
+				report.Expected[expectedIndex] = ports.AgentWorkspaceReconciliation{Ref: item.ref, ContainerID: state.ID, Classification: ports.PhysicalResourceForeign, Diagnostic: err.Error()}
+				continue
+			}
+			if !proven {
+				cleanupOnly = append(cleanupOnly, cleanupOnlyAgentRecord(item, state, report.ObservedAt))
+				report.Expected[expectedIndex] = ports.AgentWorkspaceReconciliation{
+					Ref: item.ref, ContainerID: state.ID, Classification: ports.PhysicalResourceUncertain, PlanMatched: true,
+					Diagnostic: "exact container identity matches, but this daemon has not completed framed guest readiness for it",
+				}
+				continue
+			}
+			adopted = append(adopted, record)
+			report.Expected[expectedIndex] = ports.AgentWorkspaceReconciliation{Ref: item.ref, ContainerID: state.ID, Classification: ports.PhysicalResourceAdopted, PlanMatched: true, Diagnostic: "exact persisted plan, physical configuration, and framed guest readiness match"}
 		default:
 			report.Expected[expectedIndex] = ports.AgentWorkspaceReconciliation{Ref: item.ref, Classification: ports.PhysicalResourceUncertain, Diagnostic: "multiple Docker resources claim the same generation identity"}
 		}
@@ -83,31 +112,87 @@ func (d *Driver) ReconcileAgentWorkspaces(ctx context.Context, expected []ports.
 		}
 		return report, err
 	}
-	d.rebuildAgentMaps(adopted)
+	d.rebuildAgentMaps(adopted, cleanupOnly)
 	return report, nil
 }
 
-func (d *Driver) prepareExpectedAgentContainers(expected []ports.AgentWorkspacePlan) ([]expectedAgentContainer, error) {
-	if len(expected) > dockercli.MaximumInventoryContainers {
+// cleanupOnlyAgentRecord retains complete plan authority for Stop/Destroy
+// after a daemon restart without making the workspace executable. Provision
+// must still perform a fresh framed guest readiness probe before it can become
+// Ready or be adopted for work.
+func cleanupOnlyAgentRecord(expected expectedAgentContainer, state ContainerState, observedAt time.Time) workspaceRecord {
+	return workspaceRecord{
+		plan: expected.input, containerPlan: expected.plan, containerID: state.ID,
+		status: ports.AgentWorkspaceStatus{
+			AgentWorkspaceID: expected.ref.ID, Generation: expected.ref.Generation,
+			State: domain.AgentGenerationProvisioning, Ready: false,
+			ContainerID: state.ID, CgroupID: state.CgroupID, ObservedAt: observedAt,
+		},
+	}
+}
+
+func (d *Driver) provenReconciledAgentRecord(expected expectedAgentContainer, state ContainerState, observedAt time.Time) (workspaceRecord, bool, error) {
+	if state.Running {
+		if err := requireLiveContainerState(state, "docker.reconcile"); err != nil {
+			return workspaceRecord{}, false, err
+		}
+	}
+	key := workspaceKey(expected.ref.ID, expected.ref.Generation)
+	d.mu.Lock()
+	record, found := d.workspaces[key]
+	d.mu.Unlock()
+	if !found || record.containerID != state.ID || record.status.AgentWorkspaceID != expected.ref.ID || record.status.Generation != expected.ref.Generation ||
+		record.status.ContainerID != state.ID || !record.status.Ready || record.status.State != domain.AgentGenerationReady ||
+		record.status.GuestProtocol != uint32(transport.ProtocolVersion) {
+		return workspaceRecord{}, false, nil
+	}
+	samePlan, err := sameAgentWorkspacePlanIdentity(record.plan, expected.input)
+	if err != nil {
+		return workspaceRecord{}, false, fmt.Errorf("compare readiness-proven workspace plan: %w", err)
+	}
+	if !samePlan {
+		return workspaceRecord{}, false, fmt.Errorf("readiness proof belongs to a different semantic workspace plan")
+	}
+	if err := requireLiveContainerState(state, "docker.reconcile"); err != nil {
+		return workspaceRecord{}, false, err
+	}
+	record.plan = expected.input
+	record.containerPlan = expected.plan
+	record.status = readyAgentStatus(expected.plan, state, observedAt)
+	return record, true, nil
+}
+
+func (d *Driver) prepareExpectedAgentContainers(request ports.AgentWorkspaceReconciliationRequest) ([]expectedAgentContainer, error) {
+	count := len(request.Active) + len(request.CleanupOnly)
+	if count > dockercli.MaximumInventoryContainers {
 		return nil, domain.NewError(domain.CodeResourceExhausted, "docker.reconcile", "expected", "expected generation set exceeds the reconciliation safety bound", nil)
 	}
-	prepared := make([]expectedAgentContainer, 0, len(expected))
-	refs := make(map[string]struct{}, len(expected))
-	requests := make(map[string]struct{}, len(expected))
-	for index, input := range expected {
-		plan, err := BuildContainerPlan(input, d.build)
-		if err != nil {
-			return nil, fmt.Errorf("expected agent workspace %d: %w", index, err)
+	prepared := make([]expectedAgentContainer, 0, count)
+	refs := make(map[string]struct{}, count)
+	requests := make(map[string]struct{}, count)
+	appendPlans := func(expected []ports.AgentWorkspacePlan, cleanupOnly bool) error {
+		for index, input := range expected {
+			plan, err := BuildContainerPlan(input, d.build)
+			if err != nil {
+				return fmt.Errorf("expected agent workspace %d: %w", index, err)
+			}
+			key := workspaceKey(plan.AgentWorkspaceID, plan.Generation)
+			if _, duplicate := refs[key]; duplicate {
+				return domain.NewError(domain.CodeInvalidArgument, "docker.reconcile", "expected", "contains duplicate workspace generations", nil)
+			}
+			if _, duplicate := requests[input.IdempotencyKey]; duplicate {
+				return domain.NewError(domain.CodeInvalidArgument, "docker.reconcile", "expected", "contains duplicate idempotency keys", nil)
+			}
+			refs[key], requests[input.IdempotencyKey] = struct{}{}, struct{}{}
+			prepared = append(prepared, expectedAgentContainer{input: input, plan: plan, ref: ports.AgentWorkspaceRef{ID: plan.AgentWorkspaceID, Generation: plan.Generation}, cleanupOnly: cleanupOnly})
 		}
-		key := workspaceKey(plan.AgentWorkspaceID, plan.Generation)
-		if _, duplicate := refs[key]; duplicate {
-			return nil, domain.NewError(domain.CodeInvalidArgument, "docker.reconcile", "expected", "contains duplicate workspace generations", nil)
-		}
-		if _, duplicate := requests[input.IdempotencyKey]; duplicate {
-			return nil, domain.NewError(domain.CodeInvalidArgument, "docker.reconcile", "expected", "contains duplicate idempotency keys", nil)
-		}
-		refs[key], requests[input.IdempotencyKey] = struct{}{}, struct{}{}
-		prepared = append(prepared, expectedAgentContainer{input: input, plan: plan, ref: ports.AgentWorkspaceRef{ID: plan.AgentWorkspaceID, Generation: plan.Generation}})
+		return nil
+	}
+	if err := appendPlans(request.Active, false); err != nil {
+		return nil, err
+	}
+	if err := appendPlans(request.CleanupOnly, true); err != nil {
+		return nil, err
 	}
 	return prepared, nil
 }
@@ -152,12 +237,11 @@ func (d *Driver) resolveAgentDestroy(ctx context.Context, ref ports.AgentWorkspa
 		return "", false, domain.NewError(domain.CodeIntegrityViolation, "docker.destroy", "identity", "multiple Docker resources claim the generation", nil)
 	}
 	state := candidates[0]
-	if found {
-		if err := validateContainerIdentity(state, record.containerPlan); err != nil {
-			return "", false, err
-		}
-	} else if err := validateUnclaimedAgentContainer(state, ref); err != nil {
-		return "", false, domain.NewError(domain.CodeIntegrityViolation, "docker.destroy", "identity", "refusing to remove a foreign Docker resource", err)
+	if !found {
+		return "", false, domain.NewError(domain.CodeIntegrityViolation, "docker.destroy", "identity", "present container has no reconciled complete persisted workspace plan", nil)
+	}
+	if err := validateContainerIdentity(state, record.containerPlan); err != nil {
+		return "", false, err
 	}
 	return state.ID, false, nil
 }
@@ -217,24 +301,29 @@ func (d *Driver) classifyUnclaimedAgentContainers(report *ports.AgentWorkspaceRe
 	}
 }
 
-func (d *Driver) rebuildAgentMaps(records []workspaceRecord) {
-	workspaces := make(map[string]workspaceRecord, len(records))
-	requests := make(map[string]string, len(records))
-	for _, record := range records {
+func (d *Driver) rebuildAgentMaps(adopted, cleanupRecords []workspaceRecord) {
+	workspaces := make(map[string]workspaceRecord, len(adopted))
+	cleanupOnly := make(map[string]workspaceRecord, len(cleanupRecords))
+	requests := make(map[string]string, len(adopted))
+	for _, record := range adopted {
 		key := workspaceKey(record.containerPlan.AgentWorkspaceID, record.containerPlan.Generation)
 		workspaces[key] = record
 		requests[record.plan.IdempotencyKey] = key
 	}
+	for _, record := range cleanupRecords {
+		key := workspaceKey(record.containerPlan.AgentWorkspaceID, record.containerPlan.Generation)
+		cleanupOnly[key] = record
+	}
 	d.mu.Lock()
-	d.workspaces, d.idempotency = workspaces, requests
+	d.workspaces, d.cleanupOnly, d.idempotency = workspaces, cleanupOnly, requests
 	d.mu.Unlock()
 }
 
 func validateContainerInventory(states []ContainerState) error {
 	ids := make(map[string]struct{}, len(states))
 	for _, state := range states {
-		if strings.TrimSpace(state.ID) == "" {
-			return fmt.Errorf("container has an empty runtime ID")
+		if err := dockercli.RequireCanonicalContainerID(state.ID); err != nil {
+			return fmt.Errorf("container has a non-canonical runtime ID %q: %w", state.ID, err)
 		}
 		if _, duplicate := ids[state.ID]; duplicate {
 			return fmt.Errorf("duplicate runtime ID %q", state.ID)
@@ -255,7 +344,7 @@ func validateUnclaimedAgentContainer(state ContainerState, ref ports.AgentWorksp
 }
 
 func validateContainerIdentity(state ContainerState, plan ContainerPlan) error {
-	if state.ID == "" || state.Name != plan.Name {
+	if dockercli.RequireCanonicalContainerID(state.ID) != nil || state.Name != plan.Name {
 		return domain.NewError(domain.CodeIntegrityViolation, "docker.inspect", "name", "container name or runtime identity does not match the world plan", nil)
 	}
 	if !dockercli.ExactWorldLabels(state.Labels, plan.Labels) {
@@ -306,28 +395,24 @@ func validAgentWorldLabels(labels map[string]string, ref ports.AgentWorkspaceRef
 	return dockercli.ExactWorldLabels(labels, expected)
 }
 
-func adoptedAgentStatus(plan ContainerPlan, state ContainerState, observedAt time.Time) ports.AgentWorkspaceStatus {
-	status := ports.AgentWorkspaceStatus{
-		AgentWorkspaceID: plan.AgentWorkspaceID, Generation: plan.Generation, State: domain.AgentGenerationReady,
-		Ready: state.Running, ContainerID: state.ID, CgroupID: state.CgroupID, GuestProtocol: uint32(transport.ProtocolVersion), ObservedAt: observedAt,
-	}
-	if !state.Running {
-		status.State = domain.AgentGenerationFailed
-	}
-	return status
-}
-
 func expectedAgentConfiguration(plan ContainerPlan) dockercli.Configuration {
 	memorySwap, _ := dockercli.MemorySwapTotal(plan.Resources.MemoryBytes, plan.Resources.SwapBytes)
-	configuration := dockercli.Configuration{
-		Image: plan.Image, Runtime: plan.Runtime, Entrypoint: append([]string(nil), plan.Entrypoint[:1]...), Command: append([]string(nil), plan.Entrypoint[1:]...),
-		User: plan.User, OpenStdin: true, ReadOnlyRoot: true, NetworkMode: "none", Init: true, InitKnown: true,
-		CapabilitiesDrop: []string{"ALL"}, SecurityOptions: dockercli.HardenedSecurityOptions(),
-		Tmpfs: map[string]string{"/tmp": "rw,nosuid,nodev,noexec,mode=1777"}, MemoryBytes: plan.Resources.MemoryBytes,
-		MemorySwapBytes: memorySwap, NanoCPUs: dockercli.NanoCPUs(plan.Resources.CPUMilli), PIDs: plan.Resources.PIDs,
-	}
+	configuration := dockercli.RestrictedContainerConfiguration()
+	configuration.Image = plan.Image
+	configuration.Runtime = plan.Runtime
+	configuration.Hostname = plan.Name
+	configuration.Entrypoint = append([]string(nil), plan.Entrypoint[:1]...)
+	configuration.Command = append([]string(nil), plan.Entrypoint[1:]...)
+	configuration.User = plan.User
+	configuration.AttachStdin = true
+	configuration.OpenStdin = true
+	configuration.StdinOnce = true
+	configuration.MemoryBytes = plan.Resources.MemoryBytes
+	configuration.MemorySwapBytes = memorySwap
+	configuration.NanoCPUs = dockercli.NanoCPUs(plan.Resources.CPUMilli)
+	configuration.PIDs = plan.Resources.PIDs
 	for _, mount := range plan.Mounts {
-		configuration.Mounts = append(configuration.Mounts, dockercli.Mount{Type: "bind", Source: mount.Source, Destination: mount.Target, ReadOnly: mount.ReadOnly})
+		dockercli.AddRestrictedBindMount(&configuration, mount.Source, mount.Target, mount.ReadOnly)
 	}
 	return configuration
 }

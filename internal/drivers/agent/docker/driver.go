@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
+	"github.com/philcantcode/go-world-management-layer/internal/drivers/dockercli"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
 	"github.com/philcantcode/go-world-management-layer/internal/transport"
 )
@@ -32,6 +33,7 @@ type Driver struct {
 	lifecycleMu sync.Mutex
 	mu          sync.Mutex
 	workspaces  map[string]workspaceRecord
+	cleanupOnly map[string]workspaceRecord
 	idempotency map[string]string
 }
 
@@ -52,7 +54,10 @@ func New(config Config) (*Driver, error) {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	return &Driver{build: config.Build, engine: config.Engine, now: config.Now, workspaces: make(map[string]workspaceRecord), idempotency: make(map[string]string)}, nil
+	return &Driver{
+		build: config.Build, engine: config.Engine, now: config.Now,
+		workspaces: make(map[string]workspaceRecord), cleanupOnly: make(map[string]workspaceRecord), idempotency: make(map[string]string),
+	}, nil
 }
 
 func NewDriver(config Config) (*Driver, error) { return New(config) }
@@ -65,8 +70,18 @@ func (d *Driver) Probe(ctx context.Context) (domain.CapabilityFingerprint, error
 	if err != nil {
 		return domain.CapabilityFingerprint{}, domain.NewError(domain.CodeCapabilityUnavailable, "docker.probe", "engine", "Docker Engine probe failed", err)
 	}
-	supported, _ := domain.NewCapability(domain.CapabilitySupported, map[string]string{"api_version": capabilities.APIVersion, "cgroup_version": capabilities.CgroupVersion}, map[string]string{"engine_version": capabilities.EngineVersion})
-	isolation, _ := domain.NewCapability(domain.CapabilitySupported, map[string]string{"privileged": "false", "host_namespaces": "false", "runtime_socket": "false"}, nil)
+	if err := dockercli.RequireSupportedCgroupVersion(capabilities.CgroupVersion); err != nil {
+		return domain.CapabilityFingerprint{}, domain.NewError(domain.CodeCapabilityUnavailable, "docker.probe", "cgroup_version", "Docker Engine cannot provide a supported resource-controller contract", err)
+	}
+	supported, _ := domain.NewCapability(domain.CapabilitySupported, map[string]string{
+		"api_version":               capabilities.APIVersion,
+		"cgroup_identity_authority": dockercli.ContainerCgroupIdentityAuthority(),
+		"cgroup_version":            capabilities.CgroupVersion,
+	}, map[string]string{"engine_version": capabilities.EngineVersion})
+	isolationFacts := dockercli.RestrictedNamespaceFacts(capabilities.SecurityOptions)
+	isolationFacts["privileged"] = "false"
+	isolationFacts["runtime_socket"] = "false"
+	isolation, _ := domain.NewCapability(domain.CapabilitySupported, isolationFacts, nil)
 	return domain.NewCapabilityFingerprint(map[string]domain.Capability{"agent.docker": supported, "agent.hardened-isolation": isolation}, map[string]string{"os": capabilities.OSType, "architecture": capabilities.Architecture})
 }
 
@@ -81,47 +96,208 @@ func (d *Driver) Provision(ctx context.Context, input ports.AgentWorkspacePlan) 
 	d.lifecycleMu.Lock()
 	defer d.lifecycleMu.Unlock()
 	key := workspaceKey(containerPlan.AgentWorkspaceID, containerPlan.Generation)
-	d.mu.Lock()
-	if existingKey, found := d.idempotency[input.IdempotencyKey]; found {
-		record, exists := d.workspaces[existingKey]
-		d.mu.Unlock()
-		if !exists || existingKey != key {
-			return ports.AgentWorkspaceResult{}, domain.NewError(domain.CodeConflict, "docker.provision", "idempotency_key", "was used for a different workspace generation", nil)
-		}
-		return ports.AgentWorkspaceResult{Status: record.status, Created: false}, nil
+	if result, complete, err := d.existingProvisionResult(input, key); err != nil || complete {
+		return result, err
 	}
-	if _, exists := d.workspaces[key]; exists {
-		d.mu.Unlock()
-		return ports.AgentWorkspaceResult{}, domain.NewError(domain.CodeAlreadyExists, "docker.provision", "generation", "workspace generation already exists under another idempotency key", nil)
+	containerID, found, err := d.findProvisionContainer(ctx, input, containerPlan)
+	if err != nil {
+		return ports.AgentWorkspaceResult{}, err
 	}
-	d.mu.Unlock()
 	if err := prepareWorkspaceAccess(containerPlan.ExpectedWorkspaceSource, containerPlan.User); err != nil {
 		return ports.AgentWorkspaceResult{}, domain.NewError(domain.CodeFailedPrecondition, "docker.provision", "workspace_access", "workspace could not be restricted to the configured container identity", err)
 	}
-
-	containerID, err := d.engine.Create(ctx, containerPlan)
+	created := false
+	if !found {
+		containerID, err = d.engine.Create(ctx, containerPlan)
+		if err != nil {
+			return ports.AgentWorkspaceResult{}, domain.NewError(domain.CodeUnavailable, "docker.provision", "create", "Docker create failed", err)
+		}
+		if err := dockercli.RequireCanonicalContainerID(containerID); err != nil {
+			return ports.AgentWorkspaceResult{}, domain.NewError(domain.CodeIntegrityViolation, "docker.provision", "container_id", "Docker create returned a non-canonical container identity", err)
+		}
+		created = true
+	}
+	state, err := d.inspectProvisionContainer(ctx, containerID, containerPlan)
 	if err != nil {
-		return ports.AgentWorkspaceResult{}, domain.NewError(domain.CodeUnavailable, "docker.provision", "create", "Docker create failed", err)
+		return ports.AgentWorkspaceResult{}, d.failProvisionContainer(containerID, err)
 	}
-	if err := d.engine.Start(ctx, containerID); err != nil {
-		return ports.AgentWorkspaceResult{}, domain.NewError(domain.CodeUnavailable, "docker.provision", "start", "Docker start failed", d.removeFailedContainer(containerID, err))
+	state, err = d.establishFreshAgentReadiness(ctx, containerID, containerPlan, state, "docker.provision")
+	if err != nil {
+		return ports.AgentWorkspaceResult{}, d.failProvisionContainer(containerID, err)
 	}
-	state, err := d.engine.Inspect(ctx, containerID)
-	if err != nil || !state.Running {
-		return ports.AgentWorkspaceResult{}, domain.NewError(domain.CodeFailedPrecondition, "docker.provision", "readiness", "agent container did not become running", d.removeFailedContainer(containerID, err))
-	}
-	if err := validateContainerIdentity(state, containerPlan); err != nil {
-		return ports.AgentWorkspaceResult{}, errors.Join(err, d.removeFailedContainer(containerID, nil))
-	}
-	if err := d.requireGuestReadiness(ctx, containerID, containerPlan); err != nil {
-		return ports.AgentWorkspaceResult{}, domain.NewError(domain.CodeFailedPrecondition, "docker.provision", "guest_protocol", "world-guest did not complete its framed readiness probe", d.removeFailedContainer(containerID, err))
-	}
-	status := ports.AgentWorkspaceStatus{AgentWorkspaceID: containerPlan.AgentWorkspaceID, Generation: containerPlan.Generation, State: domain.AgentGenerationReady, Ready: true, ContainerID: containerID, CgroupID: state.CgroupID, GuestProtocol: uint32(transport.ProtocolVersion), ObservedAt: d.now().UTC()}
+	status := readyAgentStatus(containerPlan, state, d.now().UTC())
 	d.mu.Lock()
 	d.workspaces[key] = workspaceRecord{plan: input, containerPlan: containerPlan, containerID: containerID, status: status}
+	delete(d.cleanupOnly, key)
 	d.idempotency[input.IdempotencyKey] = key
 	d.mu.Unlock()
-	return ports.AgentWorkspaceResult{Status: status, Created: true}, nil
+	return ports.AgentWorkspaceResult{Status: status, Created: created}, nil
+}
+
+func (d *Driver) existingProvisionResult(input ports.AgentWorkspacePlan, key string) (ports.AgentWorkspaceResult, bool, error) {
+	d.mu.Lock()
+	existingKey, found := d.idempotency[input.IdempotencyKey]
+	record, exists := d.workspaces[existingKey]
+	_, generationExists := d.workspaces[key]
+	d.mu.Unlock()
+	if !found {
+		if generationExists {
+			return ports.AgentWorkspaceResult{}, true, domain.NewError(domain.CodeAlreadyExists, "docker.provision", "generation", "workspace generation already exists under another idempotency key", nil)
+		}
+		return ports.AgentWorkspaceResult{}, false, nil
+	}
+	if !exists || existingKey != key {
+		return ports.AgentWorkspaceResult{}, true, domain.NewError(domain.CodeConflict, "docker.provision", "idempotency_key", "was used for a different workspace generation", nil)
+	}
+	samePlan, err := sameAgentWorkspacePlanIdentity(record.plan, input)
+	if err != nil {
+		return ports.AgentWorkspaceResult{}, true, domain.NewError(domain.CodeInternal, "docker.provision", "idempotency_key", "could not compare the existing and requested workspace plans", err)
+	}
+	if !samePlan {
+		return ports.AgentWorkspaceResult{}, true, domain.NewError(domain.CodeConflict, "docker.provision", "idempotency_key", "was reused with a different workspace plan", nil)
+	}
+	if record.status.State.Terminal() {
+		return ports.AgentWorkspaceResult{Status: record.status, Created: false}, true, nil
+	}
+	// A Docker container can be stopped and restarted without changing its ID
+	// or immutable configuration. Because ContainerState has no authoritative
+	// start identity, even an in-process Ready record must be inspected and
+	// complete a fresh framed guest probe before a Provision replay reports it
+	// ready.
+	record.status.Ready = false
+	record.status.State = domain.AgentGenerationProvisioning
+	record.status.GuestProtocol = 0
+	record.status.ObservedAt = d.now().UTC()
+	d.mu.Lock()
+	d.workspaces[key] = record
+	d.mu.Unlock()
+	return ports.AgentWorkspaceResult{}, false, nil
+}
+
+func (d *Driver) findProvisionContainer(ctx context.Context, input ports.AgentWorkspacePlan, plan ContainerPlan) (string, bool, error) {
+	inventory, supported := d.engine.(EngineInventory)
+	if !supported {
+		return "", false, domain.NewError(domain.CodeCapabilityUnavailable, "docker.provision", "inventory", "Docker engine does not provide authoritative inventory required for restart convergence", nil)
+	}
+	states, err := inventory.ListContainers(ctx)
+	if err != nil {
+		return "", false, domain.NewError(domain.CodeUnavailable, "docker.provision", "inventory", "Docker inventory failed", err)
+	}
+	if err := validateContainerInventory(states); err != nil {
+		return "", false, domain.NewError(domain.CodeIntegrityViolation, "docker.provision", "inventory", "Docker inventory is ambiguous", err)
+	}
+	ref := ports.AgentWorkspaceRef{ID: plan.AgentWorkspaceID, Generation: plan.Generation}
+	candidates := agentCandidates(states, expectedAgentContainer{input: input, plan: plan, ref: ref})
+	switch len(candidates) {
+	case 0:
+		return "", false, nil
+	case 1:
+		state := states[candidates[0]]
+		if err := validateContainerIdentity(state, plan); err != nil {
+			return "", false, err
+		}
+		return state.ID, true, nil
+	default:
+		return "", false, domain.NewError(domain.CodeIntegrityViolation, "docker.provision", "identity", "multiple Docker resources claim the workspace generation", nil)
+	}
+}
+
+func (d *Driver) inspectProvisionContainer(ctx context.Context, containerID string, plan ContainerPlan) (ContainerState, error) {
+	return d.inspectOwnedContainer(ctx, containerID, plan, "docker.provision")
+}
+
+func (d *Driver) inspectOwnedContainer(ctx context.Context, containerID string, plan ContainerPlan, operation string) (ContainerState, error) {
+	if err := dockercli.RequireCanonicalContainerID(containerID); err != nil {
+		return ContainerState{}, domain.NewError(domain.CodeIntegrityViolation, operation, "container_id", "stored Docker container identity is non-canonical", err)
+	}
+	state, err := d.engine.Inspect(ctx, containerID)
+	if err != nil {
+		return ContainerState{}, domain.NewError(domain.CodeUnavailable, operation, "inspect", "Docker inspect failed", err)
+	}
+	if state.ID != containerID {
+		return ContainerState{}, domain.NewError(domain.CodeIntegrityViolation, operation, "container_id", "Docker inspect returned a different container", nil)
+	}
+	if err := validateContainerIdentity(state, plan); err != nil {
+		return ContainerState{}, err
+	}
+	return state, nil
+}
+
+func (d *Driver) requireOwnedContainerStopped(ctx context.Context, containerID string, plan ContainerPlan, mode ports.StopMode, operation string) (ContainerState, error) {
+	state, err := d.inspectOwnedContainer(ctx, containerID, plan, operation)
+	if err != nil {
+		return ContainerState{}, err
+	}
+	if !state.Running {
+		if err := requireStoppedContainerState(state, operation, dockercli.StoppedStatusCreated, dockercli.StoppedStatusExited); err != nil {
+			return ContainerState{}, err
+		}
+		return state, nil
+	}
+	stopErr := d.engine.Stop(ctx, containerID, mode)
+	stopped, inspectErr := d.inspectOwnedContainer(ctx, containerID, plan, operation)
+	if inspectErr != nil {
+		if stopErr != nil {
+			stopErr = domain.NewError(domain.CodeUnavailable, operation, "engine", "Docker stop failed", stopErr)
+		}
+		return ContainerState{}, errors.Join(stopErr, inspectErr)
+	}
+	if stopped.Running {
+		return stopped, errors.Join(stopErr, domain.NewError(domain.CodeFailedPrecondition, operation, "running", "container remained running after stop", nil))
+	}
+	if err := requireStoppedContainerState(stopped, operation, dockercli.StoppedStatusExited); err != nil {
+		return ContainerState{}, errors.Join(stopErr, err)
+	}
+	if stopErr != nil {
+		return stopped, domain.NewError(domain.CodeUnavailable, operation, "engine", "Docker reported a stop failure despite the stopped observation", stopErr)
+	}
+	return stopped, nil
+}
+
+func (d *Driver) requireRunningProvisionContainer(ctx context.Context, containerID string, plan ContainerPlan) (ContainerState, error) {
+	state, err := d.inspectProvisionContainer(ctx, containerID, plan)
+	if err != nil {
+		return ContainerState{}, err
+	}
+	if err := requireLiveContainerState(state, "docker.provision"); err != nil {
+		return ContainerState{}, err
+	}
+	return state, nil
+}
+
+func requireLiveContainerState(state ContainerState, operation string) error {
+	if err := dockercli.RequireExactRunningState(state.Running, state.Paused, state.Restarting, state.Dead, state.Status); err != nil {
+		return domain.NewError(domain.CodeFailedPrecondition, operation, "readiness", "agent container is not in the exact running state", err)
+	}
+	return nil
+}
+
+func requireStoppedContainerState(state ContainerState, operation string, allowedStatuses ...string) error {
+	if err := dockercli.RequireExactStoppedState(state.Running, state.Paused, state.Restarting, state.Dead, state.Status, allowedStatuses...); err != nil {
+		return domain.NewError(domain.CodeFailedPrecondition, operation, "stopped_state", "agent container is not in an allowed exact stopped state", err)
+	}
+	return nil
+}
+
+func requireCoherentContainerState(state ContainerState, operation string) error {
+	if state.Running {
+		return requireLiveContainerState(state, operation)
+	}
+	return requireStoppedContainerState(state, operation, dockercli.StoppedStatusCreated, dockercli.StoppedStatusExited)
+}
+
+func (d *Driver) failProvisionContainer(containerID string, cause error) error {
+	if domain.IsCode(cause, domain.CodeIntegrityViolation) {
+		return cause
+	}
+	return errors.Join(cause, d.removeFailedContainer(containerID, nil))
+}
+
+func readyAgentStatus(plan ContainerPlan, state ContainerState, observedAt time.Time) ports.AgentWorkspaceStatus {
+	return ports.AgentWorkspaceStatus{
+		AgentWorkspaceID: plan.AgentWorkspaceID, Generation: plan.Generation, State: domain.AgentGenerationReady,
+		Ready: true, ContainerID: state.ID, CgroupID: state.CgroupID, GuestProtocol: uint32(transport.ProtocolVersion), ObservedAt: observedAt,
+	}
 }
 
 func (d *Driver) OpenExec(ctx context.Context, plan ports.ExecPlan) (ports.ExecTransport, error) {
@@ -240,18 +416,19 @@ func (d *Driver) Inspect(ctx context.Context, ref ports.AgentWorkspaceRef) (port
 	if err != nil {
 		return ports.AgentWorkspaceStatus{}, err
 	}
-	state, err := d.engine.Inspect(ctx, record.containerID)
+	state, err := d.inspectOwnedContainer(ctx, record.containerID, record.containerPlan, "docker.inspect")
 	if err != nil {
-		return ports.AgentWorkspaceStatus{}, domain.NewError(domain.CodeUnavailable, "docker.inspect", "engine", "Docker inspect failed", err)
-	}
-	if err := validateContainerIdentity(state, record.containerPlan); err != nil {
 		return ports.AgentWorkspaceStatus{}, err
 	}
 	status := record.status
-	status.Ready = state.Running
 	status.ObservedAt = d.now().UTC()
 	status.CgroupID = state.CgroupID
-	if !state.Running && status.State != domain.AgentGenerationSealed {
+	if status.State == domain.AgentGenerationSealed {
+		if err := requireStoppedContainerState(state, "docker.inspect", dockercli.StoppedStatusCreated, dockercli.StoppedStatusExited); err != nil {
+			return ports.AgentWorkspaceStatus{}, err
+		}
+	} else if requireLiveContainerState(state, "docker.inspect") != nil {
+		status.Ready = false
 		status.State = domain.AgentGenerationFailed
 	}
 	d.mu.Lock()
@@ -271,21 +448,25 @@ func (d *Driver) Stop(ctx context.Context, ref ports.AgentWorkspaceRef, mode por
 	if !mode.IsValid() {
 		return domain.NewError(domain.CodeInvalidArgument, "docker.stop", "mode", "is not recognized", nil)
 	}
-	record, err := d.requireWorkspace(ref.ID, ref.Generation)
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	record, cleanupOnly, err := d.requireWorkspaceForCleanup(ref.ID, ref.Generation)
 	if err != nil {
 		return err
 	}
-	if !record.status.Ready && record.status.State == domain.AgentGenerationSealed {
-		return nil
-	}
-	if err := d.engine.Stop(ctx, record.containerID, mode); err != nil {
-		return domain.NewError(domain.CodeUnavailable, "docker.stop", "engine", "Docker stop failed", err)
+	if _, err := d.requireOwnedContainerStopped(ctx, record.containerID, record.containerPlan, mode, "docker.stop"); err != nil {
+		return err
 	}
 	d.mu.Lock()
 	record.status.Ready = false
 	record.status.State = domain.AgentGenerationSealed
 	record.status.ObservedAt = d.now().UTC()
-	d.workspaces[workspaceKey(ref.ID, ref.Generation)] = record
+	key := workspaceKey(ref.ID, ref.Generation)
+	if cleanupOnly {
+		d.cleanupOnly[key] = record
+	} else {
+		d.workspaces[key] = record
+	}
 	d.mu.Unlock()
 	return nil
 }
@@ -302,6 +483,9 @@ func (d *Driver) Destroy(ctx context.Context, ref ports.AgentWorkspaceRef) error
 	key := workspaceKey(ref.ID, ref.Generation)
 	d.mu.Lock()
 	record, found := d.workspaces[key]
+	if !found {
+		record, found = d.cleanupOnly[key]
+	}
 	d.mu.Unlock()
 	containerID, absent, err := d.resolveAgentDestroy(ctx, ref, record, found)
 	if err != nil {
@@ -311,6 +495,7 @@ func (d *Driver) Destroy(ctx context.Context, ref ports.AgentWorkspaceRef) error
 		if found {
 			d.mu.Lock()
 			delete(d.workspaces, key)
+			delete(d.cleanupOnly, key)
 			delete(d.idempotency, record.plan.IdempotencyKey)
 			d.mu.Unlock()
 		}
@@ -332,6 +517,7 @@ func (d *Driver) Destroy(ctx context.Context, ref ports.AgentWorkspaceRef) error
 	}
 	d.mu.Lock()
 	delete(d.workspaces, key)
+	delete(d.cleanupOnly, key)
 	if found {
 		delete(d.idempotency, record.plan.IdempotencyKey)
 	}
@@ -347,6 +533,19 @@ func (d *Driver) requireWorkspace(id domain.AgentWorkspaceID, generation domain.
 		return workspaceRecord{}, domain.NewError(domain.CodeNotFound, "docker.workspace", "generation", "workspace generation was not provisioned by this driver", nil)
 	}
 	return record, nil
+}
+
+func (d *Driver) requireWorkspaceForCleanup(id domain.AgentWorkspaceID, generation domain.AgentGeneration) (workspaceRecord, bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	key := workspaceKey(id, generation)
+	if record, found := d.workspaces[key]; found {
+		return record, false, nil
+	}
+	if record, found := d.cleanupOnly[key]; found {
+		return record, true, nil
+	}
+	return workspaceRecord{}, false, domain.NewError(domain.CodeNotFound, "docker.workspace", "generation", "workspace generation was not proven by this driver", nil)
 }
 
 func workspaceKey(id domain.AgentWorkspaceID, generation domain.AgentGeneration) string {

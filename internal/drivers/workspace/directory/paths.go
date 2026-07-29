@@ -82,6 +82,80 @@ func requireManagedDirectory(parent, candidate string) error {
 	return nil
 }
 
+func isWorkspaceStagingName(name string) bool {
+	if !strings.HasPrefix(name, ".") {
+		return false
+	}
+	workspaceText, suffix, found := strings.Cut(strings.TrimPrefix(name, "."), ".prepare-")
+	if !found || !safeStagingSuffix(suffix) {
+		return false
+	}
+	workspaceID, err := domain.ParseWorkspaceID(workspaceText)
+	return err == nil && name == "."+workspaceID.String()+".prepare-"+suffix
+}
+
+func isSnapshotStagingName(name string) bool {
+	const prefix = ".sealed-"
+	return strings.HasPrefix(name, prefix) && safeStagingSuffix(strings.TrimPrefix(name, prefix))
+}
+
+// removeSnapshotStagingDirectories removes only the exact private directory
+// namespace created by os.MkdirTemp during sealed-snapshot publication. A
+// staging-shaped file, link, or malformed name is an integrity error and is
+// never followed or removed.
+func removeSnapshotStagingDirectories(workspaceRoot string) error {
+	entries, err := os.ReadDir(workspaceRoot)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, ".sealed") {
+			continue
+		}
+		if !isSnapshotStagingName(name) {
+			return fmt.Errorf("workspace contains malformed sealed-snapshot staging entry %q", name)
+		}
+		candidate := filepath.Join(workspaceRoot, name)
+		if err := removeStagingDirectory(workspaceRoot, candidate); err != nil {
+			return fmt.Errorf("remove incomplete sealed-snapshot staging directory %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func safeStagingSuffix(value string) bool {
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '-' || character == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func removeStagingDirectory(root, candidate string) error {
+	if err := requireManagedDirectory(root, candidate); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := removeTreeContext(ctx, candidate); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(candidate); !os.IsNotExist(err) {
+		if err == nil {
+			return fmt.Errorf("staging directory remains present after removal")
+		}
+		return fmt.Errorf("prove staging directory absence: %w", err)
+	}
+	return syncDirectory(root)
+}
+
 func requireContainedChild(root, candidate string) error {
 	rootAbsolute, err := filepath.Abs(root)
 	if err != nil {

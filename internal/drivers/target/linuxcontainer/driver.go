@@ -24,6 +24,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/drivers/target/runevidence"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
 	"github.com/philcantcode/go-world-management-layer/internal/safepath"
+	workspacepkg "github.com/philcantcode/go-world-management-layer/internal/workspace"
 )
 
 type CollectorReadiness interface {
@@ -72,6 +73,7 @@ type Driver struct {
 
 	mu           sync.Mutex
 	targets      map[string]targetRecord
+	cleanupOnly  map[string]targetRecord
 	runs         map[string]*runRecord
 	idempotency  map[string]string
 	resetResults map[string]resetOutcome
@@ -92,11 +94,13 @@ type quarantineOutcome struct {
 }
 
 type targetRecord struct {
-	input      ports.TargetPlan
-	plan       ContainerPlan
-	runtimeID  string
-	status     ports.TargetStatus
-	quarantine *ports.TargetQuarantineEvidence
+	input          ports.TargetPlan
+	plan           ContainerPlan
+	runtimeID      string
+	status         ports.TargetStatus
+	reset          *resetOutcome
+	quarantinePlan *ports.TargetQuarantinePlan
+	quarantine     *ports.TargetQuarantineEvidence
 }
 
 type materializationState struct {
@@ -118,18 +122,23 @@ func (a RunAuthority) Matches(candidate RunAuthority) bool {
 }
 
 type runRecord struct {
-	plan         ports.TargetRunPlan
-	authority    RunAuthority
-	directory    string
-	prepared     ports.PreparedTargetRun
-	started      bool
-	startedAt    time.Time
-	stopped      bool
-	quarantined  bool
-	result       *ports.TargetRunStopReceipt
-	timer        RunTimer
-	transports   map[*targetTransport]struct{}
-	observations []ports.TargetRunObservation
+	plan                 ports.TargetRunPlan
+	authority            RunAuthority
+	directory            string
+	baseline             workspacepkg.Manifest
+	prepared             ports.PreparedTargetRun
+	started              bool
+	startedAt            time.Time
+	finishing            bool
+	durationExceeded     bool
+	controlPlaneLost     bool
+	interruptedExecution bool
+	stopped              bool
+	quarantined          bool
+	result               *ports.TargetRunStopReceipt
+	timer                RunTimer
+	transports           map[*targetTransport]struct{}
+	observations         []ports.TargetRunObservation
 }
 
 func New(config Config) (*Driver, error) {
@@ -150,7 +159,7 @@ func New(config Config) (*Driver, error) {
 			return time.AfterFunc(duration, callback)
 		}
 	}
-	return &Driver{build: config.Build, runtime: config.Runtime, collectors: config.Collectors, random: config.Random, now: config.Now, afterFunc: config.AfterFunc, targets: make(map[string]targetRecord), runs: make(map[string]*runRecord), idempotency: make(map[string]string), resetResults: make(map[string]resetOutcome), quarantines: make(map[string]quarantineOutcome), materialized: make(map[string]*materializationState)}, nil
+	return &Driver{build: config.Build, runtime: config.Runtime, collectors: config.Collectors, random: config.Random, now: config.Now, afterFunc: config.AfterFunc, targets: make(map[string]targetRecord), cleanupOnly: make(map[string]targetRecord), runs: make(map[string]*runRecord), idempotency: make(map[string]string), resetResults: make(map[string]resetOutcome), quarantines: make(map[string]quarantineOutcome), materialized: make(map[string]*materializationState)}, nil
 }
 
 func NewDriver(config Config) (*Driver, error) { return New(config) }
@@ -159,21 +168,33 @@ func (d *Driver) Probe(ctx context.Context, template ports.TargetTemplate) (doma
 	if err := ports.RequireDeadline(ctx, "linux_target.probe"); err != nil {
 		return domain.CapabilityFingerprint{}, err
 	}
-	if err := template.Validate(); err != nil {
-		return domain.CapabilityFingerprint{}, err
-	}
-	if template.Kind != domain.TargetLinuxContainer {
-		return domain.CapabilityFingerprint{}, domain.NewError(domain.CodeCapabilityUnavailable, "linux_target.probe", "template.kind", "template is not a Linux container", nil)
+	if err := validatePhysicalTemplate(template); err != nil {
+		return domain.CapabilityFingerprint{}, domain.NewError(domain.CodeCapabilityUnavailable, "linux_target.probe", "template", "template is not supported by the Linux container driver", err)
 	}
 	capabilities, err := d.runtime.Probe(ctx)
 	if err != nil {
 		return domain.CapabilityFingerprint{}, domain.NewError(domain.CodeCapabilityUnavailable, "linux_target.probe", "runtime", "container runtime probe failed", err)
 	}
-	runtimeCapability, _ := domain.NewCapability(domain.CapabilitySupported, map[string]string{"api_version": capabilities.APIVersion, "cgroup_version": capabilities.CgroupVersion}, map[string]string{"runtime_version": capabilities.Version})
-	visibility, _ := domain.NewCapability(domain.CapabilitySupported, map[string]string{
-		"runtime": "runc", "sibling": "true", "arbitrary_exec": "true", "bounded_transfer": "true",
+	if err := dockercli.RequireSupportedCgroupVersion(capabilities.CgroupVersion); err != nil {
+		return domain.CapabilityFingerprint{}, domain.NewError(domain.CodeCapabilityUnavailable, "linux_target.probe", "cgroup_version", "container runtime cannot provide a supported resource-controller contract", err)
+	}
+	physical := dockercli.AssessPhysicalSupport(dockercli.PhysicalCapabilities{OSType: capabilities.OSType, Runtimes: capabilities.Runtimes}, template.Runtime)
+	if physical.Container != ports.PhysicalSupportEnforced {
+		return domain.CapabilityFingerprint{}, domain.NewError(domain.CodeCapabilityUnavailable, "linux_target.probe", "template.runtime", "requested container runtime is not reported as available on a Linux engine", nil)
+	}
+	runtimeCapability, _ := domain.NewCapability(domain.CapabilitySupported, map[string]string{
+		"api_version":               capabilities.APIVersion,
+		"cgroup_identity_authority": dockercli.ContainerCgroupIdentityAuthority(),
+		"cgroup_version":            capabilities.CgroupVersion,
+	}, map[string]string{"runtime_version": capabilities.Version})
+	visibilityFacts := dockercli.RestrictedNamespaceFacts(capabilities.SecurityOptions)
+	for name, value := range map[string]string{
+		"runtime": template.Runtime, "sibling": "true", "arbitrary_exec": "true", "bounded_transfer": "true",
 		"ptrace": strconv.FormatBool(d.build.AllowPtrace),
-	}, nil)
+	} {
+		visibilityFacts[name] = value
+	}
+	visibility, _ := domain.NewCapability(domain.CapabilitySupported, visibilityFacts, nil)
 	return domain.NewCapabilityFingerprint(map[string]domain.Capability{"target.linux-container": runtimeCapability, "target.visibility-first": visibility}, map[string]string{"os": capabilities.OSType})
 }
 
@@ -195,6 +216,13 @@ func (d *Driver) Create(ctx context.Context, input ports.TargetPlan) (ports.Targ
 		if !exists || existingKey != key {
 			return ports.TargetResult{}, domain.NewError(domain.CodeConflict, "linux_target.create", "idempotency_key", "was used for a different target generation", nil)
 		}
+		samePlan, compareErr := sameTargetPlanIdentity(record.input, input)
+		if compareErr != nil {
+			return ports.TargetResult{}, domain.NewError(domain.CodeInternal, "linux_target.create", "idempotency_key", "could not compare the existing and requested target plans", compareErr)
+		}
+		if !samePlan {
+			return ports.TargetResult{}, domain.NewError(domain.CodeConflict, "linux_target.create", "idempotency_key", "was reused with a different target plan", nil)
+		}
 		return ports.TargetResult{Status: record.status, Created: false}, nil
 	}
 	if _, exists := d.targets[key]; exists {
@@ -205,17 +233,16 @@ func (d *Driver) Create(ctx context.Context, input ports.TargetPlan) (ports.Targ
 	if err := prepareTargetDirectories(d.build.TargetRoot, plan); err != nil {
 		return ports.TargetResult{}, domain.NewError(domain.CodeUnavailable, "linux_target.create", "target_directory", "could not create target directory", err)
 	}
-	runtimeID, state, err := d.createRuntime(ctx, plan)
+	runtimeID, state, created, err := d.resumeOrCreateRuntime(ctx, plan)
 	if err != nil {
-		_ = removeTargetDirectory(d.build.TargetRoot, plan.TargetDirectory)
-		return ports.TargetResult{}, err
+		return ports.TargetResult{}, errors.Join(err, d.cleanupFailedRuntime(runtimeID, plan.TargetDirectory))
 	}
 	status := ports.TargetStatus{TargetID: plan.TargetID, Generation: plan.Generation, Kind: domain.TargetLinuxContainer, State: domain.TargetGenerationReady, Ready: true, RuntimeID: runtimeID, CgroupID: state.CgroupID, ObservedAt: d.now().UTC()}
 	d.mu.Lock()
 	d.targets[key] = targetRecord{input: input, plan: plan, runtimeID: runtimeID, status: status}
 	d.idempotency[input.IdempotencyKey] = key
 	d.mu.Unlock()
-	return ports.TargetResult{Status: status, Created: true}, nil
+	return ports.TargetResult{Status: status, Created: created}, nil
 }
 
 func (d *Driver) createRuntime(ctx context.Context, plan ContainerPlan) (string, RuntimeState, error) {
@@ -223,29 +250,99 @@ func (d *Driver) createRuntime(ctx context.Context, plan ContainerPlan) (string,
 	if err != nil {
 		return "", RuntimeState{}, domain.NewError(domain.CodeUnavailable, "linux_target.create", "runtime.create", "container create failed", err)
 	}
+	if err := dockercli.RequireCanonicalContainerID(runtimeID); err != nil {
+		return runtimeID, RuntimeState{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.create", "runtime_id", "container create returned a non-canonical runtime identity", err)
+	}
+	created, err := d.runtime.Inspect(ctx, runtimeID)
+	if err != nil {
+		return runtimeID, RuntimeState{}, domain.NewError(domain.CodeFailedPrecondition, "linux_target.create", "runtime.inspect", "created target container could not be inspected before start", err)
+	}
+	if err := requireExactRuntimeID(created, runtimeID, "linux_target.create"); err != nil {
+		return runtimeID, RuntimeState{}, err
+	}
+	if err := validateRuntimeIdentity(created, plan); err != nil {
+		return runtimeID, RuntimeState{}, err
+	}
+	if err := requireStoppedRuntimeState(created, "linux_target.create", dockercli.StoppedStatusCreated); err != nil {
+		return runtimeID, RuntimeState{}, err
+	}
 	if err := d.runtime.Start(ctx, runtimeID); err != nil {
-		d.cleanupRuntime(runtimeID)
-		return "", RuntimeState{}, domain.NewError(domain.CodeUnavailable, "linux_target.create", "runtime.start", "container start failed", err)
+		return runtimeID, RuntimeState{}, domain.NewError(domain.CodeUnavailable, "linux_target.create", "runtime.start", "container start failed", err)
 	}
 	state, err := d.runtime.Inspect(ctx, runtimeID)
-	if err != nil || !state.Running {
-		d.cleanupRuntime(runtimeID)
-		return "", RuntimeState{}, domain.NewError(domain.CodeFailedPrecondition, "linux_target.create", "readiness", "target container did not become running", err)
+	if err != nil {
+		return runtimeID, RuntimeState{}, domain.NewError(domain.CodeFailedPrecondition, "linux_target.create", "readiness", "target container did not become running", err)
+	}
+	if err := requireExactRuntimeID(state, runtimeID, "linux_target.create"); err != nil {
+		return runtimeID, RuntimeState{}, err
 	}
 	if err := validateRuntimeIdentity(state, plan); err != nil {
-		d.cleanupRuntime(runtimeID)
-		return "", RuntimeState{}, err
+		return runtimeID, RuntimeState{}, err
+	}
+	if err := requireLiveRuntimeState(state, "linux_target.create"); err != nil {
+		return runtimeID, RuntimeState{}, err
+	}
+	if err := d.requireGuestReadiness(ctx, runtimeID, plan); err != nil {
+		return runtimeID, RuntimeState{}, domain.NewError(domain.CodeFailedPrecondition, "linux_target.create", "guest_readiness", "world-guest self-test failed", err)
 	}
 	return runtimeID, state, nil
 }
 
-func (d *Driver) cleanupRuntime(id string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func requireExactRuntimeID(state RuntimeState, expected, operation string) error {
+	if state.ID != expected {
+		return domain.NewError(domain.CodeIntegrityViolation, operation, "runtime_id", "runtime inspect returned a different container", nil)
+	}
+	return nil
+}
+
+func requireLiveRuntimeState(state RuntimeState, operation string) error {
+	if err := dockercli.RequireExactRunningState(state.Running, state.Paused, state.Restarting, state.Dead, state.Status); err != nil {
+		return domain.NewError(domain.CodeFailedPrecondition, operation, "runtime_state", "target runtime is not in the exact running state", err)
+	}
+	return nil
+}
+
+func requireStoppedRuntimeState(state RuntimeState, operation string, allowedStatuses ...string) error {
+	if err := dockercli.RequireExactStoppedState(state.Running, state.Paused, state.Restarting, state.Dead, state.Status, allowedStatuses...); err != nil {
+		return domain.NewError(domain.CodeFailedPrecondition, operation, "runtime_state", "target runtime is not in an allowed exact stopped state", err)
+	}
+	return nil
+}
+
+func requireCoherentRuntimeState(state RuntimeState, operation string) error {
+	if state.Running {
+		return requireLiveRuntimeState(state, operation)
+	}
+	return requireStoppedRuntimeState(state, operation, dockercli.StoppedStatusCreated, dockercli.StoppedStatusExited)
+}
+
+func (d *Driver) cleanupFailedRuntime(id, directory string) error {
+	if id == "" {
+		// A failed Create did not transfer physical ownership to this call. Keep
+		// the directory: a colliding runtime may already depend on its bind mounts,
+		// and an exact retry can safely reuse the managed path.
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), targetCleanupGrace)
 	defer cancel()
-	_ = d.runtime.Remove(ctx, id)
+	if err := d.runtime.Remove(ctx, id); err != nil {
+		// Keep the managed directory while a runtime still refers to its bind
+		// mounts. Reconciliation can then identify and remove the orphan.
+		return domain.NewError(domain.CodeUnavailable, "linux_target.cleanup_failed_runtime", "runtime.remove", "could not remove failed target runtime", err)
+	}
+	if err := removeTargetDirectory(d.build.TargetRoot, directory); err != nil {
+		return domain.NewError(domain.CodeUnavailable, "linux_target.cleanup_failed_runtime", "target_directory", "could not remove failed target directory", err)
+	}
+	return nil
 }
 
 func (d *Driver) PrepareRun(ctx context.Context, input ports.TargetRunPlan) (ports.PreparedTargetRun, error) {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	return d.prepareRun(ctx, input, false)
+}
+
+func (d *Driver) prepareRun(ctx context.Context, input ports.TargetRunPlan, recovering bool) (ports.PreparedTargetRun, error) {
 	if err := ports.RequireDeadline(ctx, "linux_target.prepare_run"); err != nil {
 		return ports.PreparedTargetRun{}, err
 	}
@@ -271,6 +368,13 @@ func (d *Driver) PrepareRun(ctx context.Context, input ports.TargetRunPlan) (por
 		if !exists || existingKey != runKey {
 			return ports.PreparedTargetRun{}, domain.NewError(domain.CodeConflict, "linux_target.prepare_run", "idempotency_key", "was used for a different run", nil)
 		}
+		samePlan, compareErr := sameTargetRunPlanIdentity(run.plan, input)
+		if compareErr != nil {
+			return ports.PreparedTargetRun{}, domain.NewError(domain.CodeInternal, "linux_target.prepare_run", "idempotency_key", "could not compare the existing and requested run plans", compareErr)
+		}
+		if !samePlan {
+			return ports.PreparedTargetRun{}, domain.NewError(domain.CodeConflict, "linux_target.prepare_run", "idempotency_key", "was reused with a different run plan", nil)
+		}
 		return runevidence.ClonePrepared(run.prepared), nil
 	}
 	if _, exists := d.runs[runKey]; exists {
@@ -278,16 +382,29 @@ func (d *Driver) PrepareRun(ctx context.Context, input ports.TargetRunPlan) (por
 		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeAlreadyExists, "linux_target.prepare_run", "run", "run already prepared", nil)
 	}
 	d.mu.Unlock()
+	if !recovering && (!record.status.Ready || record.status.State != domain.TargetGenerationReady) {
+		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeInvalidState, "linux_target.prepare_run", "target", "target generation is not ready and must be reset before another run", nil)
+	}
+	if recovering {
+		if _, err := requireTargetGenerationRunClaim(record.plan.TargetDirectory, input); err != nil {
+			return ports.PreparedTargetRun{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.prepare_run", "run_claim", "durable target generation run claim is missing or identifies another run", err)
+		}
+	} else if _, _, err := claimTargetGenerationRun(record.plan.TargetDirectory, input); err != nil {
+		if errors.Is(err, errGenerationAlreadyClaimed) {
+			return ports.PreparedTargetRun{}, domain.NewError(domain.CodeFailedPrecondition, "linux_target.prepare_run", "target_generation", "target generation already belongs to a run and must be reset before reuse", err)
+		}
+		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeUnavailable, "linux_target.prepare_run", "run_claim", "could not durably claim the target generation for this run", err)
+	}
 	if err := d.ensureMaterialized(ctx, record, input.Material); err != nil {
 		return ports.PreparedTargetRun{}, err
 	}
 	directory := filepath.Join(record.plan.TargetDirectory, "runs", spec.ID.String())
-	if err := prepareManagedDirectory(d.build.TargetRoot, directory); err != nil {
-		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeUnavailable, "linux_target.prepare_run", "run_directory", "could not create independent run directory", err)
-	}
 	authority := RunAuthority{LeaseID: spec.LeaseID, TargetID: spec.TargetID, Generation: spec.TargetGeneration, RunID: spec.ID}
+	baseline, err := d.requireRunBaseline(ctx, record.plan, directory, authority, recovering)
+	if err != nil {
+		return ports.PreparedTargetRun{}, err
+	}
 	if _, err := io.ReadFull(d.random, authority.secret[:]); err != nil {
-		_ = removeManagedDirectory(d.build.TargetRoot, directory)
 		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeUnavailable, "linux_target.prepare_run", "credential", "could not create run credential", err)
 	}
 	preparedAt := runevidence.AtOrAfter(d.now(), spec.CreatedAt)
@@ -302,13 +419,61 @@ func (d *Driver) PrepareRun(ctx context.Context, input ports.TargetRunPlan) (por
 	currentTarget, exists := d.targets[targetKey(spec.TargetID, spec.TargetGeneration)]
 	if !exists || currentTarget.quarantine != nil {
 		d.mu.Unlock()
-		_ = removeManagedDirectory(d.build.TargetRoot, directory)
 		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeInvalidState, "linux_target.prepare_run", "target", "target generation was quarantined while material was prepared", nil)
 	}
-	d.runs[runKey] = &runRecord{plan: runevidence.ClonePlan(input), authority: authority, directory: directory, prepared: prepared, transports: make(map[*targetTransport]struct{})}
+	d.runs[runKey] = &runRecord{plan: runevidence.ClonePlan(input), authority: authority, directory: directory, baseline: baseline, prepared: prepared, transports: make(map[*targetTransport]struct{})}
 	d.idempotency[input.IdempotencyKey] = runKey
 	d.mu.Unlock()
 	return runevidence.ClonePrepared(prepared), nil
+}
+
+func (d *Driver) requireRunBaseline(ctx context.Context, plan ContainerPlan, directory string, authority RunAuthority, recovering bool) (workspacepkg.Manifest, error) {
+	baseline, loadErr := loadRunBaseline(directory)
+	if loadErr == nil {
+		if !recovering {
+			if _, started, err := loadRunStart(directory, authority); err != nil {
+				return workspacepkg.Manifest{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.prepare_run", "run_start", "durable run start record is invalid", err)
+			} else if started {
+				return workspacepkg.Manifest{}, domain.NewError(domain.CodeInvalidState, "linux_target.prepare_run", "run_start", "previously started run requires crash recovery and cannot be prepared again", nil)
+			}
+		}
+		current, err := scanTargetWritable(ctx, plan, d.now().UTC())
+		if err != nil {
+			return workspacepkg.Manifest{}, classifyTargetScanError("linux_target.prepare_run", err)
+		}
+		if !recovering {
+			changes, err := workspacepkg.Diff(baseline, current)
+			if err != nil || len(changes) != 0 {
+				return workspacepkg.Manifest{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.prepare_run", "run_baseline", "writable target changed after an incomplete preparation", err)
+			}
+		}
+		return baseline, nil
+	}
+	if !errors.Is(loadErr, fs.ErrNotExist) {
+		return workspacepkg.Manifest{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.prepare_run", "run_baseline", "durable writable-tree baseline is missing or invalid", loadErr)
+	}
+	if _, started, err := loadRunStart(directory, authority); err != nil {
+		return workspacepkg.Manifest{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.prepare_run", "run_start", "durable run start record is invalid", err)
+	} else if started {
+		code := domain.CodeInvalidState
+		message := "previously started run requires crash recovery and cannot be prepared again"
+		if recovering {
+			code = domain.CodeIntegrityViolation
+			message = "started interrupted run has no durable pre-execution baseline"
+		}
+		return workspacepkg.Manifest{}, domain.NewError(code, "linux_target.prepare_run", "run_baseline", message, nil)
+	}
+	baseline, err := scanTargetWritable(ctx, plan, d.now().UTC())
+	if err != nil {
+		return workspacepkg.Manifest{}, classifyTargetScanError("linux_target.prepare_run", err)
+	}
+	if err := prepareManagedDirectory(d.build.TargetRoot, directory); err != nil {
+		return workspacepkg.Manifest{}, domain.NewError(domain.CodeUnavailable, "linux_target.prepare_run", "run_directory", "could not create independent run directory", err)
+	}
+	if err := persistRunBaseline(directory, baseline); err != nil {
+		return workspacepkg.Manifest{}, domain.NewError(domain.CodeUnavailable, "linux_target.prepare_run", "run_baseline", "could not persist the writable-tree baseline", err)
+	}
+	return baseline, nil
 }
 
 func (d *Driver) StartRun(ctx context.Context, runID domain.TargetRunID) error {
@@ -319,7 +484,7 @@ func (d *Driver) StartRun(ctx context.Context, runID domain.TargetRunID) error {
 	if err != nil {
 		return err
 	}
-	if run.stopped || run.quarantined {
+	if run.stopped || run.quarantined || run.finishing || run.controlPlaneLost {
 		return domain.NewError(domain.CodeInvalidState, "linux_target.start_run", "run", "run was already stopped", nil)
 	}
 	if run.started {
@@ -331,15 +496,45 @@ func (d *Driver) StartRun(ctx context.Context, runID domain.TargetRunID) error {
 			return domain.NewError(domain.CodeFailedPrecondition, "linux_target.start_run", "collectors", "required external collectors are not ready", err)
 		}
 	}
+	d.lifecycleMu.Lock()
+	lifecycleLocked := true
+	defer func() {
+		if lifecycleLocked {
+			d.lifecycleMu.Unlock()
+		}
+	}()
+	d.mu.Lock()
+	current := d.runs[runID.String()]
+	if current == nil {
+		d.mu.Unlock()
+		return domain.NewError(domain.CodeNotFound, "linux_target.start_run", "run_id", "run was removed while awaiting collector readiness", nil)
+	}
+	if current.stopped || current.quarantined || current.finishing || current.controlPlaneLost {
+		d.mu.Unlock()
+		return domain.NewError(domain.CodeInvalidState, "linux_target.start_run", "run", "run stopped while awaiting collector readiness", nil)
+	}
+	if current.started {
+		d.mu.Unlock()
+		return nil
+	}
+	copy := *current
+	run = &copy
+	d.mu.Unlock()
 	target, err := d.requireTarget(run.authority.TargetID, run.authority.Generation)
 	if err != nil {
 		return err
+	}
+	if _, err := requireTargetGenerationRunClaim(target.plan.TargetDirectory, run.plan); err != nil {
+		return domain.NewError(domain.CodeIntegrityViolation, "linux_target.start_run", "run_claim", "durable target generation run claim is missing or invalid", err)
 	}
 	state, err := d.runtime.Inspect(ctx, target.runtimeID)
 	if err != nil {
 		return domain.NewError(domain.CodeUnavailable, "linux_target.start_run", "runtime", "could not inspect the prepared runtime", err)
 	}
-	if state.ID != target.runtimeID || !state.Running {
+	if err := requireExactRuntimeID(state, target.runtimeID, "linux_target.start_run"); err != nil {
+		return err
+	}
+	if err := requireLiveRuntimeState(state, "linux_target.start_run"); err != nil {
 		return domain.NewError(domain.CodeFailedPrecondition, "linux_target.start_run", "runtime", "prepared runtime identity is not running", nil)
 	}
 	if err := validateRuntimeIdentity(state, target.plan); err != nil {
@@ -362,13 +557,16 @@ func (d *Driver) StartRun(ctx context.Context, runID domain.TargetRunID) error {
 	if err != nil {
 		return domain.NewError(domain.CodeInternal, "linux_target.start_run", "evidence", "could not encode verified lifecycle evidence", err)
 	}
+	if err := persistRunStart(run.directory, run.authority, startedAt, target.runtimeID, state.CgroupID, run.plan.Run.Spec().MaterializationDigest); err != nil {
+		return domain.NewError(domain.CodeUnavailable, "linux_target.start_run", "run_start", "could not durably commit the target run start", err)
+	}
 	d.mu.Lock()
-	current := d.runs[runID.String()]
+	current = d.runs[runID.String()]
 	if current == nil {
 		d.mu.Unlock()
 		return domain.NewError(domain.CodeNotFound, "linux_target.start_run", "run_id", "run was removed while awaiting collector readiness", nil)
 	}
-	if current.stopped || current.quarantined {
+	if current.stopped || current.quarantined || current.finishing || current.controlPlaneLost {
 		d.mu.Unlock()
 		return domain.NewError(domain.CodeInvalidState, "linux_target.start_run", "run", "run stopped while awaiting collector readiness", nil)
 	}
@@ -388,6 +586,8 @@ func (d *Driver) StartRun(ctx context.Context, runID domain.TargetRunID) error {
 	})
 	duration := current.plan.MaximumDuration
 	d.mu.Unlock()
+	d.lifecycleMu.Unlock()
+	lifecycleLocked = false
 
 	// Construct the timer without holding d.mu: an injected deterministic timer
 	// is allowed to invoke an already-due callback synchronously. The stopped
@@ -413,7 +613,7 @@ func (d *Driver) OpenTransport(ctx context.Context, runID domain.TargetRunID) (p
 	if err != nil {
 		return nil, err
 	}
-	if !run.started || run.stopped || run.quarantined {
+	if !run.started || run.stopped || run.quarantined || run.finishing || run.controlPlaneLost {
 		return nil, domain.NewError(domain.CodeFailedPrecondition, "linux_target.open_transport", "run", "run is not active", nil)
 	}
 	target, err := d.requireTarget(run.authority.TargetID, run.authority.Generation)
@@ -440,7 +640,7 @@ func (d *Driver) OpenTransport(ctx context.Context, runID domain.TargetRunID) (p
 	d.mu.Lock()
 	current := d.runs[runID.String()]
 	currentTarget := d.targets[targetKey(run.authority.TargetID, run.authority.Generation)]
-	if current != nil && current.started && !current.stopped && !current.quarantined && currentTarget.quarantine == nil {
+	if current != nil && current.started && !current.stopped && !current.quarantined && !current.finishing && !current.controlPlaneLost && currentTarget.quarantine == nil {
 		current.transports[transport] = struct{}{}
 		d.appendLifecycleObservationLocked(current, ports.TargetRunObservation{
 			Kind: "target.transport.opened", ObservedAt: d.now().UTC(), Payload: openPayload,
@@ -462,12 +662,7 @@ func (d *Driver) StopRun(ctx context.Context, runID domain.TargetRunID, mode por
 	if run, err := d.requireRun(runID); err == nil && run.quarantined {
 		return ports.TargetRunStopReceipt{}, domain.NewError(domain.CodeInvalidState, "linux_target.stop_run", "run", "quarantined run state is preserved for evidence", nil)
 	}
-	result, transports, err := d.finishRun(runID, false, d.now().UTC())
-	if err != nil {
-		return ports.TargetRunStopReceipt{}, err
-	}
-	closeTargetTransports(transports)
-	return result, nil
+	return d.finishRun(ctx, runID, mode, false)
 }
 
 func (d *Driver) Quarantine(ctx context.Context, plan ports.TargetQuarantinePlan) (ports.TargetQuarantineEvidence, error) {
@@ -489,6 +684,9 @@ func (d *Driver) Quarantine(ctx context.Context, plan ports.TargetQuarantinePlan
 		if prior.plan != plan {
 			return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeConflict, "linux_target.quarantine", "idempotency_key", "was used for another quarantine", nil)
 		}
+		if err := d.drainQuarantinedTransports(ctx, plan.Target); err != nil {
+			return prior.evidence, err
+		}
 		return prior.evidence, nil
 	}
 	d.mu.Unlock()
@@ -497,28 +695,91 @@ func (d *Driver) Quarantine(ctx context.Context, plan ports.TargetQuarantinePlan
 		return ports.TargetQuarantineEvidence{}, err
 	}
 	if record.quarantine != nil {
-		evidence := *record.quarantine
-		d.mu.Lock()
-		if d.quarantines == nil {
-			d.quarantines = make(map[string]quarantineOutcome)
+		if record.quarantinePlan == nil || *record.quarantinePlan != plan {
+			return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeConflict, "linux_target.quarantine", "idempotency_key", "generation is already bound to another quarantine", nil)
 		}
-		d.quarantines[plan.IdempotencyKey] = quarantineOutcome{plan: plan, evidence: evidence}
-		d.mu.Unlock()
+		evidence := *record.quarantine
+		if err := d.drainQuarantinedTransports(ctx, plan.Target); err != nil {
+			return evidence, err
+		}
 		return evidence, nil
 	}
-	observed, err := containment.Quarantine(ctx, record.runtimeID)
+	intent, receipt, intentFound, receiptFound, err := loadQuarantineRecords(record.plan.TargetDirectory, d.build.TargetRoot, &record.plan)
 	if err != nil {
-		return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeUnavailable, "linux_target.quarantine", "runtime", "runtime containment failed", err)
+		return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.quarantine", "manifest", "durable quarantine state is invalid", err)
 	}
-	evidence := ports.TargetQuarantineEvidence{
-		Target: plan.Target, RuntimeID: observed.RuntimeID, ExecutionStopped: observed.ExecutionStopped,
-		NetworkUnreachable: observed.NetworkUnreachable, StatePreserved: observed.StatePreserved, ObservedAt: observed.ObservedAt,
+	if intentFound {
+		if intent.Plan != plan || intent.RuntimeID != record.runtimeID {
+			return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeConflict, "linux_target.quarantine", "idempotency_key", "generation is already bound to another quarantine", nil)
+		}
+	} else {
+		intent, err = newQuarantineIntent(plan, record)
+		if err != nil {
+			return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeInternal, "linux_target.quarantine", "intent", "could not construct durable quarantine authority", err)
+		}
+		if err := persistQuarantineIntent(record.plan.TargetDirectory, intent); err != nil {
+			code := domain.CodeUnavailable
+			message := "could not persist durable quarantine authority"
+			if errors.Is(err, errLifecycleRecordConflict) {
+				code, message = domain.CodeConflict, "generation is already bound to another quarantine"
+			}
+			return ports.TargetQuarantineEvidence{}, domain.NewError(code, "linux_target.quarantine", "intent", message, err)
+		}
 	}
-	if err := evidence.Validate(plan.Target); err != nil {
-		return ports.TargetQuarantineEvidence{}, err
-	}
-	if observed.RuntimeID != record.runtimeID {
-		return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.quarantine", "runtime_id", "runtime evidence identifies a different realization", nil)
+	var evidence ports.TargetQuarantineEvidence
+	if receiptFound {
+		state, inspectErr := d.runtime.Inspect(ctx, record.runtimeID)
+		if inspectErr != nil {
+			return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeUnavailable, "linux_target.quarantine", "runtime", "could not verify the quarantined runtime", inspectErr)
+		}
+		if err := validateRuntimeIdentity(state, record.plan); err != nil {
+			return ports.TargetQuarantineEvidence{}, err
+		}
+		if state.Running {
+			// Re-establish safety but do not silently accept a runtime which escaped
+			// a previously evidenced quarantine boundary.
+			_, containErr := containment.Quarantine(ctx, record.runtimeID)
+			return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.quarantine", "runtime", "durably quarantined runtime was observed running", containErr)
+		}
+		if err := requireStoppedRuntimeState(state, "linux_target.quarantine", dockercli.StoppedStatusExited); err != nil {
+			return ports.TargetQuarantineEvidence{}, err
+		}
+		evidence = receipt.Evidence
+	} else {
+		observed, containErr := containment.Quarantine(ctx, record.runtimeID)
+		if containErr != nil {
+			return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeUnavailable, "linux_target.quarantine", "runtime", "runtime containment failed", containErr)
+		}
+		evidence = ports.TargetQuarantineEvidence{
+			Target: plan.Target, RuntimeID: observed.RuntimeID, ExecutionStopped: observed.ExecutionStopped,
+			NetworkUnreachable: observed.NetworkUnreachable, StatePreserved: observed.StatePreserved, ObservedAt: observed.ObservedAt.UTC(),
+		}
+		if err := evidence.Validate(plan.Target); err != nil {
+			return ports.TargetQuarantineEvidence{}, err
+		}
+		if observed.RuntimeID != record.runtimeID {
+			return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.quarantine", "runtime_id", "runtime evidence identifies a different realization", nil)
+		}
+		state, inspectErr := d.runtime.Inspect(ctx, record.runtimeID)
+		if inspectErr != nil {
+			return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeUnavailable, "linux_target.quarantine", "runtime.inspect", "could not verify the contained target runtime", inspectErr)
+		}
+		if err := requireExactRuntimeID(state, record.runtimeID, "linux_target.quarantine"); err != nil {
+			return ports.TargetQuarantineEvidence{}, err
+		}
+		if err := validateRuntimeIdentity(state, record.plan); err != nil {
+			return ports.TargetQuarantineEvidence{}, err
+		}
+		if err := requireStoppedRuntimeState(state, "linux_target.quarantine", dockercli.StoppedStatusExited); err != nil {
+			return ports.TargetQuarantineEvidence{}, err
+		}
+		receipt, err = newQuarantineReceipt(intent, evidence)
+		if err != nil {
+			return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeInternal, "linux_target.quarantine", "receipt", "could not construct quarantine evidence receipt", err)
+		}
+		if err := persistQuarantineReceipt(record.plan.TargetDirectory, receipt); err != nil {
+			return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeUnavailable, "linux_target.quarantine", "receipt", "runtime is contained but its durable evidence receipt could not be committed", err)
+		}
 	}
 	d.mu.Lock()
 	current, found := d.targets[targetKey(plan.Target.ID, plan.Target.Generation)]
@@ -529,13 +790,14 @@ func (d *Driver) Quarantine(ctx context.Context, plan ports.TargetQuarantinePlan
 	current.status.State = domain.TargetGenerationQuarantined
 	current.status.Ready = false
 	current.status.ObservedAt = evidence.ObservedAt
+	storedPlan := plan
+	current.quarantinePlan = &storedPlan
 	current.quarantine = &evidence
 	d.targets[targetKey(plan.Target.ID, plan.Target.Generation)] = current
 	if d.quarantines == nil {
 		d.quarantines = make(map[string]quarantineOutcome)
 	}
 	d.quarantines[plan.IdempotencyKey] = quarantineOutcome{plan: plan, evidence: evidence}
-	transports := make([]*targetTransport, 0)
 	for _, run := range d.runs {
 		if run.authority.TargetID != plan.Target.ID || run.authority.Generation != plan.Target.Generation {
 			continue
@@ -545,54 +807,153 @@ func (d *Driver) Quarantine(ctx context.Context, plan ports.TargetQuarantinePlan
 			run.timer.Stop()
 			run.timer = nil
 		}
+	}
+	d.mu.Unlock()
+	if err := d.drainQuarantinedTransports(ctx, plan.Target); err != nil {
+		return evidence, err
+	}
+	return evidence, nil
+}
+
+func (d *Driver) drainQuarantinedTransports(ctx context.Context, ref ports.TargetRef) error {
+	d.mu.Lock()
+	transports := make([]*targetTransport, 0)
+	for _, run := range d.runs {
+		if run.authority.TargetID != ref.ID || run.authority.Generation != ref.Generation {
+			continue
+		}
 		for transport := range run.transports {
 			transport.revoke()
 			transports = append(transports, transport)
 		}
-		run.transports = nil
 	}
 	d.mu.Unlock()
-	closeTargetTransports(transports)
-	return evidence, nil
+	if err := closeTargetTransports(ctx, transports); err != nil {
+		return domain.NewError(domain.CodeUnavailable, "linux_target.quarantine", "transport_cleanup", "target was contained but scoped transports could not be fully drained", err)
+	}
+	d.mu.Lock()
+	for _, run := range d.runs {
+		if run.authority.TargetID == ref.ID && run.authority.Generation == ref.Generation {
+			run.transports = nil
+		}
+	}
+	d.mu.Unlock()
+	return nil
 }
 
 func (d *Driver) expireRun(runID domain.TargetRunID) {
-	result, transports, err := d.finishRun(runID, true, d.now().UTC())
-	if err != nil || result.RunID.IsZero() {
-		return
-	}
-	closeTargetTransports(transports)
+	ctx, cancel := context.WithTimeout(context.Background(), targetCleanupGrace)
+	defer cancel()
+	_, _ = d.finishRun(ctx, runID, ports.StopForce, true)
 }
 
-func (d *Driver) finishRun(runID domain.TargetRunID, limitExceeded bool, stoppedAt time.Time) (ports.TargetRunStopReceipt, []*targetTransport, error) {
+func (d *Driver) finishRun(ctx context.Context, runID domain.TargetRunID, mode ports.StopMode, limitExceeded bool) (ports.TargetRunStopReceipt, error) {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	current := d.runs[runID.String()]
 	if current == nil {
-		return ports.TargetRunStopReceipt{}, nil, domain.NewError(domain.CodeNotFound, "linux_target.stop_run", "run_id", "run is not prepared by this driver", nil)
+		d.mu.Unlock()
+		return ports.TargetRunStopReceipt{}, domain.NewError(domain.CodeNotFound, "linux_target.stop_run", "run_id", "run is not prepared by this driver", nil)
 	}
 	if current.stopped {
-		return runevidence.CloneStopReceipt(*current.result), nil, nil
+		result := runevidence.CloneStopReceipt(*current.result)
+		d.mu.Unlock()
+		return result, nil
 	}
-	if _, found := d.targets[targetKey(current.authority.TargetID, current.authority.Generation)]; !found {
-		return ports.TargetRunStopReceipt{}, nil, domain.NewError(domain.CodeFailedPrecondition, "linux_target.stop_run", "target", "target generation disappeared before run evidence was sealed", nil)
+	if current.quarantined {
+		d.mu.Unlock()
+		return ports.TargetRunStopReceipt{}, domain.NewError(domain.CodeInvalidState, "linux_target.stop_run", "run", "quarantined run state is preserved for evidence", nil)
 	}
-	minimumStop := current.prepared.PreparedAt
-	if current.started {
-		minimumStop = current.startedAt
+	target, found := d.targets[targetKey(current.authority.TargetID, current.authority.Generation)]
+	if !found {
+		d.mu.Unlock()
+		return ports.TargetRunStopReceipt{}, domain.NewError(domain.CodeFailedPrecondition, "linux_target.stop_run", "target", "target generation disappeared before run evidence was sealed", nil)
+	}
+	current.finishing = true
+	current.durationExceeded = current.durationExceeded || limitExceeded
+	if current.timer != nil {
+		current.timer.Stop()
+		current.timer = nil
+	}
+	transports := make([]*targetTransport, 0, len(current.transports))
+	for transport := range current.transports {
+		transport.revoke()
+		transports = append(transports, transport)
+	}
+	baseline := current.baseline
+	minimumBoundary := current.prepared.PreparedAt
+	if current.started || current.controlPlaneLost && !current.startedAt.IsZero() {
+		minimumBoundary = current.startedAt
+	}
+	if count := len(current.observations); count > 0 && current.observations[count-1].ObservedAt.After(minimumBoundary) {
+		minimumBoundary = current.observations[count-1].ObservedAt
+	}
+	runSnapshot := *current
+	d.mu.Unlock()
+
+	// Revocation happens while holding d.mu, but transport cleanup may wait for
+	// an uncooperative guest. Establish the exact container boundary first so a
+	// detached process cannot keep executing while those best-effort handles are
+	// drained. Once that boundary is proven, it is also the stronger cleanup
+	// authority: a missing per-exec terminal cannot contradict Docker's proof
+	// that the complete container process domain is stopped.
+	boundary, boundaryErr := d.requireStoppedRunBoundary(ctx, target, &runSnapshot, mode, minimumBoundary)
+	transportErr := closeTargetTransports(ctx, transports)
+	if boundaryErr != nil {
+		if transportErr != nil {
+			transportErr = domain.NewError(domain.CodeUnavailable, "linux_target.stop_run", "transport_cleanup", "could not drain every scoped target transport", transportErr)
+		}
+		return ports.TargetRunStopReceipt{}, errors.Join(transportErr, boundaryErr)
+	}
+	sealedAt := runevidence.AtOrAfter(d.now(), boundary.StoppedAt)
+	after, err := scanTargetWritable(ctx, target.plan, sealedAt)
+	if err != nil {
+		return ports.TargetRunStopReceipt{}, classifyTargetScanError("linux_target.stop_run", err)
+	}
+	if err := d.requireOwnedRuntimeStillStopped(ctx, target); err != nil {
+		return ports.TargetRunStopReceipt{}, err
+	}
+	changeEntries, err := workspacepkg.DomainChanges(baseline, after)
+	if err != nil {
+		return ports.TargetRunStopReceipt{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.stop_run", "target_changes", "could not derive the authoritative target change manifest", err)
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	current = d.runs[runID.String()]
+	if current == nil || current.stopped {
+		if current != nil && current.result != nil {
+			return runevidence.CloneStopReceipt(*current.result), nil
+		}
+		return ports.TargetRunStopReceipt{}, domain.NewError(domain.CodeNotFound, "linux_target.stop_run", "run_id", "run disappeared while evidence was being sealed", nil)
+	}
+	minimumStop := boundary.StoppedAt
+	if current.prepared.PreparedAt.After(minimumStop) {
+		minimumStop = current.prepared.PreparedAt
+	}
+	if current.started || current.controlPlaneLost {
+		if current.startedAt.After(minimumStop) {
+			minimumStop = current.startedAt
+		}
 	}
 	if count := len(current.observations); count > 0 && current.observations[count-1].ObservedAt.After(minimumStop) {
 		minimumStop = current.observations[count-1].ObservedAt
 	}
-	stoppedAt = runevidence.AtOrAfter(stoppedAt, minimumStop)
+	stoppedAt := runevidence.AtOrAfter(d.now(), minimumStop)
 	outcome := ports.RunCompleted
 	failureKind := ports.TargetRunFailureNone
 	stopKind := "target.run.stopped"
-	if !current.started {
+	if current.interruptedExecution {
+		outcome = ports.RunFailed
+		failureKind = ports.TargetRunFailureTarget
+		stopKind = "target.run.control-plane-failure"
+	} else if !current.started {
 		outcome = ports.RunFailed
 		failureKind = ports.TargetRunFailureNeverStarted
 		stopKind = "target.run.never-started"
-	} else if limitExceeded {
+	} else if current.durationExceeded {
 		outcome = ports.RunFailed
 		failureKind = ports.TargetRunFailureDurationExceeded
 		stopKind = "target.run.duration-exceeded"
@@ -601,13 +962,13 @@ func (d *Driver) finishRun(runID domain.TargetRunID, limitExceeded bool, stopped
 		FailureKind ports.TargetRunFailureKind `json:"failure_kind,omitempty"`
 	}{FailureKind: failureKind})
 	if err != nil {
-		return ports.TargetRunStopReceipt{}, nil, domain.NewError(domain.CodeInternal, "linux_target.stop_run", "evidence", "could not encode stop observation", err)
+		return ports.TargetRunStopReceipt{}, domain.NewError(domain.CodeInternal, "linux_target.stop_run", "evidence", "could not encode stop observation", err)
 	}
 	observations := append([]ports.TargetRunObservation(nil), current.observations...)
 	observations = append(observations, ports.TargetRunObservation{Kind: stopKind, ObservedAt: stoppedAt, Payload: stopPayload})
-	changes, err := domain.NewChangeSet(domain.ChangeScopeTarget, nil, domain.InitialRevision, stoppedAt)
+	changes, err := domain.NewChangeSet(domain.ChangeScopeTarget, changeEntries, domain.InitialRevision, stoppedAt)
 	if err != nil {
-		return ports.TargetRunStopReceipt{}, nil, err
+		return ports.TargetRunStopReceipt{}, err
 	}
 	result := ports.TargetRunStopReceipt{
 		RunID: current.plan.Run.ID(), Outcome: outcome, FailureKind: failureKind,
@@ -615,31 +976,25 @@ func (d *Driver) finishRun(runID domain.TargetRunID, limitExceeded bool, stopped
 		Observations: observations, TargetChanges: changes,
 	}
 	if err := result.Validate(); err != nil {
-		return ports.TargetRunStopReceipt{}, nil, err
-	}
-	if current.timer != nil {
-		current.timer.Stop()
-		current.timer = nil
+		return ports.TargetRunStopReceipt{}, err
 	}
 	current.stopped = true
 	stored := runevidence.CloneStopReceipt(result)
 	current.result = &stored
-	transports := make([]*targetTransport, 0, len(current.transports))
-	for transport := range current.transports {
-		// Revoke synchronously with the state transition. Potentially blocking
-		// resource closes happen after releasing the driver lock, but no new
-		// operation may cross the deadline once finishRun returns.
-		transport.revoke()
-		transports = append(transports, transport)
-	}
 	current.transports = nil
-	return runevidence.CloneStopReceipt(result), transports, nil
+	return runevidence.CloneStopReceipt(result), nil
 }
 
-func closeTargetTransports(transports []*targetTransport) {
+func closeTargetTransports(ctx context.Context, transports []*targetTransport) error {
+	bounded, cancel := context.WithTimeout(ctx, targetCleanupGrace)
+	defer cancel()
+	errs := make([]error, 0)
 	for _, transport := range transports {
-		_ = transport.Close()
+		if err := transport.closeContext(bounded); err != nil {
+			errs = append(errs, err)
+		}
 	}
+	return errors.Join(errs...)
 }
 
 func requiredExternalRequirements(collectors []ports.CollectorSpec) []ports.ObservationRequirement {
@@ -656,7 +1011,7 @@ func (d *Driver) recordLifecycleObservation(runID domain.TargetRunID, observatio
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	run := d.runs[runID.String()]
-	if run == nil || !run.started || run.stopped || run.quarantined {
+	if run == nil || !run.started || run.stopped || run.quarantined || run.finishing || run.controlPlaneLost {
 		return io.ErrClosedPipe
 	}
 	d.appendLifecycleObservationLocked(run, observation)
@@ -700,6 +1055,11 @@ func (d *Driver) Reset(ctx context.Context, targetID domain.TargetID, reset port
 	if reset.Mode == ports.ResetSnapshot {
 		return ports.TargetResult{}, domain.NewError(domain.CodeCapabilityUnavailable, "linux_target.reset", "mode", "snapshot reset is not supported by this runtime", nil)
 	}
+	if result, outcomeErr, found, err := d.replayDurableReset(targetID, reset); err != nil {
+		return ports.TargetResult{}, err
+	} else if found {
+		return result, outcomeErr
+	}
 	previous, err := d.requireTarget(targetID, reset.Previous.Generation)
 	if err != nil {
 		return ports.TargetResult{}, err
@@ -713,43 +1073,38 @@ func (d *Driver) Reset(ctx context.Context, targetID domain.TargetID, reset port
 	if d.hasUnstoppedRun(targetID, reset.Previous.Generation) {
 		return ports.TargetResult{}, domain.NewError(domain.CodeFailedPrecondition, "linux_target.reset", "run", "all prepared runs must be stopped before reset", nil)
 	}
-	next := previous.plan
-	next.Generation = reset.NextGeneration
-	next.Name = targetContainerName(targetID, reset.NextGeneration)
-	next.TargetDirectory = filepath.Join(d.build.TargetRoot, targetID.String(), "generations", strconv.FormatUint(uint64(reset.NextGeneration), 10))
-	next.MountSources = []string{next.writableRoot(), next.materialRoot()}
-	next.Labels = cloneStrings(previous.plan.Labels)
-	next.Labels["world.target-generation"] = strconv.FormatUint(uint64(reset.NextGeneration), 10)
-	if err := setPlanDigest(&next); err != nil {
-		return ports.TargetResult{}, err
-	}
-	if err := next.Validate(d.build.TargetRoot); err != nil {
+	next, err := replacementContainerPlan(previous.plan, reset.NextGeneration, d.build.TargetRoot)
+	if err != nil {
 		return ports.TargetResult{}, err
 	}
 	if err := prepareTargetDirectories(d.build.TargetRoot, next); err != nil {
 		return ports.TargetResult{}, err
 	}
+	intent, err := newResetIntent(reset, previous, next)
+	if err != nil {
+		return ports.TargetResult{}, domain.NewError(domain.CodeInternal, "linux_target.reset", "intent", "could not construct durable reset authority", err)
+	}
+	if err := persistResetIntent(next.TargetDirectory, intent); err != nil {
+		code := domain.CodeUnavailable
+		message := "could not persist durable reset authority"
+		if errors.Is(err, errLifecycleRecordConflict) {
+			code, message = domain.CodeConflict, "generation is already bound to a different reset"
+		}
+		return ports.TargetResult{}, domain.NewError(code, "linux_target.reset", "intent", message+": "+err.Error(), err)
+	}
 	runtimeID, state, err := d.createRuntime(ctx, next)
 	if err != nil {
-		_ = removeTargetDirectory(d.build.TargetRoot, next.TargetDirectory)
-		return ports.TargetResult{}, err
+		return ports.TargetResult{}, errors.Join(err, d.cleanupFailedRuntime(runtimeID, next.TargetDirectory))
 	}
-	cleanupNext := true
-	defer func() {
-		if cleanupNext {
-			d.cleanupRuntime(runtimeID)
-			_ = removeTargetDirectory(d.build.TargetRoot, next.TargetDirectory)
-		}
-	}()
-	if err := d.runtime.Stop(ctx, previous.runtimeID, ports.StopForce); err != nil {
-		return ports.TargetResult{}, domain.NewError(domain.CodeUnavailable, "linux_target.reset", "runtime.stop", "could not stop previous target", err)
+	if _, err := d.requireOwnedRuntimeStopped(ctx, previous, ports.StopForce); err != nil {
+		cause := domain.NewError(domain.CodeUnavailable, "linux_target.reset", "runtime.stop", "could not prove the previous target stopped", err)
+		return ports.TargetResult{}, errors.Join(cause, d.cleanupFailedRuntime(runtimeID, next.TargetDirectory))
 	}
 	if err := d.runtime.Remove(ctx, previous.runtimeID); err != nil {
-		// The previous container still exists after a failed remove. Restore its
-		// ready state when possible before returning, while the proven next
-		// generation is discarded by the deferred cleanup.
-		_ = d.runtime.Start(ctx, previous.runtimeID)
-		return ports.TargetResult{}, domain.NewError(domain.CodeUnavailable, "linux_target.reset", "runtime.remove", "could not remove previous target", err)
+		// The previous consumed generation remains stopped after a failed remove.
+		// Restarting it would reopen execution authority across the run boundary.
+		cause := domain.NewError(domain.CodeUnavailable, "linux_target.reset", "runtime.remove", "could not remove previous target", err)
+		return ports.TargetResult{}, errors.Join(cause, d.cleanupFailedRuntime(runtimeID, next.TargetDirectory))
 	}
 	if err := removeTargetDirectory(d.build.TargetRoot, previous.plan.TargetDirectory); err != nil {
 		// The old runtime is already gone, so retain the ready replacement and
@@ -758,15 +1113,70 @@ func (d *Driver) Reset(ctx context.Context, targetID domain.TargetID, reset port
 		status := ports.TargetStatus{TargetID: targetID, Generation: reset.NextGeneration, Kind: domain.TargetLinuxContainer, State: domain.TargetGenerationReady, Ready: true, RuntimeID: runtimeID, CgroupID: state.CgroupID, ObservedAt: d.now().UTC()}
 		result := ports.TargetResult{Status: status, Created: true}
 		outcomeErr := domain.NewError(domain.CodeUnavailable, "linux_target.reset", "cleanup", "replacement is ready but the retired target directory could not be removed", err)
+		if err := d.persistResetOutcome(intent, result, outcomeErr); err != nil {
+			outcomeErr = domain.NewError(domain.CodeUnavailable, "linux_target.reset", "receipt", "replacement is ready but its durable reset receipt could not be committed", err)
+		}
 		d.commitReset(previous, next, runtimeID, status, targetID, reset, result, outcomeErr)
-		cleanupNext = false
 		return result, outcomeErr
 	}
 	status := ports.TargetStatus{TargetID: targetID, Generation: reset.NextGeneration, Kind: domain.TargetLinuxContainer, State: domain.TargetGenerationReady, Ready: true, RuntimeID: runtimeID, CgroupID: state.CgroupID, ObservedAt: d.now().UTC()}
 	result := ports.TargetResult{Status: status, Created: true}
+	if err := d.persistResetOutcome(intent, result, nil); err != nil {
+		outcomeErr := domain.NewError(domain.CodeUnavailable, "linux_target.reset", "receipt", "replacement is ready but its durable reset receipt could not be committed", err)
+		d.commitReset(previous, next, runtimeID, status, targetID, reset, result, outcomeErr)
+		return result, outcomeErr
+	}
 	d.commitReset(previous, next, runtimeID, status, targetID, reset, result, nil)
-	cleanupNext = false
 	return result, nil
+}
+
+func (d *Driver) replayDurableReset(targetID domain.TargetID, reset ports.ResetPlan) (ports.TargetResult, error, bool, error) {
+	directory := targetDirectory(d.build.TargetRoot, ports.TargetRef{ID: targetID, Generation: reset.NextGeneration})
+	intent, receipt, intentFound, receiptFound, err := loadResetRecords(directory, d.build.TargetRoot, nil)
+	if err != nil {
+		return ports.TargetResult{}, nil, false, domain.NewError(domain.CodeIntegrityViolation, "linux_target.reset", "receipt", "durable reset state is invalid", err)
+	}
+	if !intentFound {
+		return ports.TargetResult{}, nil, false, nil
+	}
+	durablePlan, planErr := intent.Reset.plan()
+	if planErr != nil {
+		return ports.TargetResult{}, nil, false, domain.NewError(domain.CodeIntegrityViolation, "linux_target.reset", "intent", "durable reset plan is invalid", planErr)
+	}
+	if durablePlan != reset || targetID != durablePlan.Previous.ID {
+		return ports.TargetResult{}, nil, false, domain.NewError(domain.CodeConflict, "linux_target.reset", "idempotency_key", "generation is already bound to a different reset", nil)
+	}
+	if !receiptFound {
+		d.mu.Lock()
+		_, previousStillOwned := d.targets[targetKey(targetID, reset.Previous.Generation)]
+		d.mu.Unlock()
+		if previousStillOwned {
+			return ports.TargetResult{}, nil, false, nil
+		}
+		return ports.TargetResult{}, nil, false, domain.NewError(domain.CodeFailedPrecondition, "linux_target.reset", "receipt", "durable reset has not been reconciled to a completed physical outcome", nil)
+	}
+	outcome := receipt.outcome(intent)
+	d.mu.Lock()
+	record, adopted := d.targets[targetKey(targetID, reset.NextGeneration)]
+	if adopted && record.runtimeID == outcome.result.Status.RuntimeID {
+		copy := outcome
+		record.reset = &copy
+		d.targets[targetKey(targetID, reset.NextGeneration)] = record
+		d.resetResults[reset.IdempotencyKey] = outcome
+	}
+	d.mu.Unlock()
+	if !adopted || record.runtimeID != outcome.result.Status.RuntimeID {
+		return ports.TargetResult{}, nil, false, domain.NewError(domain.CodeFailedPrecondition, "linux_target.reset", "adoption", "durable reset outcome must be adopted by reconciliation before replay", nil)
+	}
+	return outcome.result, outcome.err, true, nil
+}
+
+func (d *Driver) persistResetOutcome(intent persistedResetIntent, result ports.TargetResult, outcomeErr error) error {
+	receipt, err := newResetReceipt(intent, result, outcomeErr)
+	if err != nil {
+		return err
+	}
+	return persistResetReceipt(intent.NextPlan.TargetDirectory, receipt)
 }
 
 func (d *Driver) commitReset(previous targetRecord, next ContainerPlan, runtimeID string, status ports.TargetStatus, targetID domain.TargetID, reset ports.ResetPlan, result ports.TargetResult, outcomeErr error) {
@@ -780,8 +1190,9 @@ func (d *Driver) commitReset(previous targetRecord, next ContainerPlan, runtimeI
 	}
 	delete(d.materialized, targetKey(previous.plan.TargetID, previous.plan.Generation))
 	delete(d.targets, targetKey(previous.plan.TargetID, previous.plan.Generation))
-	d.targets[targetKey(previous.plan.TargetID, next.Generation)] = targetRecord{input: previous.input, plan: next, runtimeID: runtimeID, status: status}
-	d.resetResults[reset.IdempotencyKey] = resetOutcome{targetID: targetID, plan: reset, result: result, err: outcomeErr}
+	outcome := resetOutcome{targetID: targetID, plan: reset, result: result, err: outcomeErr}
+	d.targets[targetKey(previous.plan.TargetID, next.Generation)] = targetRecord{input: previous.input, plan: next, runtimeID: runtimeID, status: status, reset: &outcome}
+	d.resetResults[reset.IdempotencyKey] = outcome
 }
 
 func (d *Driver) Destroy(ctx context.Context, ref ports.TargetRef) error {
@@ -794,7 +1205,11 @@ func (d *Driver) Destroy(ctx context.Context, ref ports.TargetRef) error {
 	d.lifecycleMu.Lock()
 	defer d.lifecycleMu.Unlock()
 	d.mu.Lock()
-	record, found := d.targets[targetKey(ref.ID, ref.Generation)]
+	key := targetKey(ref.ID, ref.Generation)
+	record, found := d.targets[key]
+	if !found {
+		record, found = d.cleanupOnly[key]
+	}
 	d.mu.Unlock()
 	if d.hasUnstoppedRun(ref.ID, ref.Generation) {
 		return domain.NewError(domain.CodeFailedPrecondition, "linux_target.destroy", "run", "all prepared runs must be stopped before destroy", nil)
@@ -802,6 +1217,12 @@ func (d *Driver) Destroy(ctx context.Context, ref ports.TargetRef) error {
 	runtimeID, absent, err := d.resolveTargetDestroy(ctx, ref, record, found)
 	if err != nil {
 		return err
+	}
+	if absent && !found {
+		// Authoritative runtime absence is idempotent, but without a
+		// reconciled complete plan there is no authority to touch the target
+		// directory that merely happens to have the canonical ref-derived path.
+		return nil
 	}
 	if !absent {
 		if err := d.runtime.Remove(ctx, runtimeID); err != nil {
@@ -827,8 +1248,9 @@ func (d *Driver) Destroy(ctx context.Context, ref ports.TargetRef) error {
 		return domain.NewError(domain.CodeUnavailable, "linux_target.destroy", "cleanup", "could not remove target directory", err)
 	}
 	d.mu.Lock()
-	delete(d.targets, targetKey(ref.ID, ref.Generation))
-	delete(d.materialized, targetKey(ref.ID, ref.Generation))
+	delete(d.targets, key)
+	delete(d.cleanupOnly, key)
+	delete(d.materialized, key)
 	if found {
 		delete(d.idempotency, record.input.IdempotencyKey)
 	}

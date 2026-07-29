@@ -258,9 +258,19 @@ type TargetAdmission struct {
 	ExecTransport                 string
 	FileTransfer                  string
 	NetworkEndpoints              string
+	ADB                           string
+	DeviceScopedADBServices       string
 	DeniedInfrastructureAuthority []string
 	ResetAfterEveryRun            bool
 	ResetMode                     string
+	BaselineState                 string
+	RequireHardwareAcceleration   bool
+	HardwareAccelerationEnforced  bool
+	Headless                      bool
+	Rooted                        bool
+	Debuggable                    bool
+	GuestMemoryBytes              int64
+	BootTimeout                   time.Duration
 	Resources                     RuntimeResources
 	ConcurrentTargets             int64
 }
@@ -277,13 +287,43 @@ func ValidateTarget(effective *policy.EffectivePolicy, request TargetAdmission) 
 	if !found {
 		return deny("target.template", "%q is not declared", request.Template)
 	}
-	if !request.UserEnforced {
-		return deny("target.runtime.user", "the physical runtime does not enforce the configured user")
+	if template.Kind == "linux-container" {
+		if !request.UserEnforced {
+			return deny("target.runtime.user", "the physical runtime does not enforce the configured user")
+		}
+		if !request.SeccompEnforced {
+			return deny("target.runtime.seccomp_profile", "the physical runtime does not enforce the configured seccomp profile")
+		}
+	} else if template.Kind == "android-virtual-device" {
+		if template.Runtime.RequireHardwareAcceleration && (!request.RequireHardwareAcceleration || !request.HardwareAccelerationEnforced) {
+			return deny("target.runtime.require_hardware_acceleration", "the physical runtime does not prove hardware acceleration")
+		}
+		for _, value := range []struct {
+			field            string
+			actual, expected bool
+		}{
+			{"target.runtime.headless", request.Headless, template.Runtime.Headless},
+			{"target.runtime.rooted", request.Rooted, template.Runtime.Rooted},
+			{"target.runtime.debuggable", request.Debuggable, template.Runtime.Debuggable},
+		} {
+			if value.actual != value.expected {
+				return deny(value.field, "got %t, policy requires %t", value.actual, value.expected)
+			}
+		}
+		if request.BaselineState != template.Runtime.BaselineState {
+			return deny("target.runtime.baseline_state", "got %q, policy requires %q", request.BaselineState, template.Runtime.BaselineState)
+		}
+		if request.GuestMemoryBytes != template.Runtime.GuestMemory.Bytes() {
+			return deny("target.runtime.guest_memory", "got %d bytes, policy requires %d bytes", request.GuestMemoryBytes, template.Runtime.GuestMemory.Bytes())
+		}
+		if request.BootTimeout <= 0 || request.BootTimeout > template.Runtime.BootTimeout.Duration() {
+			return deny("target.runtime.boot_timeout", "got %s, policy limit is %s", request.BootTimeout, template.Runtime.BootTimeout.Duration())
+		}
+		if request.ADB != template.Interaction.ADB || request.DeviceScopedADBServices != template.Interaction.DeviceScopedADBServices {
+			return deny("target.interaction.adb", "physical ADB facts do not match the Android policy")
+		}
 	}
-	if !request.SeccompEnforced {
-		return deny("target.runtime.seccomp_profile", "the physical runtime does not enforce the configured seccomp profile")
-	}
-	if template.Material.WritableState == "private-overlay" && !request.WritableStateEnforced {
+	if (template.Material.WritableState == "private-overlay" || template.Material.WritableState == "guest-data-partition") && !request.WritableStateEnforced {
 		return deny("target.resources.writable_state_bytes", "the physical runtime does not enforce the configured writable-state limit")
 	}
 	image := template.Runtime.Image

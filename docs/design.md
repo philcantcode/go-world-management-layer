@@ -43,10 +43,13 @@ shipped executable topology. Today `worldd` and `world-node` are independent
 full daemons with different default state paths/endpoints; there is no
 controller-to-node protocol and `world-node` does not register with `worldd`.
 Either binary can run logical-only or activate the same fail-closed physical
-Linux composition from a trusted version-2 deployment profile:
+Linux and managed-Android composition from a trusted version-3 deployment profile:
 
 - a directory-copy workspace and digest-pinned Docker agent container;
-- digest-pinned Docker Linux targets with scoped exec/file transports;
+- digest-pinned Docker Linux targets with scoped exec/file transports, exact
+  container stop proof, and one mutable run per replacement generation;
+- full-tree-digest-pinned Android SDK Emulator AVDs with scoped ADB/file
+  transports and replacement-generation clean reset;
 - deployment-authorized local input/output/bundle material;
 - optional profile-defined process observers and ledger capture; and
 - startup policy compilation, plan preflight, exact physical-plan binding,
@@ -55,14 +58,20 @@ Linux composition from a trusted version-2 deployment profile:
 `directory-copy-non-production` is the only daemon-composed workspace mode;
 the OverlayFS, cgroup/pressure actuation, eBPF suites, split controller/node
 topology, and fleet scheduler described later remain target architecture.
+Directory copy bounds bytes and inodes during prepare/scan/seal/export, but it
+does not enforce either as a live filesystem quota while the agent runs. Those
+two physical support facts are reported as `unsupported` and are the only
+resource-support checks omitted for this explicit non-production mode. Runtime
+identity/isolation and CPU, memory, swap, PID, and capture enforcement remain
+mandatory; an OverlayFS policy fails closed without live byte and inode support.
 
-Android is not daemon-composed. The Cuttlefish-family driver, exact-serial ADB
-authorization, and AttachedEmulator backend have an opt-in real SDK-emulator
-test that installs and launches an APK through a run-scoped gateway, then
-revokes the endpoint without stopping the externally owned emulator. Both
-daemon configurations still accept only `android-target-driver=none`; this
-qualification is not managed Cuttlefish boot, reset, destruction, or startup
-reconciliation.
+Android SDK Emulator targets are daemon-composed with durable AVD/port
+allocation, exact installed-image and runtime identity, headless accelerated
+clean boot, exact-serial ADB authorization, one mutable run per generation,
+replacement reset, quarantine, destruction, and startup reconciliation. The
+AttachedEmulator backend remains an opt-in boundary test that never assumes
+ownership of its externally started emulator. A daemon-selected Cuttlefish or
+physical-device backend is not shipped.
 
 ## 2. Ecosystem boundaries
 
@@ -203,22 +212,23 @@ worldd OR world-node
   |-- logical lifecycle core + SQLite control journal
   |-- durable observation ledger/live projections
   |-- local bundle finalizer/material publication
-  `-- optional version-2 deployment-profile composition
+  `-- optional version-3 deployment-profile composition
         |-- strict policy compile + complete capability fingerprint
         |-- directory workspace + Docker agent + world-guest exec
         |-- Docker Linux target + scoped exec/file transports
+        |-- managed Android SDK Emulator + scoped ADB/file transports
         |-- optional process observers
         `-- optional ledger capture
 ```
 
 Both binaries use this same composition. They are independent services; there
 is no RPC, registration, or scheduling relationship between them. The default
-driver selection is logical-only. Physical Linux mode requires the Docker agent
-and directory workspace together, an absolute immutable deployment profile,
-exact locally present image digests, and non-overlapping managed roots. Linux
-targets, process observers, and ledger capture are additional explicit
-selections constrained by that profile. Android and physical-device selections
-are rejected.
+driver selection is logical-only. Physical mode requires the Docker agent and
+directory workspace together, an absolute immutable deployment profile, exact
+locally present image/system-image digests, and non-overlapping managed roots.
+Docker Linux targets, managed Android SDK Emulator targets, process observers,
+and ledger capture are explicit selections constrained by that profile.
+Daemon-selected Cuttlefish and physical-device selections are not shipped.
 
 ### 6.2 Target controller/node split
 
@@ -280,10 +290,10 @@ cgroup roots, observer permissions, and lease ownership.
 Access to the Docker socket is root-equivalent and must never be delegated to
 the agent workspace or a target. The v1 Linux target uses a hardened standard
 OCI runtime because host eBPF, namespace, cgroup, and filesystem observers can
-attribute its behavior directly. Stronger runtimes such as gVisor or Kata are
-optional profiles. Capability probing must reveal when they hide guest syscalls
-or prevent required ptrace/eBPF observation; a visibility-required policy fails
-rather than silently substituting a less complete collector set.
+attribute its behavior directly. The shipped policy, plan compiler, and Linux
+target driver accept only `runc`; gVisor and Kata are not selectable profiles.
+They remain future research candidates whose different observation boundary
+would require a new explicit policy and capability contract before shipping.
 
 ### 6.5 `world-guest`
 
@@ -351,11 +361,12 @@ ADB-server operations, or another lease or target identity.
 ### 6.6 Target sandboxes and observation bundles
 
 A target sandbox is an add-on resource owned by a `TargetDriver`. The v1 target
-architecture provides Linux OCI-container and Android virtual-device drivers;
-the shipped daemon composition currently activates only the Linux driver. Each
-`TargetInstance` has an independently versioned runtime realization, while each
-`TargetRun` is one bounded execution and observation window within that
-realization.
+architecture provides shipped Docker Linux-container and managed Android SDK
+Emulator drivers. Each `TargetInstance` has an independently versioned runtime
+realization, while each `TargetRun` is one bounded execution and observation
+window within that realization. Both physical drivers grant mutable authority
+to only one run per generation; finalization proves the runtime stopped, and
+another run requires a replacement generation.
 
 Before a run, `world-node` stages the declared specimen and fixtures, starts
 required collectors, verifies their coverage, and opens the scoped target
@@ -467,7 +478,7 @@ The current daemon then performs physical/run reconciliation before lease
 cleanup and before constructing its RPC server or listener. It reconstructs
 immutable plans from durable state, re-applies policy admission, inventories
 exact physical identities, and adopts only a resource whose labels and
-inspected configuration match that plan. Version-5 observer markers bind their
+inspected configuration match that plan. Version-6 observer markers bind their
 filename and run ID to the persisted run-plan digest and full observer start
 signature. They also persist every exact external `CollectorPlan`, a
 `start_committed` flag written only after `ObserverDriver.Start` succeeds, and
@@ -490,24 +501,30 @@ A nonterminal bound run is an interruption, not a resumable execution. The
 Linux reconciler force-stops surviving execution and proves it stopped; it may
 restart only an inert target and reconstruct the run as prepared for the normal
 failure-finalization path. It never calls `StartRun`, restarts a specimen or
-collector, or replaces the original maximum-duration timer. The built-in Linux
-parent-death `SIGKILL` contract proves death only for the directly spawned
-collector process; Go's fork/exec path also closes the parent-exit race.
-Adapters that daemonize or leave surviving helpers are unsupported unless an
-external cgroup/process-tree supervisor supplies an equivalent authoritative
-proof. Unsupported platforms or custom cleanup contracts fail closed.
+collector, or replaces the original maximum-duration timer. The built-in
+Windows starter atomically places each collector in its own anonymous
+kill-on-close Job before any child instruction executes and retains the sole
+Job handle in the daemon; normal teardown also requires the Job's active-process
+count to reach zero. The built-in Linux parent-death `SIGKILL` contract proves
+death only for the directly spawned collector process; Go's fork/exec path also
+closes the parent-exit race. Adapters that daemonize on Linux or leave surviving
+helpers are unsupported unless an external cgroup/process-tree supervisor
+supplies an equivalent authoritative proof. Unsupported platforms or custom
+cleanup contracts fail closed.
 
 Only after that death proof may the process observer reconcile durable output.
 For every exact persisted collector binding it requires one bounded,
 non-symlink transaction directory and validates terminal manifests, stream
 roles, artifact references, digests, sizes, the shared byte limit, and object
-reachability. A valid finalized transaction retains its immutable artifacts,
-but the recovered collector's continuity is still recorded as lost. Partial,
-never-finished output is closed with an exact-plan `aborted` transaction and
-its partial files are removed. A missing transaction is tolerated only when
-`start_committed` is false; a present valid finalized transaction remains
-authoritative even when that flag is false because output publication may have
-won the marker-update race. Foreign collectors/files/objects, conflicting or
+reachability. A valid finalized transaction retains its immutable artifacts.
+For a start-committed transaction with both exact regular partial streams,
+recovery fsyncs and bounds the retained bytes, then uses the normal publisher to
+create canonical immutable stdout/stderr objects and a finalized manifest.
+Continuity is still recorded as lost. An uncommitted transaction is closed with
+an exact-plan `aborted` state and its partial files are removed. A missing
+transaction is tolerated only when `start_committed` is false; a present valid
+finalized transaction remains authoritative even when that flag is false
+because output publication may have won the marker-update race. Foreign collectors/files/objects, conflicting or
 mismatched control files, missing referenced objects, and unsafe path/type
 changes fail startup. Complete unreferenced objects are safely removed; a
 truncated pending object is removed only when it is a verified prefix tied to
@@ -599,7 +616,10 @@ idempotency key. The executable supplies `argv[0]`; temporary-input indices are
 zero-based over the separate argument vector.
 Subsequent frames carry raw stream bytes, signals, resize events, heartbeats,
 and one terminal outcome. It is the transport behind the runner execution
-environment, not a provider-aware protocol.
+environment, not a provider-aware protocol. The control plane maintains the
+guest heartbeat for the full physical execution lifetime, including after the
+client half-closes its input stream; client heartbeat frames are supplementary,
+not the sole source of guest liveness.
 
 `StartTargetRun` creates the bounded observation window and initial material
 plan. It does not freeze the commands that may run during that window. Target
@@ -893,36 +913,43 @@ records these as interventions and enforces the target's cgroup, filesystem,
 network, time, and capture budgets; it does not interpret command text or turn
 guest root into host authority.
 
-A stronger gVisor or Kata target is admitted only when its in-guest collectors
-meet the policy's required coverage. V1 never claims equivalent syscall
-visibility from host eBPF across an application-kernel or VM boundary.
+gVisor and Kata are not admitted by the current policy or Linux target driver.
+Future research may define a separate in-guest collector contract for such
+boundaries; v1 does not claim equivalent host-eBPF syscall visibility or expose
+a selectable compatibility path.
 
 ## 11. Android target management
 
 ### 11.1 Virtual-device driver
 
-The v1 Android target driver supports a KVM-backed, instrumented AOSP virtual
-device. Phase 0 compares Cuttlefish with the Android Emulator behind the same
-driver contract; Cuttlefish is preferred when its operational and snapshot
-behavior meets the exit gate because it is designed for scalable, high-fidelity
-AOSP virtual devices. Each target generation uses isolated writable device
+The v1 Android target driver supports a hardware-accelerated, instrumented AOSP
+virtual device through the Android SDK Emulator. Cuttlefish can be added behind
+the same driver contract after separately satisfying the lifecycle and
+qualification gates. Each target generation uses isolated writable device
 state, fixed console/ADB endpoints, a recorded system-image/runtime fingerprint,
-a cgroup under the lease, and a dedicated network path. Readiness requires:
+and a dedicated scoped-ADB path. Managed lifecycle execution is currently
+Windows-only: the emulator process tree is atomically placed in one
+deterministically named Job whose CPU and committed-memory limits, membership,
+and restart reopen are verified. Other hosts fail resource-containment
+preflight. Readiness requires:
 
 - the virtual-device process is alive;
+- its exact host process identity remains in the configured named Job;
 - ADB reports the expected serial as `device`;
 - boot completion and package manager readiness checks pass;
 - Android build fingerprint matches the plan; and
+- the guest `/data` block device has the exact planned capacity; and
 - all required collectors have started and meet required coverage; optional
   collectors have started or recorded an explicit downgrade.
 
-The manager can reset device state to an immutable baseline and may use
-runtime-supported named snapshots. Before a restore or powerwash, the failed
-target run and generation are sealed and crash evidence is captured. Reset
-always increments `TargetGeneration` and emits an incident/recovery pair without
-changing `AgentGeneration`. Snapshot validity is tied to runtime, system image,
-device configuration, and feature fingerprints; invalidity triggers an explicit
-cold boot or fails according to policy.
+Host Job memory is distinct from emulator guest RAM: the former caps committed
+memory for the whole process tree, while the latter is the exact `-memory`
+topology value. Writable-state bytes bind the guest `/data` block capacity,
+not host AVD metadata or diagnostic logs. Managed AVDs disable cache, SD-card,
+snapshot load/save, and writable-system state. The shipped reset modes create a
+separately allocated clean-boot AVD; no snapshot restore is claimed. Before a
+reset, the target run and generation are sealed and crash evidence is captured.
+Reset always increments `TargetGeneration` without changing `AgentGeneration`.
 
 The visibility-first Android image is rooted/debuggable, contains pinned guest
 collector components, and is treated as instrumentation rather than a consumer-
@@ -956,7 +983,7 @@ services, not device command semantics. Each request, transfer hash, resulting
 process where observable, disconnect, and reboot is linked to the initiating
 agent operation and target run.
 
-Host-owned packet, runtime, cgroup, filesystem, and gateway observers remain
+Host-owned packet, runtime, process-controller, filesystem, and gateway observers remain
 outside the Android guest. Agent-installed instrumentation is labeled as an
 intervention. If a command disrupts logcat, Perfetto, Frida hooks, or another
 in-guest collector, the command proceeds and the observation bundle records the
@@ -1002,9 +1029,11 @@ incident without pretending the sample caused it.
 
 ### 12.2 Subject attribution and baseline matrix
 
-Resource attribution follows a stable subject tree. The agent workspace, Linux
-targets, Android runtimes, and observers use separate leaf cgroups beneath the
-lease aggregate so the system can show both individual and total cost:
+Resource attribution follows a stable subject tree. Agent workspaces, Linux
+targets, and Linux observers use separate cgroup leaves. A managed Android
+runtime on Windows uses its own named Job and is joined into the same logical
+lease aggregate by durable plan identity rather than by pretending that a
+Windows Job is a Linux cgroup:
 
 ```text
 host
@@ -1013,7 +1042,7 @@ host
     |   `-- provider/tool process groups
     |-- Linux-target cgroup(s)
     |   `-- investigated process trees
-    |-- Android-runtime cgroup(s)
+    |-- Android-runtime controller(s) (Windows named Jobs)
     `-- observer cgroup
 
 Android guest/app subjects map to the emulator target and a separate Android
@@ -1250,11 +1279,11 @@ the index, committed observer marker, and `bundle.completed` record agree.
 ## 14. Pressure-aware admission and shedding
 
 Each lease has resource requests, hard limits, priority, preemptibility, and a
-cost estimate. The agent workspace, Linux targets, Android runtime processes,
-and observers are placed in separate leaves under one lease cgroup subtree so
-both attribution and aggregate pressure remain visible. Future physical-device
-helpers also belong to it, though device-side consumption is reported
-separately.
+cost estimate. Linux workloads use separate leaves under one lease cgroup
+subtree. Managed Android runtime processes use exact per-generation Windows
+Jobs, while durable admission accounts their requested resources in the same
+logical lease aggregate. Future physical-device helpers also belong to that
+logical aggregate, though device-side consumption is reported separately.
 
 Admission evaluates allocatable CPU/memory/storage/pids/devices, warm-pool cost,
 current PSI trends, requested observers, snapshot memory spikes, and safety
@@ -1349,7 +1378,7 @@ cross-field invariants, resolves defaults, probes capabilities, and emits a
 canonical effective-policy document for each admitted agent or target
 generation.
 
-In the shipped physical composition, a version-2 deployment profile names each
+In the shipped physical composition, a version-3 deployment profile names each
 regular policy source by exact `metadata.name@metadata.revision`. Startup probes
 the selected agent, target, workspace, and observer facts, constructs one
 complete capability fingerprint, compiles every source against it, and binds
@@ -1368,8 +1397,9 @@ from an authoritative inventory of all persisted sessions with their exact
 plans re-resolved; an idempotent candidate is excluded once so a retry does not
 double-count itself. Policy denial occurs before logical or physical mutation.
 
-`world-capabilities -policy <path>` performs the non-provisioning Docker probe
-and reports the canonical policy digest plus the complete capability digest.
+`world-capabilities -policy <path>` performs the non-provisioning probe for the
+selected Docker and/or managed Android composition and reports the canonical
+policy digest plus the complete capability digest.
 The daemon independently repeats compilation and physical-plan preflight; the
 operator tool is preparation and evidence, not an authorization bypass.
 
@@ -1553,9 +1583,10 @@ privilege. Captured content is untrusted evidence, not safe structured data.
 - `observable-container`: hardened standard OCI/runc Linux target with required
   host eBPF, namespace, network, and filesystem coverage. This is the v1 target
   default because visibility has priority.
-- `sandboxed-kernel`: optional gVisor/Kata target with stronger kernel isolation;
-  admitted only with an explicitly reduced visibility contract or equivalent
-  in-guest collectors.
+- `sandboxed-kernel`: a future, non-shipped research tier for runtimes such as
+  gVisor or Kata. It is not a current policy value or selectable target profile;
+  shipping it would require a separate reduced-visibility or in-guest collector
+  contract.
 - `instrumented-android`: target profile for a rooted/debuggable AOSP virtual
   device with pinned Perfetto, logcat, state, packet, and Frida/framework
   observation capabilities. It remains outside the daemon composition.
@@ -1602,8 +1633,9 @@ No tier is named `unrestricted`; permissions are described concretely.
   integration; it remains an external adapter because its lifecycle and
   evidence model are not the world's authority:
   <https://github.com/MobSF/Mobile-Security-Framework-MobSF>.
-- gVisor can be selected as a Docker runtime but has distinct filesystem,
-  network, and debugging behavior: <https://gvisor.dev/docs/user_guide/quick_start/docker/>.
+- Docker can be configured upstream with gVisor, but World does not select or
+  admit it; its distinct filesystem, network, and debugging behavior remains a
+  future research subject: <https://gvisor.dev/docs/user_guide/quick_start/docker/>.
 - OpenTelemetry correlates traces, metrics, and logs but is an export framework,
   not the durable world ledger: <https://opentelemetry.io/docs/concepts/signals/>.
 - Frida and mitmproxy are invasive, capability-dependent collectors rather than

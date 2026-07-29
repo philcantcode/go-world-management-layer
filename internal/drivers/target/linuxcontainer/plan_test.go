@@ -31,7 +31,7 @@ func TestDockerCreateArgsUseControlledScratchCompatibleIdleBinary(t *testing.T) 
 	if strings.Contains(joined, "/bin/sh") || strings.Contains(joined, "sleep 3600") || strings.Contains(joined, "-c\x00") {
 		t.Fatalf("target lifecycle still depends on a shell: %v", arguments)
 	}
-	for _, expected := range []string{"--read-only", "--user\x0065532:65532", "--memory-swap\x0067108864", "--security-opt\x00seccomp=builtin", "--ipc\x00private", "--cgroupns\x00private"} {
+	for _, expected := range []string{"--read-only", "--user\x0065532:65532", "--memory-swap\x0067108864", "--security-opt\x00seccomp=builtin", "--ipc\x00private", "--cgroupns\x00private", "--env\x00" + dockercli.RestrictedPathEnvironment, "--workdir\x00/"} {
 		if !strings.Contains(joined, expected) {
 			t.Fatalf("target arguments do not contain %q: %v", expected, arguments)
 		}

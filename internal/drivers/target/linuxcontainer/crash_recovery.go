@@ -3,6 +3,7 @@ package linuxcontainer
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"reflect"
 
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
@@ -10,10 +11,11 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
 )
 
-// RecoverInterruptedRun resets the adopted container at its process boundary,
-// which authoritatively kills every docker-exec child left by the old daemon,
-// and then reconstructs only the prepared run. It deliberately never calls
-// StartRun, waits for collectors, or creates a maximum-duration timer.
+// RecoverInterruptedRun stops the adopted container at its process boundary,
+// which authoritatively kills every process left by the old daemon, and then
+// reconstructs only the prepared run for evidence sealing. It deliberately
+// never restarts the container, calls StartRun, waits for collectors, or
+// creates a maximum-duration timer.
 func (d *Driver) RecoverInterruptedRun(ctx context.Context, plan ports.TargetRunPlan) (ports.PreparedTargetRun, error) {
 	if err := ports.RequireDeadline(ctx, "linux_target.recover_interrupted_run"); err != nil {
 		return ports.PreparedTargetRun{}, err
@@ -32,69 +34,61 @@ func (d *Driver) RecoverInterruptedRun(ctx context.Context, plan ports.TargetRun
 	if err != nil {
 		return ports.PreparedTargetRun{}, err
 	}
-	state, err := d.runtime.Inspect(ctx, target.runtimeID)
+	if _, err := requireTargetGenerationRunClaim(target.plan.TargetDirectory, plan); err != nil {
+		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.recover_interrupted_run", "run_claim", "durable target generation run claim is missing or invalid", err)
+	}
+	recoveryAuthority := RunAuthority{LeaseID: spec.LeaseID, TargetID: spec.TargetID, Generation: spec.TargetGeneration, RunID: spec.ID}
+	runDirectory := filepath.Join(target.plan.TargetDirectory, "runs", spec.ID.String())
+	if err := prepareManagedDirectory(d.build.TargetRoot, runDirectory); err != nil {
+		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeUnavailable, "linux_target.recover_interrupted_run", "run_directory", "could not restore the interrupted run directory", err)
+	}
+	startRecord, startCommitted, err := loadRunStart(runDirectory, recoveryAuthority)
 	if err != nil {
-		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeUnavailable, "linux_target.recover_interrupted_run", "runtime", "could not inspect the adopted target", err)
+		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.recover_interrupted_run", "run_start", "durable target run start record is invalid", err)
 	}
-	if state.ID != target.runtimeID {
-		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.recover_interrupted_run", "runtime_id", "runtime inspect returned a different target", nil)
+	if startCommitted && (startRecord.RuntimeID != target.runtimeID || startRecord.Materialization != spec.MaterializationDigest) {
+		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeIntegrityViolation, "linux_target.recover_interrupted_run", "run_start", "durable target run start record identifies different physical execution", nil)
 	}
-	if err := validateRuntimeIdentity(state, target.plan); err != nil {
+	initialState, err := d.inspectOwnedRuntime(ctx, target, "linux_target.recover_interrupted_run")
+	if err != nil {
 		return ports.PreparedTargetRun{}, err
 	}
-	if state.Running {
-		if err := d.runtime.Stop(ctx, target.runtimeID, ports.StopForce); err != nil {
-			return ports.PreparedTargetRun{}, domain.NewError(domain.CodeUnavailable, "linux_target.recover_interrupted_run", "runtime_stop", "could not terminate execution left by the old controller", err)
-		}
-		state, err = d.runtime.Inspect(ctx, target.runtimeID)
-		if err != nil {
-			return ports.PreparedTargetRun{}, domain.NewError(domain.CodeUnavailable, "linux_target.recover_interrupted_run", "runtime_stop", "could not prove the adopted target stopped", err)
-		}
-		if state.ID != target.runtimeID || state.Running {
-			return ports.PreparedTargetRun{}, domain.NewError(domain.CodeFailedPrecondition, "linux_target.recover_interrupted_run", "runtime_stop", "the adopted target still executes after forced stop", nil)
-		}
-		if err := validateRuntimeIdentity(state, target.plan); err != nil {
-			return ports.PreparedTargetRun{}, err
-		}
+	runtimeWasRunning := initialState.Running
+	minimumBoundary := spec.CreatedAt
+	if startCommitted {
+		minimumBoundary = startRecord.StartedAt
 	}
-	if err := d.runtime.Start(ctx, target.runtimeID); err != nil {
-		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeUnavailable, "linux_target.recover_interrupted_run", "runtime_start", "could not restart the clean adopted target", err)
+	recoveryRun := &runRecord{plan: plan, authority: recoveryAuthority, directory: runDirectory}
+	if _, err := d.requireStoppedRunBoundary(ctx, target, recoveryRun, ports.StopForce, minimumBoundary); err != nil {
+		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeUnavailable, "linux_target.recover_interrupted_run", "runtime_stop", "could not establish the durable stopped-container boundary", err)
 	}
-	state, err = d.runtime.Inspect(ctx, target.runtimeID)
-	if err != nil {
-		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeUnavailable, "linux_target.recover_interrupted_run", "runtime_start", "could not inspect the restarted adopted target", err)
-	}
-	if state.ID != target.runtimeID || !state.Running {
-		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeFailedPrecondition, "linux_target.recover_interrupted_run", "runtime_start", "the clean adopted target did not become running", nil)
-	}
-	if err := validateRuntimeIdentity(state, target.plan); err != nil {
-		return ports.PreparedTargetRun{}, err
-	}
-	d.mu.Lock()
-	current, exists := d.targets[targetKey(spec.TargetID, spec.TargetGeneration)]
-	if !exists || current.runtimeID != target.runtimeID {
-		d.mu.Unlock()
-		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeFailedPrecondition, "linux_target.recover_interrupted_run", "target", "adopted target ownership changed during recovery", nil)
-	}
-	current.status = adoptedTargetStatus(current.plan, state, d.now().UTC())
-	d.targets[targetKey(spec.TargetID, spec.TargetGeneration)] = current
-	d.mu.Unlock()
-
-	prepared, err := d.PrepareRun(ctx, plan)
+	prepared, err := d.prepareRun(ctx, plan, true)
 	if err != nil {
 		return ports.PreparedTargetRun{}, err
 	}
 	payload, err := json.Marshal(struct {
 		RuntimeID                   string `json:"runtime_id"`
-		PriorExecutionTerminated    bool   `json:"prior_execution_terminated"`
+		RuntimeWasRunning           bool   `json:"runtime_was_running"`
+		ProcessBoundaryReset        bool   `json:"process_boundary_reset"`
+		RunStartCommitted           bool   `json:"run_start_committed"`
+		PriorCgroupID               string `json:"prior_cgroup_id,omitempty"`
 		ControlPlaneContinuityLost  bool   `json:"control_plane_continuity_lost"`
 		SpecimenExecutionWasResumed bool   `json:"specimen_execution_was_resumed"`
-	}{target.runtimeID, true, true, false})
+	}{
+		RuntimeID: target.runtimeID, RuntimeWasRunning: runtimeWasRunning, ProcessBoundaryReset: true,
+		RunStartCommitted: startCommitted, PriorCgroupID: startRecord.CgroupID,
+		ControlPlaneContinuityLost: true, SpecimenExecutionWasResumed: false,
+	})
 	if err != nil {
 		return ports.PreparedTargetRun{}, err
 	}
 	d.mu.Lock()
 	if run := d.runs[spec.ID.String()]; run != nil {
+		run.controlPlaneLost = true
+		run.interruptedExecution = startCommitted
+		if startCommitted {
+			run.startedAt = startRecord.StartedAt
+		}
 		run.observations = append(run.observations, ports.TargetRunObservation{
 			Kind: "target.run.control-plane-loss", ObservedAt: prepared.PreparedAt, Payload: payload,
 		})
@@ -115,6 +109,9 @@ func (d *Driver) existingPreparedRecovery(plan ports.TargetRunPlan) (ports.Prepa
 	}
 	if run.started || run.timer != nil {
 		return ports.PreparedTargetRun{}, true, domain.NewError(domain.CodeIntegrityViolation, "linux_target.recover_interrupted_run", "run", "recovered run unexpectedly owns execution or a duration timer", nil)
+	}
+	if !run.controlPlaneLost {
+		return ports.PreparedTargetRun{}, true, domain.NewError(domain.CodeIntegrityViolation, "linux_target.recover_interrupted_run", "run", "existing run was not reconstructed as a control-plane-loss recovery", nil)
 	}
 	return runevidence.ClonePrepared(run.prepared), true, nil
 }

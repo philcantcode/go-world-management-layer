@@ -76,7 +76,7 @@ func TestContainerPlanRequiresEveryDockerEnforcedLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(arguments, " ")
-	for _, expected := range []string{"--memory 67108864", "--memory-swap 67108864", "--cpus 0.250", "--pids-limit 64", "seccomp=builtin", "--ipc private", "--cgroupns private"} {
+	for _, expected := range []string{"--memory 67108864", "--memory-swap 67108864", "--cpus 0.250", "--pids-limit 64", "seccomp=builtin", "--ipc private", "--cgroupns private", "--env " + dockercli.RestrictedPathEnvironment, "--workdir /"} {
 		if !strings.Contains(joined, expected) {
 			t.Fatalf("Docker args do not contain %q: %s", expected, joined)
 		}

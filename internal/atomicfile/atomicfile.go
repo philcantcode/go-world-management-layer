@@ -30,6 +30,35 @@ func WriteExclusive(path string, content []byte, mode os.FileMode) error {
 	return write(path, content, mode, publishExclusive)
 }
 
+// PublishExclusive atomically publishes a completed staging file without
+// replacing an existing destination. Both paths must share one directory so
+// publication cannot cross a filesystem boundary. The caller retains the
+// staging file when publication fails.
+func PublishExclusive(stagedPath, path string) error {
+	stagedAbs, err := filepath.Abs(stagedPath)
+	if err != nil {
+		return fmt.Errorf("canonicalize staging path: %w", err)
+	}
+	pathAbs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("canonicalize publication path: %w", err)
+	}
+	if filepath.Clean(filepath.Dir(stagedAbs)) != filepath.Clean(filepath.Dir(pathAbs)) || filepath.Clean(stagedAbs) == filepath.Clean(pathAbs) {
+		return fmt.Errorf("exclusive publication requires distinct paths in one directory")
+	}
+	info, err := os.Lstat(stagedAbs)
+	if err != nil {
+		return fmt.Errorf("inspect completed staging file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("completed staging path is not a regular file")
+	}
+	if err := publishExclusive(stagedAbs, pathAbs); err != nil {
+		return fmt.Errorf("publish completed staging file: %w", err)
+	}
+	return syncDirectory(filepath.Dir(pathAbs))
+}
+
 func write(path string, content []byte, mode os.FileMode, publish func(string, string) error) error {
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {

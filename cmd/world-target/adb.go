@@ -12,6 +12,8 @@ import (
 	"github.com/philcantcode/go-world-management-layer/world"
 )
 
+const maxADBProxyConnections = 64
+
 type adbProxyOptions struct {
 	scope       *targetScope
 	listen      string
@@ -65,7 +67,8 @@ func proxyADBConnection(ctx context.Context, client *world.Client, connection ne
 	err = worldcli.PumpBidi(stream, &worldv1.ADBFrame{Start: &worldv1.ADBStart{Mutation: meta, TargetId: scope.target, TargetRunId: scope.run}}, connection,
 		func(data []byte) *worldv1.ADBFrame { return &worldv1.ADBFrame{ClientBytes: data} },
 		func() *worldv1.ADBFrame { return &worldv1.ADBFrame{Complete: true} },
-		response.handle)
+		response.handle,
+		worldcli.PumpBidiOptions{AllowServerEOFBeforeInputHalfClose: true})
 	if err != nil {
 		return err
 	}
@@ -123,7 +126,7 @@ func parseADBProxy(arguments []string, stderr io.Writer) (*adbProxyOptions, erro
 	flags := worldcli.NewFlagSet("adb-proxy", stderr)
 	scope := addTargetScope(flags)
 	listen := flags.String("listen", "127.0.0.1:0", "loopback TCP listen address")
-	connections := flags.Int("connections", 1, "maximum sequential ADB client connections (1-16)")
+	connections := flags.Int("connections", 1, fmt.Sprintf("maximum sequential ADB client connections (1-%d)", maxADBProxyConnections))
 	if err := flags.Parse(arguments); err != nil {
 		return nil, err
 	}
@@ -136,8 +139,8 @@ func parseADBProxy(arguments []string, stderr io.Writer) (*adbProxyOptions, erro
 	if err := requireLoopback(*listen); err != nil {
 		return nil, err
 	}
-	if *connections < 1 || *connections > 16 {
-		return nil, worldcli.UsageError("connections must be between 1 and 16")
+	if *connections < 1 || *connections > maxADBProxyConnections {
+		return nil, worldcli.UsageError(fmt.Sprintf("connections must be between 1 and %d", maxADBProxyConnections))
 	}
 	return &adbProxyOptions{scope: scope, listen: *listen, connections: *connections}, nil
 }

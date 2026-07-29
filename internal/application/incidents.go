@@ -330,7 +330,22 @@ type TransitionIncidentRequest struct {
 }
 
 func (c *Core) TransitionIncident(ctx context.Context, request TransitionIncidentRequest) (IncidentRecord, error) {
-	const operation = "incident.transition"
+	return c.transitionIncident(ctx, "incident.transition", "transition_incident", request, false)
+}
+
+// CompleteIncidentRecovery is the trusted physical-controller completion
+// boundary. Ordinary incident transitions may resolve sealed incidents that
+// never entered recovery, but cannot claim that an in-flight generation
+// replacement completed.
+func (c *Core) CompleteIncidentRecovery(ctx context.Context, request TransitionIncidentRequest) (IncidentRecord, error) {
+	const operation = "incident.complete_recovery"
+	if request.State != domain.IncidentResolved {
+		return IncidentRecord{}, invalidArgument(operation, "state", "recovery completion must resolve the incident", nil)
+	}
+	return c.transitionIncident(ctx, operation, "complete_incident_recovery", request, true)
+}
+
+func (c *Core) transitionIncident(ctx context.Context, operation, namespace string, request TransitionIncidentRequest, recoveryCompletion bool) (IncidentRecord, error) {
 	if err := request.Meta.Validate(ctx, c.clock()); err != nil {
 		return IncidentRecord{}, err
 	}
@@ -355,7 +370,7 @@ func (c *Core) TransitionIncident(ctx context.Context, request TransitionInciden
 	if err := c.syncLocked(ctx); err != nil {
 		return IncidentRecord{}, err
 	}
-	response, _, err := c.store.RunIdempotent(ctx, "transition_incident", request.Meta.IdempotencyKey, requestBytes, func(ctx context.Context, tx *store.Tx) ([]byte, error) {
+	response, _, err := c.store.RunIdempotent(ctx, namespace, request.Meta.IdempotencyKey, requestBytes, func(ctx context.Context, tx *store.Tx) ([]byte, error) {
 		incident, ok := detachedRecord(c.incidents, request.IncidentID, cloneIncident)
 		if !ok {
 			return nil, ErrNotFound
@@ -365,6 +380,21 @@ func (c *Core) TransitionIncident(ctx context.Context, request TransitionInciden
 		}
 		if request.State == domain.IncidentEvidenceSealed && len(incident.Artifacts) == 0 && incident.ObservationBundleID == "" {
 			return nil, failedPrecondition(operation, "evidence", "cannot be sealed without a typed artifact or observation bundle", nil)
+		}
+		if incident.State == domain.IncidentRecovering && request.State == domain.IncidentResolved && !recoveryCompletion {
+			return nil, failedPrecondition(operation, "state", "recovering incidents can be resolved only by the trusted physical recovery completion path", nil)
+		}
+		if recoveryCompletion {
+			if incident.State != domain.IncidentRecovering {
+				return nil, failedPrecondition(operation, "state", "only a recovering incident can complete recovery", nil)
+			}
+			if !stringSetContainsAll(request.RecoveryActions, incident.RecoveryActions) ||
+				!stringSetContainsAll(request.VisibilityAcknowledgements, incident.VisibilityAcknowledgements) {
+				return nil, domain.NewError(domain.CodeIntegrityViolation, operation, "history", "recovery completion cannot remove durable actions or visibility acknowledgements", nil)
+			}
+			if err := requireExactPhysicalRecoveryCompletion(incident.RecoveryActions, request.RecoveryActions); err != nil {
+				return nil, err
+			}
 		}
 		if err := domain.RequireIncidentTransition(incident.State, request.State); err != nil {
 			return nil, err
@@ -388,6 +418,55 @@ func (c *Core) TransitionIncident(ctx context.Context, request TransitionInciden
 		return IncidentRecord{}, err
 	}
 	return cloneIncident(incident), nil
+}
+
+func stringSetContainsAll(values, required []string) bool {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	for _, value := range required {
+		if _, found := set[value]; !found {
+			return false
+		}
+	}
+	return true
+}
+
+func requireExactPhysicalRecoveryCompletion(existing, completed []string) error {
+	const operation = "incident.complete_recovery"
+	expected := ""
+	for _, action := range existing {
+		var candidate string
+		switch {
+		case strings.HasPrefix(action, string(RecoveryResourceAgent)+":"):
+			strategy := strings.TrimPrefix(action, string(RecoveryResourceAgent)+":")
+			if strategy != "" {
+				candidate = "physical-agent:" + strategy
+			}
+		case strings.HasPrefix(action, string(RecoveryResourceTarget)+":"):
+			strategy := strings.TrimPrefix(action, string(RecoveryResourceTarget)+":")
+			if strategy != "" {
+				candidate = "physical-target:" + strategy
+			}
+		}
+		if candidate == "" {
+			continue
+		}
+		if expected != "" && expected != candidate {
+			return domain.NewError(domain.CodeIntegrityViolation, operation, "recovery_actions", "incident contains multiple physical recovery intents", nil)
+		}
+		expected = candidate
+	}
+	if expected == "" {
+		return domain.NewError(domain.CodeIntegrityViolation, operation, "recovery_actions", "incident has no exact physical recovery intent", nil)
+	}
+	for _, action := range completed {
+		if action == expected {
+			return nil
+		}
+	}
+	return failedPrecondition(operation, "recovery_actions", "trusted recovery completion lacks the exact physical action "+expected, nil)
 }
 
 type RecoveryResource string

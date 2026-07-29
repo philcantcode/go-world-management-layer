@@ -44,3 +44,16 @@ func TestAllocatorKeepsGenerationsAndTargetsCollisionFree(t *testing.T) {
 		t.Fatalf("serial collision: %#v %#v %#v", a1, a2, b1)
 	}
 }
+
+func TestManagedEmulatorConsolePortUsesExactSDKRange(t *testing.T) {
+	for _, port := range []int{ManagedEmulatorMinConsolePort, ManagedEmulatorMaxConsolePort} {
+		if observed, err := emulatorAllocation(port).EmulatorConsolePort(); err != nil || observed != port {
+			t.Fatalf("supported console port %d = %d, %v", port, observed, err)
+		}
+	}
+	for _, port := range []int{ManagedEmulatorMinConsolePort - 2, ManagedEmulatorMaxConsolePort + 2} {
+		if _, err := emulatorAllocation(port).EmulatorConsolePort(); err == nil {
+			t.Fatalf("unsupported SDK emulator console port %d was accepted", port)
+		}
+	}
+}

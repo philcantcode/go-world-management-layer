@@ -6,6 +6,7 @@ import (
 
 	"github.com/philcantcode/go-world-management-layer/internal/application"
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
+	"github.com/philcantcode/go-world-management-layer/internal/orchestration/policyauthority"
 	"github.com/philcantcode/go-world-management-layer/internal/store"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -26,7 +27,7 @@ func StatusError(err error) error {
 		return status.Error(codes.DeadlineExceeded, err.Error())
 	case errors.Is(err, application.ErrNotFound), errors.Is(err, store.ErrNotFound):
 		return status.Error(codes.NotFound, err.Error())
-	case errors.Is(err, application.ErrScope):
+	case errors.Is(err, application.ErrScope), errors.Is(err, policyauthority.ErrPolicyDenied):
 		return status.Error(codes.PermissionDenied, err.Error())
 	case errors.Is(err, store.ErrIdempotencyConflict):
 		return status.Error(codes.AlreadyExists, err.Error())

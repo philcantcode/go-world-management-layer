@@ -288,6 +288,15 @@ func (l ProcessLifecycle) ValidateTerminal(terminal Terminal) error {
 	return nil
 }
 
+// Started returns the observed process start event, if any.
+func (l ProcessLifecycle) Started() *ProcessEvent {
+	if l.started == nil {
+		return nil
+	}
+	copy := *l.started
+	return &copy
+}
+
 type Terminal struct {
 	ExitCode         int    `json:"exit_code"`
 	Signal           string `json:"signal,omitempty"`

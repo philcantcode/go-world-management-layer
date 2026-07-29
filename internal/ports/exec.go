@@ -2,7 +2,9 @@ package ports
 
 import (
 	"context"
+	"errors"
 	"io"
+	"time"
 
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
 	"github.com/philcantcode/go-world-management-layer/internal/safepath"
@@ -16,6 +18,45 @@ type ExecTransport interface {
 	Send(context.Context, transport.Kind, []byte) (transport.Frame, error)
 	Receive(context.Context) (transport.Frame, error)
 	Close() error
+}
+
+const DefaultExecHeartbeatInterval = 10 * time.Second
+
+// MaintainExecHeartbeat keeps a guest exec lease alive until the returned
+// stop function is called or ctx ends. A heartbeat send failure closes the
+// transport to unblock a concurrent Receive and is returned by stop.
+func MaintainExecHeartbeat(ctx context.Context, stream ExecTransport, interval time.Duration) func() error {
+	if interval <= 0 {
+		interval = DefaultExecHeartbeatInterval
+	}
+	heartbeatCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	var heartbeatErr error
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				if _, err := stream.Send(heartbeatCtx, transport.KindHeartbeat, nil); err != nil {
+					if heartbeatCtx.Err() != nil && errors.Is(err, heartbeatCtx.Err()) {
+						return
+					}
+					heartbeatErr = err
+					_ = stream.Close()
+					return
+				}
+			}
+		}
+	}()
+	return func() error {
+		cancel()
+		<-done
+		return heartbeatErr
+	}
 }
 
 type ExecPlan struct {

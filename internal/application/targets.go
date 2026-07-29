@@ -234,12 +234,16 @@ func (c *Core) StartTargetRun(ctx context.Context, request StartTargetRunRequest
 		if err != nil {
 			return nil, err
 		}
-		if generation.State != domain.TargetGenerationReady && generation.State != domain.TargetGenerationResettable {
-			return nil, failedPrecondition(operation, "target_generation", "is not ready", nil)
+		if generation.State != domain.TargetGenerationReady {
+			reason := "is not ready"
+			if generation.State == domain.TargetGenerationResettable {
+				reason = "must be reset before another run"
+			}
+			return nil, failedPrecondition(operation, "target_generation", reason, nil)
 		}
 		for _, run := range target.Runs {
-			if run.Generation == target.CurrentGeneration && !run.State.Terminal() {
-				return nil, failedPrecondition(operation, "target_generation", "already has an active run", nil)
+			if run.Generation == target.CurrentGeneration {
+				return nil, failedPrecondition(operation, "target_generation", "already has a run and must be reset", nil)
 			}
 		}
 		now := c.clock().UTC()

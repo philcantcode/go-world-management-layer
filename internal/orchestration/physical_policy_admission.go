@@ -3,6 +3,7 @@ package orchestration
 import (
 	"fmt"
 
+	"github.com/philcantcode/go-world-management-layer/internal/domain"
 	"github.com/philcantcode/go-world-management-layer/internal/orchestration/policyauthority"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
 	"github.com/philcantcode/go-world-management-layer/policy"
@@ -29,6 +30,16 @@ func validateTargetPlanPhysicalReport(plan ports.TargetPlan, report ports.Target
 		report.Runtime.ImageDigest != plan.Template.ImageDigest.String() || report.Runtime.IsolationProfile != plan.Template.IsolationProfile {
 		return fmt.Errorf("%w: target physical policy report does not identify the exact plan", policyauthority.ErrPolicyDenied)
 	}
+	if plan.Template.Kind == domain.TargetAndroidVirtualDevice {
+		if report.Android.SystemImageDigest != plan.Template.ImageDigest.String() ||
+			report.Android.BaselineState != plan.Template.BaselineState ||
+			report.Android.HardwareAcceleration != plan.Template.RequireHardwareAcceleration ||
+			report.Android.Headless != plan.Template.Headless || report.Android.Rooted != plan.Template.Rooted ||
+			report.Android.Debuggable != plan.Template.Debuggable || report.Android.GuestMemoryBytes != plan.Template.GuestMemoryBytes ||
+			report.Android.BootTimeout != plan.Template.BootTimeout {
+			return fmt.Errorf("%w: Android physical policy report does not identify the exact virtual-device plan", policyauthority.ErrPolicyDenied)
+		}
+	}
 	if err := requireTargetPhysicalEnforcement(report); err != nil {
 		return err
 	}
@@ -52,13 +63,22 @@ func requireTargetPhysicalEnforcement(report ports.TargetPhysicalPolicyReport) e
 	if report.InteractionSupport != ports.PhysicalSupportEnforced || report.ResetSupport != ports.PhysicalSupportEnforced {
 		return fmt.Errorf("%w: target interaction and reset facts must be enforced", policyauthority.ErrPolicyDenied)
 	}
-	for name, support := range map[string]ports.PhysicalSupport{
-		"runtime.capabilities": report.Runtime.CapabilitySupport, "runtime.no_new_privileges": report.Runtime.NoNewPrivilegesSupport,
-		"runtime.user": report.Runtime.UserSupport, "runtime.seccomp": report.Runtime.SeccompSupport,
-	} {
-		if support != ports.PhysicalSupportEnforced {
-			return fmt.Errorf("%w: target %s is not enforced (%s)", policyauthority.ErrPolicyDenied, name, support)
+	switch report.Kind {
+	case string(domain.TargetLinuxContainer):
+		for name, support := range map[string]ports.PhysicalSupport{
+			"runtime.capabilities": report.Runtime.CapabilitySupport, "runtime.no_new_privileges": report.Runtime.NoNewPrivilegesSupport,
+			"runtime.user": report.Runtime.UserSupport, "runtime.seccomp": report.Runtime.SeccompSupport,
+		} {
+			if support != ports.PhysicalSupportEnforced {
+				return fmt.Errorf("%w: target %s is not enforced (%s)", policyauthority.ErrPolicyDenied, name, support)
+			}
 		}
+	case string(domain.TargetAndroidVirtualDevice):
+		if report.Android.HardwareAccelerationSupport != ports.PhysicalSupportEnforced || !report.Android.HardwareAcceleration {
+			return fmt.Errorf("%w: Android hardware acceleration is not enforced (%s)", policyauthority.ErrPolicyDenied, report.Android.HardwareAccelerationSupport)
+		}
+	default:
+		return fmt.Errorf("%w: target kind %q has no physical enforcement contract", policyauthority.ErrPolicyDenied, report.Kind)
 	}
 	if err := validatePhysicalResourceSupports(report.Resources); err != nil {
 		return err
@@ -143,8 +163,9 @@ func validatePhysicalResourceSupports(resources ports.ContainerResourcePhysicalF
 }
 
 type physicalLimitRequirement struct {
-	limit int64
-	fact  ports.PhysicalLimitFact
+	limit           int64
+	fact            ports.PhysicalLimitFact
+	requireWhenZero bool
 }
 
 func requireAgentResourceSupport(effective *policy.EffectivePolicy, resources ports.ContainerResourcePhysicalFacts) error {
@@ -153,18 +174,18 @@ func requireAgentResourceSupport(effective *policy.EffectivePolicy, resources po
 	}
 	document := effective.Policy()
 	limits := document.Spec.AgentWorkspace.Resources.Limits
-	if err := requirePhysicalLimitSupport("agent.resources.swap_bytes", resources.SwapBytes); err != nil {
-		return err
+	required := map[string]physicalLimitRequirement{
+		"agent.resources.cpu_milli":     requirePositivePhysicalLimit(limits.CPU.MilliCPU(), resources.CPUMilli),
+		"agent.resources.memory_bytes":  requirePositivePhysicalLimit(limits.Memory.Bytes(), resources.MemoryBytes),
+		"agent.resources.swap_bytes":    requirePhysicalLimit(limits.Swap.Bytes(), resources.SwapBytes),
+		"agent.resources.capture_bytes": requirePositivePhysicalLimit(document.Spec.Resources.AggregateLimits.CaptureBytes.Bytes(), resources.CaptureBytes),
+		"agent.resources.pids":          requirePositivePhysicalLimit(limits.PIDs, resources.PIDs),
 	}
-	return requireEnforcedLimits(map[string]physicalLimitRequirement{
-		"agent.resources.cpu_milli":       {limits.CPU.MilliCPU(), resources.CPUMilli},
-		"agent.resources.memory_bytes":    {limits.Memory.Bytes(), resources.MemoryBytes},
-		"agent.resources.swap_bytes":      {limits.Swap.Bytes(), resources.SwapBytes},
-		"agent.resources.workspace_bytes": {limits.Workspace.Bytes(), resources.WorkspaceBytes},
-		"agent.resources.capture_bytes":   {document.Spec.Resources.AggregateLimits.CaptureBytes.Bytes(), resources.CaptureBytes},
-		"agent.resources.inodes":          {limits.WorkspaceInodes, resources.Inodes},
-		"agent.resources.pids":            {limits.PIDs, resources.PIDs},
-	})
+	if document.Spec.Workspace.Mode != "directory-copy-non-production" {
+		required["agent.resources.workspace_bytes"] = requirePositivePhysicalLimit(limits.Workspace.Bytes(), resources.WorkspaceBytes)
+		required["agent.resources.inodes"] = requirePositivePhysicalLimit(limits.WorkspaceInodes, resources.Inodes)
+	}
+	return requireEnforcedLimits(required)
 }
 
 func requireAgentRuntimeSupport(resources ports.ContainerResourcePhysicalFacts) error {
@@ -185,33 +206,32 @@ func requireTargetResourceSupport(effective *policy.EffectivePolicy, templateNam
 		return fmt.Errorf("%w: target template %q is not allowed", policyauthority.ErrPolicyDenied, templateName)
 	}
 	limits := selected.Resources.Limits
-	if selected.Kind == "linux-container" {
-		if err := requirePhysicalLimitSupport("target.resources.swap_bytes", resources.SwapBytes); err != nil {
-			return err
-		}
-	}
 	required := map[string]physicalLimitRequirement{
-		"target.resources.cpu_milli":    {limits.CPU.MilliCPU(), resources.CPUMilli},
-		"target.resources.memory_bytes": {limits.Memory.Bytes(), resources.MemoryBytes},
-		"target.resources.swap_bytes":   {limits.Swap.Bytes(), resources.SwapBytes},
-		"target.resources.pids":         {limits.PIDs, resources.PIDs},
+		"target.resources.cpu_milli":    requirePositivePhysicalLimit(limits.CPU.MilliCPU(), resources.CPUMilli),
+		"target.resources.memory_bytes": requirePositivePhysicalLimit(limits.Memory.Bytes(), resources.MemoryBytes),
+		"target.resources.swap_bytes":   requirePositivePhysicalLimit(limits.Swap.Bytes(), resources.SwapBytes),
+		"target.resources.pids":         requirePositivePhysicalLimit(limits.PIDs, resources.PIDs),
+	}
+	if selected.Kind == "linux-container" {
+		required["target.resources.swap_bytes"] = requirePhysicalLimit(limits.Swap.Bytes(), resources.SwapBytes)
 	}
 	if selected.Material.WritableState != "private-directory-non-production" {
-		required["target.resources.writable_state_bytes"] = physicalLimitRequirement{limits.WritableState.Bytes(), resources.WritableStateBytes}
+		required["target.resources.writable_state_bytes"] = requirePositivePhysicalLimit(limits.WritableState.Bytes(), resources.WritableStateBytes)
 	}
 	return requireEnforcedLimits(required)
 }
 
-func requirePhysicalLimitSupport(name string, fact ports.PhysicalLimitFact) error {
-	if fact.Support != ports.PhysicalSupportEnforced {
-		return fmt.Errorf("%w: %s policy limit is not enforced (%s: %s)", policyauthority.ErrPolicyDenied, name, fact.Support, fact.Detail)
-	}
-	return nil
+func requirePositivePhysicalLimit(limit int64, fact ports.PhysicalLimitFact) physicalLimitRequirement {
+	return physicalLimitRequirement{limit: limit, fact: fact}
+}
+
+func requirePhysicalLimit(limit int64, fact ports.PhysicalLimitFact) physicalLimitRequirement {
+	return physicalLimitRequirement{limit: limit, fact: fact, requireWhenZero: true}
 }
 
 func requireEnforcedLimits(values map[string]physicalLimitRequirement) error {
 	for name, value := range values {
-		if value.limit > 0 && value.fact.Support != ports.PhysicalSupportEnforced {
+		if (value.limit > 0 || value.requireWhenZero) && value.fact.Support != ports.PhysicalSupportEnforced {
 			return fmt.Errorf("%w: %s policy limit is not enforced (%s: %s)", policyauthority.ErrPolicyDenied, name, value.fact.Support, value.fact.Detail)
 		}
 	}
@@ -250,7 +270,14 @@ func targetAdmission(report ports.TargetPhysicalPolicyReport) policyauthority.Ta
 		WritableStateEnforced: report.WritableStateEnforced && report.Resources.WritableStateBytes.Support == ports.PhysicalSupportEnforced,
 		CommandAuthority:      report.CommandAuthority, ExecTransport: report.ExecTransport, FileTransfer: report.FileTransfer,
 		NetworkEndpoints: report.NetworkEndpoints, DeniedInfrastructureAuthority: append([]string(nil), report.DeniedInfrastructureAuthority...),
+		ADB: report.ADB, DeviceScopedADBServices: report.DeviceScopedADBServices,
 		ResetAfterEveryRun: report.ResetAfterEveryRun, ResetMode: report.ResetMode,
+		BaselineState:                report.Android.BaselineState,
+		RequireHardwareAcceleration:  report.Android.HardwareAcceleration,
+		HardwareAccelerationEnforced: report.Android.HardwareAccelerationSupport == ports.PhysicalSupportEnforced,
+		Headless:                     report.Android.Headless, Rooted: report.Android.Rooted, Debuggable: report.Android.Debuggable,
+		GuestMemoryBytes: report.Android.GuestMemoryBytes,
+		BootTimeout:      report.Android.BootTimeout,
 		Resources: policyauthority.RuntimeResources{
 			CPUMilli: report.Resources.CPUMilli.Value, MemoryBytes: report.Resources.MemoryBytes.Value,
 			SwapBytes: report.Resources.SwapBytes.Value, WritableStateBytes: report.Resources.WritableStateBytes.Value,

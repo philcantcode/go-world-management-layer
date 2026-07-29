@@ -82,10 +82,18 @@ type BidiStream[Frame any] interface {
 	CloseSend() error
 }
 
+// PumpBidiOptions declares protocol-specific stream completion behavior.
+// Exec-style streams retain the zero-value requirement that input is
+// half-closed before the server may end. Request/response protocols such as
+// ADB may explicitly allow the server to complete first after replying.
+type PumpBidiOptions struct {
+	AllowServerEOFBeforeInputHalfClose bool
+}
+
 // PumpBidi sends a start frame, copies bounded chunks from input on the sole
 // sending goroutine, and delivers server frames to handle. The stream context
 // remains the caller's bound on a blocked or slow peer.
-func PumpBidi[Frame any](stream BidiStream[Frame], start *Frame, input io.Reader, inputFrame func([]byte) *Frame, endFrame func() *Frame, handle func(*Frame) error) error {
+func PumpBidi[Frame any](stream BidiStream[Frame], start *Frame, input io.Reader, inputFrame func([]byte) *Frame, endFrame func() *Frame, handle func(*Frame) error, options PumpBidiOptions) error {
 	if start == nil {
 		return fmt.Errorf("bidirectional stream start frame is nil")
 	}
@@ -148,6 +156,9 @@ func PumpBidi[Frame any](stream BidiStream[Frame], start *Frame, input io.Reader
 			case <-halfClosing:
 				return <-sendResult
 			default:
+				if options.AllowServerEOFBeforeInputHalfClose {
+					return nil
+				}
 				return fmt.Errorf("bidirectional stream closed before client input was half-closed")
 			}
 		}

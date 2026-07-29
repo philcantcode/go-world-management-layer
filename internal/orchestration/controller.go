@@ -11,6 +11,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/application"
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
+	"github.com/philcantcode/go-world-management-layer/internal/transport"
 )
 
 const defaultControllerCleanupTimeout = 10 * time.Second
@@ -300,14 +301,14 @@ func (c *Controller) provisionAgentPhysical(ctx context.Context, plan AgentProvi
 	if err != nil {
 		return err
 	}
-	if err := validateWorkspaceHandle(plan.Workspace, prepared, domain.WorkspaceReady, "prepare"); err != nil {
+	if err := validateWorkspaceHandle(plan.Workspace, prepared, "prepare", domain.WorkspaceReady, domain.WorkspaceMounted); err != nil {
 		return err
 	}
 	mounted, err := c.workspace.Mount(ctx, plan.Workspace.Workspace.ID())
 	if err != nil {
 		return err
 	}
-	if err := validateWorkspaceHandle(plan.Workspace, mounted, domain.WorkspaceMounted, "mount"); err != nil {
+	if err := validateWorkspaceHandle(plan.Workspace, mounted, "mount", domain.WorkspaceMounted); err != nil {
 		return err
 	}
 	if mounted.MergedPath != prepared.MergedPath {
@@ -359,12 +360,8 @@ func (c *Controller) CreateTarget(ctx context.Context, request application.Creat
 	if err != nil {
 		return target, c.failTargetProvisioningAttempt(request.Meta, target, driver, nil, prebound, err)
 	}
-	result, err := driver.Create(operationCtx, plan)
 	ref := ports.TargetRef{ID: plan.Target.ID(), Generation: plan.Generation.Spec().Generation}
-	if err != nil {
-		return target, c.failTargetProvisioningAttempt(request.Meta, target, driver, []ports.TargetRef{ref}, prebound, err)
-	}
-	if err := validateTargetProvisioningResult(plan, result); err != nil {
+	if _, err := c.provisionTargetPhysical(operationCtx, driver, plan); err != nil {
 		return target, c.failTargetProvisioningAttempt(request.Meta, target, driver, []ports.TargetRef{ref}, prebound, err)
 	}
 	target, err = c.advanceTargetReady(operationCtx, request.Meta, target)
@@ -372,6 +369,20 @@ func (c *Controller) CreateTarget(ctx context.Context, request application.Creat
 		return target, c.failTargetProvisioningAttempt(request.Meta, target, driver, []ports.TargetRef{ref}, prebound, err)
 	}
 	return target, nil
+}
+
+// provisionTargetPhysical establishes and verifies one initial target
+// generation. Startup reconciliation uses the same boundary as CreateTarget,
+// so a crash cannot weaken result validation on replay.
+func (c *Controller) provisionTargetPhysical(ctx context.Context, driver ports.TargetDriver, plan ports.TargetPlan) (ports.TargetResult, error) {
+	result, err := driver.Create(ctx, plan)
+	if err != nil {
+		return ports.TargetResult{}, err
+	}
+	if err := validateTargetProvisioningResult(plan, result); err != nil {
+		return ports.TargetResult{}, err
+	}
+	return result, nil
 }
 
 func (c *Controller) failTargetProvisioningAttempt(meta application.MutationMeta, target application.TargetRecord, driver ports.TargetDriver, refs []ports.TargetRef, prebound bool, cause error) error {
@@ -387,6 +398,12 @@ func (c *Controller) StartTargetRun(ctx context.Context, request application.Sta
 	if c.logicalOnly() {
 		return c.Core.StartTargetRun(ctx, request)
 	}
+	// Quarantine shares this lock through the capabilities service. Holding it
+	// for the complete physical start means either the run becomes fully bound
+	// first and quarantine evidence-finalizes it, or quarantine closes Ready
+	// admission first and this start is rejected by Core.
+	c.capabilities.targetRunLifecycleMu.Lock()
+	defer c.capabilities.targetRunLifecycleMu.Unlock()
 	operationCtx, cancel := context.WithDeadline(ctx, request.Meta.Deadline)
 	defer cancel()
 	target, err := c.Core.GetTarget(operationCtx, request.TargetID)
@@ -575,8 +592,8 @@ func (c *Controller) resetTargetPhysical(ctx context.Context, request applicatio
 	if err != nil {
 		return target, refs, err
 	}
-	if result.Status.TargetID != targetID || result.Status.Generation != reset.NextGeneration || !result.Status.Ready {
-		return target, refs, fmt.Errorf("target reset returned a mismatched or unready generation")
+	if err := requireReadyTargetStatus(result.Status, targetID, reset.NextGeneration, target.Kind); err != nil {
+		return target, refs, fmt.Errorf("target reset returned an invalid generation: %w", err)
 	}
 	target, err = c.advanceTargetReady(ctx, request.Meta, target)
 	return target, refs, err
@@ -935,7 +952,15 @@ func (c *Controller) destroyAgentAndWorkspace(ctx context.Context, ref ports.Age
 	if sealErr != nil {
 		return errors.Join(cleanup...)
 	}
-	return errors.Join(append(cleanup, c.releaseWorkspace(ctx, workspaceID))...)
+	releaseErr := c.releaseWorkspace(ctx, workspaceID)
+	cleanup = append(cleanup, releaseErr)
+	if err := endedCleanupContext(ctx, cleanup); err != nil {
+		return err
+	}
+	if releaseErr != nil {
+		return errors.Join(cleanup...)
+	}
+	return errors.Join(append(cleanup, c.requireWorkspaceAbsent(ctx, workspaceID))...)
 }
 
 // endedCleanupContext stops a best-effort cleanup walk once its shared budget
@@ -980,9 +1005,24 @@ func missingCapability(operation, field, message string) error {
 	return domain.NewError(domain.CodeCapabilityUnavailable, operation, field, message, nil)
 }
 
-func validateWorkspaceHandle(plan ports.WorkspacePlan, handle ports.WorkspaceHandle, state domain.WorkspaceState, operation string) error {
-	if handle.WorkspaceID != plan.Workspace.ID() || handle.State != state || strings.TrimSpace(handle.MergedPath) == "" {
-		return fmt.Errorf("workspace %s returned a mismatched identity, state, or merged path", operation)
+func validateWorkspaceHandle(plan ports.WorkspacePlan, handle ports.WorkspaceHandle, operation string, allowedStates ...domain.WorkspaceState) error {
+	stateAllowed := false
+	for _, state := range allowedStates {
+		if handle.State == state {
+			stateAllowed = true
+			break
+		}
+	}
+	if handle.WorkspaceID != plan.Workspace.ID() || !stateAllowed || strings.TrimSpace(handle.MergedPath) == "" {
+		return fmt.Errorf(
+			"workspace %s returned workspace_id=%s state=%s merged_path_present=%t; want workspace_id=%s state in %v and a merged path",
+			operation,
+			handle.WorkspaceID,
+			handle.State,
+			strings.TrimSpace(handle.MergedPath) != "",
+			plan.Workspace.ID(),
+			allowedStates,
+		)
 	}
 	if handle.PhysicalBytes < 0 || handle.PhysicalBytes > plan.UpperByteLimit || handle.Inodes < 0 || handle.Inodes > plan.UpperInodeLimit {
 		return fmt.Errorf("workspace %s exceeded its physical bounds", operation)
@@ -992,17 +1032,37 @@ func validateWorkspaceHandle(plan ports.WorkspacePlan, handle ports.WorkspaceHan
 
 func validateAgentProvisioningResult(plan ports.AgentWorkspacePlan, result ports.AgentWorkspaceResult) error {
 	spec := plan.Generation.Spec()
-	if result.Status.AgentWorkspaceID != spec.AgentWorkspaceID || result.Status.Generation != spec.Generation ||
-		result.Status.State != domain.AgentGenerationReady || !result.Status.Ready {
+	if err := requireReadyAgentStatus(result.Status, spec.AgentWorkspaceID, spec.Generation); err != nil {
 		return fmt.Errorf("agent driver returned a mismatched or unready generation")
 	}
 	return nil
 }
 
+func requireReadyAgentStatus(status ports.AgentWorkspaceStatus, agentID domain.AgentWorkspaceID, generation domain.AgentGeneration) error {
+	if status.AgentWorkspaceID != agentID || status.Generation != generation ||
+		status.State != domain.AgentGenerationReady || !status.Ready ||
+		strings.TrimSpace(status.ContainerID) == "" ||
+		status.GuestProtocol != uint32(transport.ProtocolVersion) || status.ObservedAt.IsZero() {
+		return fmt.Errorf("expected ready agent workspace %s generation %d", agentID, generation)
+	}
+	return nil
+}
+
 func validateTargetProvisioningResult(plan ports.TargetPlan, result ports.TargetResult) error {
-	if result.Status.TargetID != plan.Target.ID() || result.Status.Generation != plan.Generation.Spec().Generation ||
-		result.Status.Kind != plan.Template.Kind || result.Status.State != domain.TargetGenerationReady || !result.Status.Ready {
-		return fmt.Errorf("target driver returned a mismatched or unready generation")
+	if err := requireReadyTargetStatus(result.Status, plan.Target.ID(), plan.Generation.Spec().Generation, plan.Template.Kind); err != nil {
+		return fmt.Errorf("target driver returned an invalid generation: %w", err)
+	}
+	return nil
+}
+
+func requireReadyTargetStatus(status ports.TargetStatus, targetID domain.TargetID, generation domain.TargetGeneration, kind domain.TargetKind) error {
+	if status.TargetID != targetID || status.Generation != generation || status.Kind != kind ||
+		status.State != domain.TargetGenerationReady || !status.Ready || strings.TrimSpace(status.RuntimeID) == "" || status.ObservedAt.IsZero() ||
+		((kind == domain.TargetAndroidVirtualDevice || kind == domain.TargetPhysicalDevice) && strings.TrimSpace(status.DeviceSerial) == "") {
+		return fmt.Errorf(
+			"expected ready %s target %s generation %d, got target %s generation %d kind %s state %s ready=%t",
+			kind, targetID, generation, status.TargetID, status.Generation, status.Kind, status.State, status.Ready,
+		)
 	}
 	return nil
 }

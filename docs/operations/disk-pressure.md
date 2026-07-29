@@ -11,7 +11,7 @@ the control database or unfinalized evidence.
 2. Protect control-plane reserve. Do not delete the SQLite database, its WAL or
    shared-memory sidecars, open ledger segments, finalization reservations,
    canonical public-bundle stages, public bundle files/indexes/completions,
-version-5 observer markers or output transactions/objects, local seal/commit
+version-6 observer markers or output transactions/objects, local seal/commit
    markers, writable layers for active generations, or unacknowledged artifact
    staging.
 3. Reduce producers according to policy: increase observation of the pressure,

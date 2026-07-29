@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
+	"github.com/philcantcode/go-world-management-layer/internal/ports"
 )
 
 type MemoryAllocator struct {
@@ -86,14 +87,14 @@ func NewFixedAllocator(allocation Allocation) (*FixedAllocator, error) {
 	if err := allocation.Validate(); err != nil {
 		return nil, err
 	}
-	if !safeExactADBSerial(allocation.Serial) {
+	if err := ports.ValidateExactADBSerial(allocation.Serial); err != nil {
 		return nil, fmt.Errorf("fixed allocation serial is unsafe")
 	}
 	return &FixedAllocator{allocation: allocation}, nil
 }
 
 func NewAttachedEmulatorAllocator(serial string) (*FixedAllocator, error) {
-	if !safeExactADBSerial(serial) {
+	if err := ports.ValidateExactADBSerial(serial); err != nil {
 		return nil, fmt.Errorf("attached emulator serial is unsafe")
 	}
 	instanceNumber := 1

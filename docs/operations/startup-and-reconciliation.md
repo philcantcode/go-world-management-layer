@@ -57,12 +57,29 @@ startup gate in this order:
    reservation without a stage remains owned by its original finalization
    namespace/key/signature and is continued when interrupted-run recovery
    reaches the stop path.
-2. Enumerate every durable session and require complete, canonical physical
-   bindings for nonterminal generations and runs. Reconstruct each plan through
-   the trusted resolver and re-apply effective-policy admission. A changed plan
-   digest, provisioning key, policy pair, resource plan, or physical report is
-   an integrity/admission failure, not a reason to create something new.
-3. Parse every run-observer marker as format version 5 and match its filename
+2. Enumerate every durable session and reconstruct physical plans through the
+   trusted resolver, then re-apply effective-policy admission. Complete
+   bindings must match their exact digest, provisioning keys, policy pair, and
+   resource plan. Before preparing a workspace, replaying provisioning, or
+   performing any other ordinary physical mutation, collect every nonterminal
+   agent exec and invoke the exact persisted generation's crash reconciler.
+   It must stop or prove absent the old execution boundary, start the same
+   container generation, complete a fresh framed readiness exchange, and only
+   then mark the exec lost; an incomplete or wrong-protocol proof keeps RPC
+   admission closed. The one safe unbound exception is the first generation still
+   in `provisioning`: its workspace/agent keys are deterministically recovered
+   from the immutable session acquisition key, and its target key from the
+   immutable target creation key. Startup persists the binding, replays the
+   idempotent physical operation, validates the real result, and advances the
+   logical generation to ready before inventory. Bound active Docker agent
+   generations also replay `Prepare`/`Mount`/`Provision`, including a fresh
+   framed `world-guest` readiness exchange; a cached ready record is not proof
+   after process restart. A later unbound recovery generation, or an unbound
+   target reset whose mode/snapshot request cannot be reconstructed, is
+   reported as pending and must be continued by the exact original client
+   request. Startup never guesses those inputs. A partially present binding is
+   an integrity failure.
+3. Parse every run-observer marker as format version 6 and match its filename
    and recorded run ID to the exact durable target run. Require its immutable
    persisted run-plan digest and full observer start signature, every complete
    external `CollectorPlan`, and each `start_committed` flag to match the
@@ -83,48 +100,109 @@ startup gate in this order:
    entries fail reconciliation closed.
 4. Inventory agent and target runtimes. An expected container is adopted only
    when its complete structural labels and physical configuration match the
-   reconstructed plan. Missing, foreign, uncertain, conflicting, mismatched,
-   or unprovable orphan resources fail startup. A uniquely owned orphan is
+   reconstructed plan. Inventory receives active plans separately from
+   cleanup-only plans. Every cleanup-only entry is still the complete
+   historical plan reconstructed through the trusted resolver, including its
+   immutable digests and physical configuration; a generation reference,
+   runtime name, or labels alone never authorize deletion. Drivers retain
+   cleanup-only matches solely for `Stop`/`Destroy` and never expose them to
+   execution, transfer, run, or ordinary adoption paths. Missing, foreign,
+   uncertain, conflicting, mismatched,
+   or unprovable orphan resources fail startup. The current quarantined
+   generation is an expected stopped resource, never a terminal orphan; only a
+   durable lease cleanup/release decision makes it cleanup-eligible. A uniquely owned orphan is
    removed only when its bound generation is durably terminal (or cleanup is
    already durably authorized), and a second inventory must prove it absent.
+   If the runtime is authoritatively absent but exact driver-local target state
+   remains, inventory reports cleanup-required residue; startup removes it only
+   through that cleanup-only plan and requires the follow-up inventory to show
+   both runtime and residue absent. When a terminal Docker agent container is
+   absent, startup read-only inspects its exact persisted workspace identity,
+   then destroys and seals/releases any remaining workspace through the normal
+   generation-bound cleanup path. A failed or partial cleanup keeps admission
+   closed.
    Docker inventory remains global and fail-closed, but inspection is issued in
    bounded groups of 32 IDs to avoid one host process per container. Every
    requested ID must appear exactly once; a partial, duplicate, or substituted
    batch invalidates the entire snapshot. Direct one-container inspection uses
-   the same exact requested-ID check.
-5. Finalize every durably nonterminal target run as interrupted. For the Docker
+   the same exact requested-ID check. A `destroy_target` reservation is bound
+   to one exact target generation. If a crash leaves that generation ready or
+   resettable and physically adopted or already absent, startup re-establishes
+   the resettable boundary, repeats idempotent destruction, proves absence with
+   a second inventory, and commits `destroyed`. Missing is accepted for no
+   other expected generation. Driver reconciliation also validates durable
+   reset-transition receipts before rebuilding an exact Reset replay result;
+   a changed reset key or payload remains a conflict after restart.
+   A reset interrupted after Core created its successor is represented as an
+   exact predecessor/successor pair. Startup accepts only predecessor adopted
+   with successor authoritatively missing, or predecessor authoritatively
+   missing with successor adopted. It preserves both identities, destroys
+   neither, reports the successor as pending, and lets only the byte-equivalent
+   reset retry complete it. Both present, both absent, foreign, uncertain, or
+   conflicting observations fail closed. A recovery already marked resolved is
+   accepted only when its complete predecessor/successor plans and observations
+   still form the exact adopted/missing pair and the incident contains the
+   strategy-derived trusted physical completion action; a generic recovery
+   string cannot satisfy this proof.
+5. Resume an exact generation-bound quarantine intent without losing run
+   evidence. Close the `ready -> resettable` admission boundary first. Finalize
+   every bound interrupted run and require every current-generation run,
+   including an unbound crash-window record, to be terminal with its public
+   bundle and committed observer marker. Only then invoke target-wide physical
+   quarantine, persist its exact containment evidence, and commit the logical
+   quarantined state. If containment was already persisted while any run is
+   nonterminal, startup fails integrity checks; it never reopens the target to
+   manufacture a missing bundle. The contained target remains an expected
+   adopted resource.
+6. Finalize every other durably nonterminal target run as interrupted. For the Docker
    Linux target, the crash reconciler validates the adopted runtime identity,
-   force-stops leftover execution, re-inspects it to prove stopped, restarts the
-   clean inert target container, revalidates identity, and reconstructs only a
-   prepared run. It never calls `StartRun`, resumes the specimen, starts a
-   collector, or creates a new maximum-duration timer.
-6. Before observer evidence is reconstructed, old external collector ownership
-   must be provably dead. The built-in Linux process starter's parent-death
-   `SIGKILL`, including the parent-exit race, proves death of its directly
-   spawned process only. An adapter that daemonizes or leaves surviving helpers
-   is unsupported unless an external cgroup/process-tree supervisor supplies an
-   equivalent proof; custom starters and other platforms fail closed. The
-   output reconciler then classifies exactly one transaction per persisted
-   collector. It verifies and
-   retains valid finalized artifacts, durably aborts incomplete output and
-   removes its partial files, and accepts an absent transaction only when
-   `start_committed` is false. A present valid finalized transaction remains
-   authoritative even if the marker flag is false. It validates manifests,
+   force-stops the exact container and every process inside its boundary,
+   re-inspects it to prove stopped, and reconstructs only the persisted prepared
+   run for failed evidence. It never restarts the container, calls `StartRun`,
+   resumes the specimen, starts a collector, or creates a new duration timer.
+   For a managed Android SDK Emulator target, require the exact target/runtime
+   manifests, durable allocation and serial, runtime identity, generation-use
+   claim, and run/start records. The host process is adoptable only after its
+   canonical executable, generation-unique `-pidfile` argument, PID, and start
+   token have been durably committed. Stop and prove that exact tainted AVD
+   unreachable, reconstruct its persisted prepared run without reboot or ADB
+   cleanup, and finalize it with explicit control-plane-loss and opaque-change
+   evidence. Launch intent plus a PID can become ownership only when the live
+   canonical emulator/QEMU image has exactly one generation-specific `-pidfile`
+   argument; its PID and start token are committed before any use. If intent has
+   no such exactly bound live successor, startup does not infer ownership, kill
+   a candidate process, delete the AVD, or admit work. It reports an unresolved
+   physical conflict for exact operator containment or host reboot.
+7. Before observer evidence is reconstructed, old external collector ownership
+   must be provably dead. The built-in Windows starter atomically assigns each
+   collector tree to a private kill-on-close Job whose sole handle belongs to
+   the daemon; the built-in Linux starter's parent-death `SIGKILL`, including
+   the parent-exit race, proves death of its directly spawned process only. A
+   Linux adapter that daemonizes or leaves surviving helpers is unsupported
+   unless an external cgroup/process-tree supervisor supplies an equivalent
+   proof; custom starters and unsupported platforms fail closed. The output
+   reconciler then classifies exactly one transaction per persisted collector.
+   It retains valid finalized artifacts; for a start-committed exact partial
+   pair it fsyncs, bounds, and publishes the same canonical immutable artifacts
+   as normal finalization; and it durably aborts only uncommitted output. It
+   accepts an absent transaction only when `start_committed` is false. A present
+   valid finalized transaction remains authoritative even if the marker flag is
+   false. It validates manifests,
    roles, digests, sizes,
    byte limits, object reachability, file identity, and exact directory
    membership. Foreign/mismatched collectors, files, objects, or transaction
-   states fail startup. Even retained finalized output is accompanied by lost
+   states fail startup. Even retained or crash-finalized output is accompanied by lost
    continuity and explicit control-plane-loss gaps.
-7. Continue the ordered bundle saga for the failed run: immutable seal and
+8. Continue the ordered bundle saga for the failed run: immutable seal and
    artifact, canonical hash-chain-anchored public stage, Core terminal state,
    public file/index, committed observer marker, then `bundle.completed`.
    Link a `control_plane_failure` incident. Reads remain closed before the
    completion record; startup never rebuilds or invents evidence from a later
    state.
-8. Mark each nonterminal target operation attached to the interrupted run as
+9. Mark each nonterminal target operation attached to the interrupted run as
    `lost`. Verify all observer markers are committed. A repeated reconciliation
    leaves the already-terminal run and its existing bundle untouched.
-9. Only after physical/run recovery succeeds, resume every unfinished release
+10. Only after physical/run recovery succeeds, resume every unfinished release
    or due expiry through the durable lease-termination drain.
 
 Any failure aborts startup before an RPC can observe, reuse, or add work. A
@@ -164,19 +242,22 @@ does not change this server-side cleanup budget.
    non-overlapping roots. A physical selection without authoritative inventory,
    exact-plan reporting, run crash recovery, or observer cleanup proof fails.
 5. Retain the startup report fields for expected/unclaimed/conflicting agent and
-   target resources, removed terminal orphans, interrupted runs failed, target
-   operations lost, and lease terminations examined/begun/completed.
+   target resources, recovered and pending agent/target provisioning, pending
+   unbound runs, removed terminal orphans, resumed exact quarantines and target
+   destructions, interrupted runs failed, target operations lost, and lease
+   terminations examined/begun/completed.
 6. For an interrupted run, query the durable target after startup and require
    state `failed`, a non-empty sealed bundle/artifact/digest, a linked
    `control_plane_failure` incident, and at least one explicit
    control-plane-loss gap. Require every formerly active target operation to be
-   `lost`. Verify the version-5 marker is committed, the public stage/file/index
+   `lost`. Verify the version-6 marker is committed, the public stage/file/index
    and `bundle.completed` record agree, and each persisted collector output is
    exactly finalized or aborted. Never label the run resumed, even when
    finalized collector artifacts were retained.
 7. Classify any resource family outside the current daemon composition
-   separately. Android/Cuttlefish/physical devices have no daemon startup
-   reconciler; do not infer their safety from Linux reconciliation.
+   separately. Managed Android SDK Emulator targets have their own exact
+   startup reconciler; daemon-selected Cuttlefish and physical devices do not.
+   Do not infer one backend's safety from another backend's reconciliation.
 8. Confirm no stale target transport remains, no old specimen/collector process
    survived, terminal runs were not rewritten, live cursors are monotonic, and
    artifact staging remains pinned.

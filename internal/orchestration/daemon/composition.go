@@ -3,7 +3,9 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -12,7 +14,9 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
 	agentdocker "github.com/philcantcode/go-world-management-layer/internal/drivers/agent/docker"
 	"github.com/philcantcode/go-world-management-layer/internal/drivers/command"
+	"github.com/philcantcode/go-world-management-layer/internal/drivers/deviceproxy"
 	observerprocess "github.com/philcantcode/go-world-management-layer/internal/drivers/observer/process"
+	"github.com/philcantcode/go-world-management-layer/internal/drivers/target/cuttlefish"
 	"github.com/philcantcode/go-world-management-layer/internal/drivers/target/linuxcontainer"
 	workspacedirectory "github.com/philcantcode/go-world-management-layer/internal/drivers/workspace/directory"
 	"github.com/philcantcode/go-world-management-layer/internal/ledger"
@@ -32,6 +36,7 @@ type hostComposition struct {
 	observers             *orchestration.RunObserverCoordinator
 	policyAdmission       orchestration.PolicyAdmissionConfig
 	capabilityFingerprint domain.CapabilityFingerprint
+	close                 func() error
 }
 
 type agentDriverConfig struct {
@@ -49,6 +54,24 @@ type linuxTargetDriverConfig struct {
 	AllowPtrace     bool
 }
 
+type androidTargetDriverConfig struct {
+	TargetRoot           string
+	SystemImageRoot      string
+	SDKRoot              string
+	ADBBinary            string
+	ADBServer            string
+	EmulatorBinary       string
+	SDKManagerBinary     string
+	AVDManagerBinary     string
+	BackendVersion       string
+	RuntimeVersion       string
+	FirstConsolePort     int
+	MaximumTransferBytes int64
+	MaximumADBBytes      int64
+	ShutdownTimeout      time.Duration
+	SystemImages         map[string]string
+}
+
 type observerDriverConfig struct {
 	Adapters   []observerprocess.Adapter
 	OutputRoot string
@@ -58,6 +81,7 @@ type compositionFactories struct {
 	newWorkspace func(string) (ports.WorkspaceDriver, error)
 	newAgent     func(agentDriverConfig) (ports.AgentWorkspaceDriver, error)
 	newTarget    func(linuxTargetDriverConfig, linuxcontainer.CollectorReadiness) (ports.TargetDriver, error)
+	newAndroid   func(androidTargetDriverConfig, cuttlefish.CollectorReadiness) (ports.TargetDriver, error)
 	newObserver  func(observerDriverConfig) (ports.ObserverDriver, error)
 	verifyImage  func(context.Context, string, string) error
 }
@@ -87,6 +111,7 @@ func productionCompositionFactories() compositionFactories {
 				Runtime: containerRuntime, Collectors: readiness,
 			})
 		},
+		newAndroid: newManagedAndroidTargetDriver,
 		newObserver: func(config observerDriverConfig) (ports.ObserverDriver, error) {
 			outputs, err := observerprocess.NewLocalOutputFactory(observerprocess.LocalOutputConfig{Root: config.OutputRoot})
 			if err != nil {
@@ -98,16 +123,107 @@ func productionCompositionFactories() compositionFactories {
 	}
 }
 
+func newManagedAndroidTargetDriver(config androidTargetDriverConfig, readiness cuttlefish.CollectorReadiness) (_ ports.TargetDriver, resultErr error) {
+	images := managedAndroidSystemImages(config.SystemImages)
+	backend, err := cuttlefish.NewManagedEmulatorBackend(cuttlefish.ManagedEmulatorBackendConfig{
+		EmulatorBinary: config.EmulatorBinary, ADBBinary: config.ADBBinary, ADBServerEndpoint: config.ADBServer,
+		SDKManagerBinary: config.SDKManagerBinary, AVDManagerBinary: config.AVDManagerBinary,
+		SDKRoot: config.SDKRoot, StateRoot: config.TargetRoot, SystemImages: images,
+		ShutdownTimeout: config.ShutdownTimeout,
+	})
+	if err != nil {
+		return nil, err
+	}
+	config.EmulatorBinary = backend.EmulatorExecutableIdentity()
+	allocator, err := cuttlefish.NewDurableEmulatorAllocator(cuttlefish.DurableEmulatorAllocatorConfig{
+		StateRoot: filepath.Join(config.TargetRoot, "allocations"), FirstConsolePort: config.FirstConsolePort,
+		LastConsolePort: cuttlefish.ManagedEmulatorMaxConsolePort, ListenHost: "127.0.0.1",
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		resultErr = closeResourceOnConstructionFailure(resultErr, allocator, "close durable Android emulator allocator")
+	}()
+	gateway, err := cuttlefish.NewDeviceProxyGateway(deviceproxy.GatewayConfig{
+		UpstreamAddress: config.ADBServer, MaximumConnectionDuration: maximumConfiguredRunWindow,
+		MaximumStreamBytes: config.MaximumADBBytes,
+	})
+	if err != nil {
+		return nil, err
+	}
+	files, err := cuttlefish.NewCommandFileGateway(cuttlefish.CommandFileGatewayConfig{
+		ADBBinary: config.ADBBinary, ADBServerEndpoint: config.ADBServer, StagingRoot: filepath.Join(config.TargetRoot, "adb-staging"),
+		MaximumTransferBytes: config.MaximumTransferBytes,
+	})
+	if err != nil {
+		return nil, err
+	}
+	deviceConfigDigest, err := androidDeviceConfigDigest(config)
+	if err != nil {
+		return nil, err
+	}
+	driver, err := cuttlefish.New(cuttlefish.Config{
+		Build: cuttlefish.BuildConfig{
+			TargetRoot: config.TargetRoot, SystemImageRoot: config.SystemImageRoot,
+			ADBServerEndpoint: config.ADBServer,
+			BackendVersion:    config.BackendVersion, RuntimeVersion: config.RuntimeVersion,
+			DeviceConfigDigest: deviceConfigDigest,
+			Features:           []string{"adb-scoped-gateway", "guest-data-partition", "hardware-acceleration", "headless", "rooted"},
+		},
+		Backend: backend, Allocator: allocator, Gateway: gateway, Files: files, Collectors: readiness,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return driver, nil
+}
+
+func closeResourceOnConstructionFailure(constructionErr error, resource io.Closer, description string) error {
+	if constructionErr == nil || resource == nil {
+		return constructionErr
+	}
+	if closeErr := resource.Close(); closeErr != nil {
+		return errors.Join(constructionErr, fmt.Errorf("%s: %w", description, closeErr))
+	}
+	return constructionErr
+}
+
+func managedAndroidSystemImages(configured map[string]string) map[string]cuttlefish.ManagedSystemImage {
+	images := make(map[string]cuttlefish.ManagedSystemImage, len(configured))
+	for digest, packageID := range configured {
+		images[digest] = cuttlefish.ManagedSystemImage{Package: packageID}
+	}
+	return images
+}
+
+func androidDeviceConfigDigest(config androidTargetDriverConfig) (domain.Digest, error) {
+	digest, err := cuttlefish.ManagedEmulatorDeviceConfigDigest(cuttlefish.ManagedEmulatorDeviceConfigIdentity{
+		EmulatorBinary: config.EmulatorBinary, ADBBinary: config.ADBBinary,
+		SDKManagerBinary: config.SDKManagerBinary, AVDManagerBinary: config.AVDManagerBinary,
+		SDKRoot: config.SDKRoot, ADBServerEndpoint: config.ADBServer,
+		ExpectedBackendVersion: config.BackendVersion, ExpectedRuntimeVersion: config.RuntimeVersion,
+		BaseConsolePort: config.FirstConsolePort, LastConsolePort: cuttlefish.ManagedEmulatorMaxConsolePort, SystemImages: managedAndroidSystemImages(config.SystemImages),
+	})
+	if err != nil {
+		return domain.Digest{}, fmt.Errorf("fingerprint managed Android device configuration: %w", err)
+	}
+	return digest, nil
+}
+
 func configureHostDrivers(ctx context.Context, configuration config, observations *ledger.Ledger, policies *policyauthority.Authority) (hostComposition, error) {
 	return configureHostDriversWithFactories(ctx, configuration, observations, policies, productionCompositionFactories())
 }
 
-func configureHostDriversWithFactories(ctx context.Context, configuration config, observations *ledger.Ledger, policies *policyauthority.Authority, factories compositionFactories) (hostComposition, error) {
+func configureHostDriversWithFactories(ctx context.Context, configuration config, observations *ledger.Ledger, policies *policyauthority.Authority, factories compositionFactories) (composition hostComposition, resultErr error) {
+	ownedResources := make([]io.Closer, 0, 1)
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, closeCompositionResources(ownedResources))
+		}
+	}()
 	if configuration.materialDriver != "local" {
 		return hostComposition{}, unavailableDriver("material-driver", configuration.materialDriver, "this binary supports the local scope-bound material authority")
-	}
-	if configuration.androidTargetDriver != "none" {
-		return hostComposition{}, unavailableDriver("android-target-driver", configuration.androidTargetDriver, "Android composition requires its device allocator and scoped ADB gateway")
 	}
 	if configuration.physicalTargetDriver != "none" {
 		return hostComposition{}, unavailableDriver("physical-target-driver", configuration.physicalTargetDriver, "physical devices require an injected device authority and containment controller")
@@ -124,8 +240,14 @@ func configureHostDriversWithFactories(ctx context.Context, configuration config
 	if policies == nil {
 		return hostComposition{}, fmt.Errorf("physical composition requires a durable effective-policy authority")
 	}
-	if factories.newWorkspace == nil || factories.newAgent == nil || factories.newTarget == nil || factories.verifyImage == nil {
+	if factories.newWorkspace == nil || factories.newAgent == nil || factories.verifyImage == nil {
 		return hostComposition{}, fmt.Errorf("physical composition factory is incomplete")
+	}
+	if configuration.linuxTargetDriver == "docker" && factories.newTarget == nil {
+		return hostComposition{}, fmt.Errorf("Linux target composition factory is incomplete")
+	}
+	if configuration.androidTargetDriver == "android-emulator" && factories.newAndroid == nil {
+		return hostComposition{}, fmt.Errorf("Android target composition factory is incomplete")
 	}
 	loadCtx, cancel := context.WithTimeout(ctx, configuration.probeTimeout)
 	deployment, err := loadDeployment(loadCtx, configuration.deploymentProfile, configuration.materialRoot, configuration.maxBundleBytes)
@@ -147,14 +269,29 @@ func configureHostDriversWithFactories(ctx context.Context, configuration config
 		return hostComposition{}, fmt.Errorf("agent-image-repository %q does not match deployment profile repository %q", configuration.agentImageRepository, deployment.agentRepository)
 	}
 	if configuration.linuxTargetDriver == "docker" {
-		if len(deployment.targetTemplates) == 0 || deployment.targetRepository == "" {
+		if len(deployment.linuxTargets) == 0 || deployment.targetRepository == "" {
 			return hostComposition{}, fmt.Errorf("linux-target-driver=docker requires target templates in the deployment profile")
 		}
 		if configuration.targetImageRepository != "" && configuration.targetImageRepository != deployment.targetRepository {
 			return hostComposition{}, fmt.Errorf("target-image-repository %q does not match deployment profile repository %q", configuration.targetImageRepository, deployment.targetRepository)
 		}
-	} else if len(deployment.targetTemplates) != 0 || deployment.runCount != 0 {
-		return hostComposition{}, fmt.Errorf("deployment profile contains target or run plans while linux-target-driver is disabled")
+	} else if len(deployment.linuxTargets) != 0 {
+		return hostComposition{}, fmt.Errorf("deployment profile contains Linux target plans while linux-target-driver is disabled")
+	}
+	if configuration.androidTargetDriver != "none" {
+		if len(deployment.androidTargets) == 0 {
+			return hostComposition{}, fmt.Errorf("android-target-driver requires Android target templates in the deployment profile")
+		}
+		for _, template := range deployment.androidTargets {
+			if template.Driver != configuration.androidTargetDriver {
+				return hostComposition{}, fmt.Errorf("Android target template %q selects driver %q but android-target-driver=%s", template.Name, template.Driver, configuration.androidTargetDriver)
+			}
+		}
+	} else if len(deployment.androidTargets) != 0 {
+		return hostComposition{}, fmt.Errorf("deployment profile contains Android target plans while android-target-driver is disabled")
+	}
+	if len(deployment.targetTemplates) == 0 && deployment.runCount != 0 {
+		return hostComposition{}, fmt.Errorf("deployment profile contains run plans without an enabled target driver")
 	}
 	if err := validatePhysicalRootSeparation(configuration, deployment.sourceRoot); err != nil {
 		return hostComposition{}, err
@@ -190,7 +327,7 @@ func configureHostDriversWithFactories(ctx context.Context, configuration config
 		return hostComposition{}, fmt.Errorf("agent driver does not expose physical policy facts")
 	}
 	agentReporter, err := policyauthority.NewAgentPhysicalPolicyReporter(rawAgentReporter, policyauthority.AgentPhysicalEnforcement{
-		DirectoryWorkspace: true, BoundedLedgerCapture: configuration.captureDriver == "ledger",
+		BoundedLedgerCapture: configuration.captureDriver == "ledger",
 	})
 	if err != nil {
 		return hostComposition{}, fmt.Errorf("compose agent physical policy reporter: %w", err)
@@ -254,8 +391,6 @@ func configureHostDriversWithFactories(ctx context.Context, configuration config
 	targets := make(map[domain.TargetKind]ports.TargetDriver)
 	targetReporters := make(map[domain.TargetKind]ports.TargetPhysicalPolicyReporter)
 	targetPhysicalReports := make(map[domain.TargetKind]map[string]ports.TargetPhysicalPolicyReport)
-	var targetFingerprint domain.CapabilityFingerprint
-	var targetPhysicalFingerprint domain.CapabilityFingerprint
 	if configuration.linuxTargetDriver == "docker" {
 		readiness, err := orchestration.NewLedgerCollectorReadiness(observations)
 		if err != nil {
@@ -272,56 +407,66 @@ func configureHostDriversWithFactories(ctx context.Context, configuration config
 		if !ok {
 			return hostComposition{}, fmt.Errorf("Linux target driver does not expose physical policy facts")
 		}
-		for _, expected := range deployment.targetTemplates {
-			configured := expected
-			configuredPlan, found := deployment.static.Targets[configured.Name]
-			if !found {
-				return hostComposition{}, fmt.Errorf("Linux target template %q has no authoritative provisioning plan", configured.Name)
-			}
-			if err := runProbe(ctx, configuration.probeTimeout, "Linux target template "+configured.Name, func(probeCtx context.Context) error {
-				fingerprint, err := target.Probe(probeCtx, configured)
-				if err != nil {
-					return err
-				}
-				if err := requireProbeCapabilities(fingerprint, "target.linux-container", "target.visibility-first"); err != nil {
-					return err
-				}
-				if targetFingerprint.Digest().IsZero() {
-					targetFingerprint = fingerprint
-				} else if targetFingerprint.Digest() != fingerprint.Digest() {
-					return fmt.Errorf("Linux target templates produced different physical capability fingerprints")
-				}
-				return nil
-			}); err != nil {
-				return hostComposition{}, err
-			}
-			var physicalReport ports.TargetPhysicalPolicyReport
-			if err := runProbe(ctx, configuration.probeTimeout, "Linux target physical policy "+configured.Name, func(probeCtx context.Context) error {
-				var reportErr error
-				physicalReport, reportErr = targetReporter.TargetPhysicalPolicy(probeCtx, configured)
-				return reportErr
-			}); err != nil {
-				return hostComposition{}, err
-			}
-			physicalReport = policyauthority.WithTargetConfiguredResources(physicalReport, configuredPlan.Resources)
-			fingerprint, err := policyauthority.TargetPhysicalPolicyFingerprint(physicalReport)
-			if err != nil {
-				return hostComposition{}, fmt.Errorf("fingerprint Linux target physical policy: %w", err)
-			}
-			if targetPhysicalFingerprint.Digest().IsZero() {
-				targetPhysicalFingerprint = fingerprint
-			} else if targetPhysicalFingerprint.Digest() != fingerprint.Digest() {
-				return hostComposition{}, fmt.Errorf("Linux target templates produced different physical policy facts")
-			}
-			if targetPhysicalReports[configured.Kind] == nil {
-				targetPhysicalReports[configured.Kind] = make(map[string]ports.TargetPhysicalPolicyReport)
-			}
-			targetPhysicalReports[configured.Kind][configured.Name] = physicalReport
+		targetFingerprint, targetPhysicalFingerprint, reports, err := probeTargetTemplates(ctx, configuration.probeTimeout, deployment, targetProbeSpec{
+			Label: "Linux target", Kind: domain.TargetLinuxContainer, Templates: deployment.linuxTargets,
+			Capabilities: []string{"target.linux-container", "target.visibility-first"}, OperatingSystem: "linux",
+		}, target, targetReporter)
+		if err != nil {
+			return hostComposition{}, err
 		}
+		targetPhysicalReports[domain.TargetLinuxContainer] = reports
 		targets[domain.TargetLinuxContainer] = target
 		targetReporters[domain.TargetLinuxContainer] = targetReporter
 		capabilityComponents = append(capabilityComponents, policyauthority.CapabilityComponent{Name: "linux-target", Fingerprint: targetFingerprint})
 		capabilityComponents = append(capabilityComponents, policyauthority.CapabilityComponent{Name: "linux-target-physical", Fingerprint: targetPhysicalFingerprint})
+	}
+	if configuration.androidTargetDriver == "android-emulator" {
+		readiness, err := orchestration.NewLedgerCollectorReadiness(observations)
+		if err != nil {
+			return hostComposition{}, fmt.Errorf("open Android collector readiness gate: %w", err)
+		}
+		target, err := factories.newAndroid(androidTargetDriverConfig{
+			TargetRoot: configuration.androidTargetRoot, SystemImageRoot: configuration.androidSystemImageRoot,
+			SDKRoot: configuration.androidSDKRoot, ADBBinary: configuration.androidADBBinary,
+			ADBServer: configuration.androidADBServer, EmulatorBinary: configuration.androidEmulatorBinary,
+			SDKManagerBinary: configuration.androidSDKManagerBinary, AVDManagerBinary: configuration.androidAVDManagerBinary,
+			BackendVersion: configuration.androidBackendVersion, RuntimeVersion: configuration.androidRuntimeVersion,
+			FirstConsolePort: configuration.androidADBBasePort, MaximumTransferBytes: configuration.maxTransferBytes,
+			MaximumADBBytes: configuration.maxADBBytes, ShutdownTimeout: configuration.controlTimeout,
+			SystemImages: deployment.androidImages,
+		}, readiness)
+		if err != nil {
+			return hostComposition{}, fmt.Errorf("open managed Android target driver: %w", err)
+		}
+		closer, ok := target.(io.Closer)
+		if !ok {
+			return hostComposition{}, fmt.Errorf("managed Android target driver does not expose durable allocator shutdown")
+		}
+		ownedResources = append(ownedResources, closer)
+		if _, ok := target.(ports.TargetReconciler); !ok {
+			return hostComposition{}, fmt.Errorf("managed Android target driver does not expose authoritative reconciliation")
+		}
+		if _, ok := target.(ports.TargetRunCrashReconciler); !ok {
+			return hostComposition{}, fmt.Errorf("managed Android target driver does not expose interrupted-run recovery")
+		}
+		targetReporter, ok := target.(ports.TargetPhysicalPolicyReporter)
+		if !ok {
+			return hostComposition{}, fmt.Errorf("managed Android target driver does not expose physical policy facts")
+		}
+		targetFingerprint, targetPhysicalFingerprint, reports, err := probeTargetTemplates(ctx, configuration.probeTimeout, deployment, targetProbeSpec{
+			Label: "Android target", Kind: domain.TargetAndroidVirtualDevice, Templates: deployment.androidTargets,
+			Capabilities: []string{"target.android-virtual", "target.android-reset", "target.scoped-adb"}, OperatingSystem: "android",
+		}, target, targetReporter)
+		if err != nil {
+			return hostComposition{}, err
+		}
+		targetPhysicalReports[domain.TargetAndroidVirtualDevice] = reports
+		targets[domain.TargetAndroidVirtualDevice] = target
+		targetReporters[domain.TargetAndroidVirtualDevice] = targetReporter
+		capabilityComponents = append(capabilityComponents,
+			policyauthority.CapabilityComponent{Name: "android-target", Fingerprint: targetFingerprint},
+			policyauthority.CapabilityComponent{Name: "android-target-physical", Fingerprint: targetPhysicalFingerprint},
+		)
 	}
 	coverage := compositionIntrinsicCoverage(targets)
 	combinedFingerprint, err := policyauthority.BuildCapabilityFingerprint(policyauthority.CapabilityFacts{
@@ -362,7 +507,18 @@ func configureHostDriversWithFactories(ctx context.Context, configuration config
 		agent: agent, targets: targets, workspace: workspace, material: deployment.authority,
 		captures: captures, resolver: deployment.resolver, profileDigest: deployment.profileDigest, observers: coordinator,
 		policyAdmission: admissionConfig, capabilityFingerprint: combinedFingerprint,
+		close: func() error { return closeCompositionResources(ownedResources) },
 	}, nil
+}
+
+func closeCompositionResources(resources []io.Closer) error {
+	errorsFound := make([]error, 0, len(resources))
+	for index := len(resources) - 1; index >= 0; index-- {
+		if resources[index] != nil {
+			errorsFound = append(errorsFound, resources[index].Close())
+		}
+	}
+	return errors.Join(errorsFound...)
 }
 
 func runObserverCoordinatorConfig(configuration config, driver ports.ObserverDriver, observations *ledger.Ledger) orchestration.RunObserverCoordinatorConfig {
@@ -386,6 +542,10 @@ func runProbe(parent context.Context, timeout time.Duration, name string, probe 
 }
 
 func requireProbeCapabilities(fingerprint domain.CapabilityFingerprint, names ...string) error {
+	return requireProbeCapabilitiesForOS(fingerprint, "linux", names...)
+}
+
+func requireProbeCapabilitiesForOS(fingerprint domain.CapabilityFingerprint, expectedOS string, names ...string) error {
 	if fingerprint.Digest().IsZero() {
 		return fmt.Errorf("driver returned an empty capability fingerprint")
 	}
@@ -395,10 +555,71 @@ func requireProbeCapabilities(fingerprint domain.CapabilityFingerprint, names ..
 			return fmt.Errorf("driver does not report required capability %q as supported", name)
 		}
 	}
-	if operatingSystem := strings.ToLower(strings.TrimSpace(fingerprint.Evidence()["os"])); operatingSystem != "linux" {
-		return fmt.Errorf("driver reports operating system %q; a Linux Docker engine is required", operatingSystem)
+	if operatingSystem := strings.ToLower(strings.TrimSpace(fingerprint.Evidence()["os"])); operatingSystem != expectedOS {
+		return fmt.Errorf("driver reports operating system %q; %s is required", operatingSystem, expectedOS)
 	}
 	return nil
+}
+
+type targetProbeSpec struct {
+	Label           string
+	Kind            domain.TargetKind
+	Templates       []ports.TargetTemplate
+	Capabilities    []string
+	OperatingSystem string
+}
+
+func probeTargetTemplates(ctx context.Context, timeout time.Duration, deployment builtDeployment, spec targetProbeSpec, target ports.TargetDriver, reporter ports.TargetPhysicalPolicyReporter) (domain.CapabilityFingerprint, domain.CapabilityFingerprint, map[string]ports.TargetPhysicalPolicyReport, error) {
+	var capabilityFingerprint domain.CapabilityFingerprint
+	var physicalFingerprint domain.CapabilityFingerprint
+	reports := make(map[string]ports.TargetPhysicalPolicyReport, len(spec.Templates))
+	for _, expected := range spec.Templates {
+		configured := expected
+		if configured.Kind != spec.Kind {
+			return domain.CapabilityFingerprint{}, domain.CapabilityFingerprint{}, nil, fmt.Errorf("%s template %q has kind %q", spec.Label, configured.Name, configured.Kind)
+		}
+		configuredPlan, found := deployment.static.Targets[configured.Name]
+		if !found {
+			return domain.CapabilityFingerprint{}, domain.CapabilityFingerprint{}, nil, fmt.Errorf("%s template %q has no authoritative provisioning plan", spec.Label, configured.Name)
+		}
+		if err := runProbe(ctx, timeout, spec.Label+" template "+configured.Name, func(probeCtx context.Context) error {
+			fingerprint, err := target.Probe(probeCtx, configured)
+			if err != nil {
+				return err
+			}
+			if err := requireProbeCapabilitiesForOS(fingerprint, spec.OperatingSystem, spec.Capabilities...); err != nil {
+				return err
+			}
+			if capabilityFingerprint.Digest().IsZero() {
+				capabilityFingerprint = fingerprint
+			} else if capabilityFingerprint.Digest() != fingerprint.Digest() {
+				return fmt.Errorf("%s templates produced different physical capability fingerprints", spec.Label)
+			}
+			return nil
+		}); err != nil {
+			return domain.CapabilityFingerprint{}, domain.CapabilityFingerprint{}, nil, err
+		}
+		var report ports.TargetPhysicalPolicyReport
+		if err := runProbe(ctx, timeout, spec.Label+" physical policy "+configured.Name, func(probeCtx context.Context) error {
+			var reportErr error
+			report, reportErr = reporter.TargetPhysicalPolicy(probeCtx, configured)
+			return reportErr
+		}); err != nil {
+			return domain.CapabilityFingerprint{}, domain.CapabilityFingerprint{}, nil, err
+		}
+		report = policyauthority.WithTargetConfiguredResources(report, configuredPlan.Resources)
+		fingerprint, err := policyauthority.TargetPhysicalPolicyFingerprint(report)
+		if err != nil {
+			return domain.CapabilityFingerprint{}, domain.CapabilityFingerprint{}, nil, fmt.Errorf("fingerprint %s physical policy: %w", spec.Label, err)
+		}
+		if physicalFingerprint.Digest().IsZero() {
+			physicalFingerprint = fingerprint
+		} else if physicalFingerprint.Digest() != fingerprint.Digest() {
+			return domain.CapabilityFingerprint{}, domain.CapabilityFingerprint{}, nil, fmt.Errorf("%s templates produced different physical policy facts", spec.Label)
+		}
+		reports[configured.Name] = report
+	}
+	return capabilityFingerprint, physicalFingerprint, reports, nil
 }
 
 func requireObserverProbe(fingerprint domain.CapabilityFingerprint, adapter string) error {
@@ -417,6 +638,9 @@ func compositionIntrinsicCoverage(targets map[domain.TargetKind]ports.TargetDriv
 	coverage := make(map[string][]string)
 	if _, configured := targets[domain.TargetLinuxContainer]; configured {
 		coverage["linux-container"] = []string{ports.TargetLifecycleSignal}
+	}
+	if _, configured := targets[domain.TargetAndroidVirtualDevice]; configured {
+		coverage["android-virtual-device"] = []string{ports.TargetLifecycleSignal}
 	}
 	return coverage
 }
@@ -480,6 +704,22 @@ func validatePhysicalRootSeparation(configuration config, sourceRoot string) err
 			name string
 			path string
 		}{"target-root", configuration.targetRoot})
+	}
+	if configuration.androidTargetDriver != "none" {
+		roots = append(roots,
+			struct {
+				name string
+				path string
+			}{"android-target-root", configuration.androidTargetRoot},
+			struct {
+				name string
+				path string
+			}{"android-system-image-root", configuration.androidSystemImageRoot},
+			struct {
+				name string
+				path string
+			}{"android-sdk-root", configuration.androidSDKRoot},
+		)
 	}
 	if configuration.captureDriver == "ledger" {
 		roots = append(roots, struct {

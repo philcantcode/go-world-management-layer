@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	observerStateVersion               = uint32(5)
+	observerStateVersion               = uint32(6)
 	observerStateSource                = "world.run-observer-coordinator"
 	maximumObserverStateMarkerBytes    = int64(4 << 20)
 	defaultMaximumObserverJournalBytes = int64(64 << 20)
@@ -120,6 +120,9 @@ type runObserverRecord struct {
 	stoppedAt             time.Time
 	phase                 string
 	timer                 *time.Timer
+	timerGeneration       uint64
+	stopDeadline          time.Time
+	stopResumePhase       string
 	stopResult            *RunObservationEvidence
 	targetEventIDs        []domain.EventID
 	targetAppended        int
@@ -592,37 +595,98 @@ func (c *RunObserverCoordinator) Start(ctx context.Context, input RunObserverSta
 	if err := c.persistMarker(record); err != nil {
 		return errors.Join(err, c.stopStartedDetached(record))
 	}
-	duration := input.Plan.MaximumDuration
-	record.timer = time.AfterFunc(duration, func() {
-		deadlineCtx, cancel := context.WithTimeout(context.Background(), c.cleanupTimeout)
-		defer cancel()
-		stop := RunObserverStop{RunID: input.Plan.Run.ID(), TargetStoppedAt: c.clock().UTC()}
-		for attempt := 0; attempt < 3 && deadlineCtx.Err() == nil; attempt++ {
-			if _, err := c.Stop(deadlineCtx, stop); err == nil {
-				return
-			}
-		}
-	})
+	record.stopDeadline = c.clock().UTC().Add(input.Plan.MaximumDuration)
+	c.armMaximumDurationTimer(record)
 	return nil
 }
 
-func (c *RunObserverCoordinator) Stop(ctx context.Context, input RunObserverStop) (RunObservationEvidence, error) {
-	if input.RunID.IsZero() {
-		return RunObservationEvidence{}, domain.NewError(domain.CodeInvalidArgument, "run_observers.stop", "run_id", "must be set", nil)
-	}
+// PrepareStop durably arms every external collector before the target is
+// stopped. An armed collector keeps running; Stop is the commit point that
+// transfers its final output into observer evidence.
+func (c *RunObserverCoordinator) PrepareStop(ctx context.Context, runID domain.TargetRunID) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	record := c.records[input.RunID.String()]
-	if record == nil {
-		return RunObservationEvidence{}, domain.NewError(domain.CodeNotFound, "run_observers.stop", "run_id", "has no coordinator state in this process; restart reconciliation is required", nil)
+	record, err := c.requireRunRecordLocked(runID, "run_observers.prepare_stop")
+	if err != nil {
+		return err
 	}
+	switch record.phase {
+	case "stop-prepared":
+		return nil
+	case "stopping", "stopped", "committed":
+		// Stop has already committed the boundary. Driver implementations make
+		// preparation harmless after commit, and coordinator replay does too.
+		return nil
+	case "stop-preparing", "stop-canceling":
+		if err := c.cancelStopPreparationLocked(ctx, record); err != nil {
+			return err
+		}
+	case "active", "recovering":
+	default:
+		return domain.NewError(domain.CodeInvalidState, "run_observers.prepare_stop", "phase", "collector lifecycle cannot prepare a stop from "+record.phase, nil)
+	}
+
+	record.stopResumePhase = record.phase
+	c.disarmMaximumDurationTimer(record)
+	record.phase = "stop-preparing"
+	if err := c.persistMarker(record); err != nil {
+		record.phase = record.stopResumePhase
+		record.stopResumePhase = ""
+		if record.phase == "active" {
+			c.armMaximumDurationTimer(record)
+		}
+		return err
+	}
+	for _, plan := range record.plans {
+		if !record.started[plan.CollectorID.String()] {
+			continue
+		}
+		if err := c.driver.PrepareStop(ctx, plan.CollectorID); err != nil {
+			return errors.Join(err, c.cancelStopPreparationDetachedLocked(record))
+		}
+	}
+	record.phase = "stop-prepared"
+	if err := c.persistMarker(record); err != nil {
+		return errors.Join(err, c.cancelStopPreparationDetachedLocked(record))
+	}
+	return nil
+}
+
+// CancelStopPreparation restores collection after the target stop failed
+// before producing an authoritative receipt. It is idempotent and does not
+// roll back a boundary once collector Stop has begun.
+func (c *RunObserverCoordinator) CancelStopPreparation(ctx context.Context, runID domain.TargetRunID) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	record, err := c.requireRunRecordLocked(runID, "run_observers.cancel_stop_preparation")
+	if err != nil {
+		return err
+	}
+	switch record.phase {
+	case "active", "recovering", "stopping", "stopped", "committed":
+		return nil
+	case "stop-preparing", "stop-prepared", "stop-canceling":
+		return c.cancelStopPreparationLocked(ctx, record)
+	default:
+		return domain.NewError(domain.CodeInvalidState, "run_observers.cancel_stop_preparation", "phase", "collector lifecycle cannot cancel a stop preparation from "+record.phase, nil)
+	}
+}
+
+func (c *RunObserverCoordinator) Stop(ctx context.Context, input RunObserverStop) (RunObservationEvidence, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	record, err := c.requireRunRecordLocked(input.RunID, "run_observers.stop")
+	if err != nil {
+		return RunObservationEvidence{}, err
+	}
+	return c.stopLocked(ctx, input, record)
+}
+
+func (c *RunObserverCoordinator) stopLocked(ctx context.Context, input RunObserverStop, record *runObserverRecord) (RunObservationEvidence, error) {
 	if record.stopResult != nil {
 		return cloneRunObservationEvidence(*record.stopResult), nil
 	}
-	if record.timer != nil {
-		record.timer.Stop()
-		record.timer = nil
-	}
+	c.disarmMaximumDurationTimer(record)
 	record.phase = "stopping"
 	if err := c.persistMarker(record); err != nil {
 		return RunObservationEvidence{}, err
@@ -654,6 +718,103 @@ func (c *RunObserverCoordinator) Stop(ctx context.Context, input RunObserverStop
 	evidence := c.evidence(record)
 	record.stopResult = &evidence
 	return cloneRunObservationEvidence(evidence), nil
+}
+
+func (c *RunObserverCoordinator) cancelStopPreparationDetachedLocked(record *runObserverRecord) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.cleanupTimeout)
+	defer cancel()
+	return c.cancelStopPreparationLocked(ctx, record)
+}
+
+func (c *RunObserverCoordinator) cancelStopPreparationLocked(ctx context.Context, record *runObserverRecord) error {
+	var transitionErr error
+	if record.phase != "stop-canceling" {
+		record.phase = "stop-canceling"
+		transitionErr = c.persistMarker(record)
+	}
+	var cancellationErrors []error
+	for index := len(record.plans) - 1; index >= 0; index-- {
+		plan := record.plans[index]
+		if !record.started[plan.CollectorID.String()] {
+			continue
+		}
+		if err := c.driver.CancelStopPreparation(ctx, plan.CollectorID); err != nil {
+			cancellationErrors = append(cancellationErrors, err)
+		}
+	}
+	if cancellationErr := errors.Join(cancellationErrors...); cancellationErr != nil {
+		return errors.Join(transitionErr, cancellationErr, c.persistMarker(record))
+	}
+	resumePhase := record.stopResumePhase
+	if resumePhase != "active" && resumePhase != "recovering" {
+		resumePhase = "active"
+	}
+	record.phase = resumePhase
+	if err := c.persistMarker(record); err != nil {
+		// The physical collectors are active again, but retain the conservative
+		// durable phase in memory until a retry can persist that fact.
+		record.phase = "stop-canceling"
+		return errors.Join(transitionErr, err)
+	}
+	record.stopResumePhase = ""
+	if resumePhase == "active" {
+		c.armMaximumDurationTimer(record)
+	}
+	return transitionErr
+}
+
+func (c *RunObserverCoordinator) requireRunRecordLocked(runID domain.TargetRunID, operation string) (*runObserverRecord, error) {
+	if runID.IsZero() {
+		return nil, domain.NewError(domain.CodeInvalidArgument, operation, "run_id", "must be set", nil)
+	}
+	record := c.records[runID.String()]
+	if record == nil {
+		return nil, domain.NewError(domain.CodeNotFound, operation, "run_id", "has no coordinator state in this process; restart reconciliation is required", nil)
+	}
+	return record, nil
+}
+
+func (c *RunObserverCoordinator) disarmMaximumDurationTimer(record *runObserverRecord) {
+	record.timerGeneration++
+	if record.timer != nil {
+		record.timer.Stop()
+		record.timer = nil
+	}
+}
+
+func (c *RunObserverCoordinator) armMaximumDurationTimer(record *runObserverRecord) {
+	if record.stopDeadline.IsZero() {
+		return
+	}
+	c.disarmMaximumDurationTimer(record)
+	generation := record.timerGeneration
+	runID := record.start.Plan.Run.ID()
+	duration := record.stopDeadline.Sub(c.clock().UTC())
+	if duration < 0 {
+		duration = 0
+	}
+	record.timer = time.AfterFunc(duration, func() {
+		deadlineCtx, cancel := context.WithTimeout(context.Background(), c.cleanupTimeout)
+		defer cancel()
+		stop := RunObserverStop{RunID: runID, TargetStoppedAt: c.clock().UTC()}
+		_, stopErr := c.stopAfterMaximumDuration(deadlineCtx, stop, generation)
+		for attempt := 1; stopErr != nil && attempt < 3 && deadlineCtx.Err() == nil; attempt++ {
+			_, stopErr = c.Stop(deadlineCtx, stop)
+		}
+	})
+}
+
+func (c *RunObserverCoordinator) stopAfterMaximumDuration(ctx context.Context, input RunObserverStop, generation uint64) (RunObservationEvidence, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	record, err := c.requireRunRecordLocked(input.RunID, "run_observers.maximum_duration_stop")
+	if err != nil {
+		return RunObservationEvidence{}, err
+	}
+	if record.timerGeneration != generation || record.phase != "active" {
+		return RunObservationEvidence{}, nil
+	}
+	return c.stopLocked(ctx, input, record)
 }
 
 func (c *RunObserverCoordinator) collectStoppedObservers(ctx context.Context, record *runObserverRecord, targetStoppedAt time.Time) (persistedCollectorStopBatch, error) {
@@ -982,7 +1143,7 @@ func (c *RunObserverCoordinator) Close(ctx context.Context) error {
 	c.mu.Lock()
 	runIDs := make([]domain.TargetRunID, 0)
 	for _, record := range c.records {
-		if record.phase == "active" || record.phase == "starting" || record.phase == "recovering" || record.phase == "stopping" {
+		if observerPhaseMayOwnCollectors(record.phase) {
 			runIDs = append(runIDs, record.start.Plan.Run.ID())
 		}
 	}
@@ -1035,14 +1196,15 @@ func observerStartSignature(input RunObserverStart) (string, error) {
 	sort.Slice(collectors, func(i, j int) bool { return collectors[i].Name < collectors[j].Name })
 	required := sortedCoverageFamilies(input.Plan.RequiredCoverage)
 	encoded, err := json.Marshal(struct {
-		Run, Material, Runtime, TargetKind, Policy, Capability string
-		MaximumDuration                                        int64
-		Required                                               []string
-		Collectors                                             []collectorSignature
+		Run, Material, TargetKind, Policy, Capability string
+		Attachment                                    ports.ObservationAttachment
+		MaximumDuration                               int64
+		Required                                      []string
+		Collectors                                    []collectorSignature
 	}{
-		input.Plan.Run.ID().String(), input.Plan.Run.Spec().MaterializationDigest.String(),
-		input.Prepared.Attachment.RuntimeID, string(input.TargetKind), input.PolicyDigest.String(),
-		input.CapabilityFingerprintDigest.String(), int64(input.Plan.MaximumDuration), required, collectors,
+		Run: input.Plan.Run.ID().String(), Material: input.Plan.Run.Spec().MaterializationDigest.String(),
+		TargetKind: string(input.TargetKind), Policy: input.PolicyDigest.String(), Capability: input.CapabilityFingerprintDigest.String(),
+		Attachment: input.Prepared.Attachment, MaximumDuration: int64(input.Plan.MaximumDuration), Required: required, Collectors: collectors,
 	})
 	if err != nil {
 		return "", err
@@ -1832,7 +1994,16 @@ func (c *RunObserverCoordinator) loadMarkers() ([]observerStateMarker, error) {
 
 func validObserverPhase(phase string) bool {
 	switch phase {
-	case "starting", "active", "recovering", "stopping", "stopped", "committed":
+	case "starting", "active", "recovering", "stop-preparing", "stop-prepared", "stop-canceling", "stopping", "stopped", "committed":
+		return true
+	default:
+		return false
+	}
+}
+
+func observerPhaseMayOwnCollectors(phase string) bool {
+	switch phase {
+	case "starting", "active", "recovering", "stop-preparing", "stop-prepared", "stop-canceling", "stopping":
 		return true
 	default:
 		return false

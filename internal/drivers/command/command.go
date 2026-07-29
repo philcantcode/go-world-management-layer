@@ -235,24 +235,48 @@ func StartGuestTransport(ctx context.Context, starter Starter, invocation Invoca
 		stderr:       stderr,
 		encoder:      transport.NewEncoder(stdin, transport.DefaultMaxFrame),
 		decoder:      transport.NewDecoder(stdout, transport.DefaultMaxFrame),
+		frames:       make(chan transport.Frame, 32),
 		cleanupGrace: cleanupGrace,
 		done:         make(chan struct{}),
+		readDone:     make(chan struct{}),
+		closing:      make(chan struct{}),
 	}
 	if _, err := t.encoder.WriteJSON(transport.KindStart, start); err != nil {
-		_ = process.Kill()
-		_ = stdin.Close()
-		_ = stdout.Close()
-		_ = stderr.Close()
-		return nil, err
+		cleanupErr := abortStartedProcess(process, stdin, stdout, stderr, cleanupGrace)
+		return nil, errors.Join(err, cleanupErr)
 	}
 	go func() {
 		_, _ = io.Copy(io.Discard, stderr)
 	}()
+	go t.readGuestFrames()
 	go func() {
-		t.waitErr = process.Wait()
+		waitErr := process.Wait()
+		t.stateMu.Lock()
+		t.waitErr = waitErr
+		t.stateMu.Unlock()
 		close(t.done)
 	}()
 	return t, nil
+}
+
+func abortStartedProcess(process Process, stdin io.WriteCloser, stdout, stderr io.ReadCloser, grace time.Duration) error {
+	_ = stdin.Close()
+	waitDone := make(chan struct{})
+	go func() {
+		_ = process.Wait()
+		close(waitDone)
+	}()
+	killErr := process.Kill()
+	if errors.Is(killErr, os.ErrProcessDone) {
+		killErr = nil
+	}
+	exited := waitForDone(waitDone, grace)
+	_ = stdout.Close()
+	_ = stderr.Close()
+	if exited {
+		return nil
+	}
+	return errors.Join(killErr, transport.ErrCleanupUnknown)
 }
 
 type guestTransport struct {
@@ -262,15 +286,22 @@ type guestTransport struct {
 	stderr       io.ReadCloser
 	encoder      *transport.Encoder
 	decoder      *transport.Decoder
+	frames       chan transport.Frame
 	cleanupGrace time.Duration
 	done         chan struct{}
+	readDone     chan struct{}
+	closing      chan struct{}
 
-	sendMu    sync.Mutex
-	receiveMu sync.Mutex
-	stateMu   sync.Mutex
-	closed    bool
-	waitErr   error
-	closeOnce sync.Once
+	sendMu      sync.Mutex
+	receiveMu   sync.Mutex
+	stateMu     sync.Mutex
+	closed      bool
+	waitErr     error
+	readErr     error
+	terminal    *transport.Terminal
+	terminalErr error
+	closeOnce   sync.Once
+	closeErr    error
 }
 
 func (t *guestTransport) Send(ctx context.Context, kind transport.Kind, data []byte) (transport.Frame, error) {
@@ -297,36 +328,111 @@ func (t *guestTransport) Receive(ctx context.Context) (transport.Frame, error) {
 	if closed {
 		return transport.Frame{}, io.ErrClosedPipe
 	}
-	type result struct {
-		frame transport.Frame
-		err   error
-	}
-	resultChannel := make(chan result, 1)
-	go func() {
-		frame, err := t.decoder.Read()
-		resultChannel <- result{frame: frame, err: err}
-	}()
 	select {
 	case <-ctx.Done():
-		go func() { _ = t.Close() }()
 		return transport.Frame{}, ctx.Err()
-	case value := <-resultChannel:
-		return value.frame, value.err
+	case frame, ok := <-t.frames:
+		if ok {
+			return frame, nil
+		}
+		t.stateMu.Lock()
+		readErr := t.readErr
+		t.stateMu.Unlock()
+		if readErr == nil {
+			readErr = io.EOF
+		}
+		return transport.Frame{}, readErr
 	}
 }
 
 func (t *guestTransport) Close() error {
-	var result error
 	t.closeOnce.Do(func() {
 		t.stateMu.Lock()
 		t.closed = true
 		t.stateMu.Unlock()
+		close(t.closing)
 		_ = t.stdin.Close()
-		result = awaitProcessExit(t.process, t.done, t.cleanupGrace)
+		processErr := awaitProcessExit(t.process, t.done, t.cleanupGrace)
+		if processErr != nil {
+			_ = t.stdout.Close()
+		}
+		var readErr error
+		if !waitForDone(t.readDone, t.cleanupGrace) {
+			_ = t.stdout.Close()
+			readErr = errors.Join(transport.ErrCleanupUnknown, fmt.Errorf("world-guest output reader did not stop"))
+			_ = waitForDone(t.readDone, t.cleanupGrace)
+		}
+		t.closeErr = errors.Join(processErr, readErr, t.guestCleanupResult())
 		_ = t.stdout.Close()
 		_ = t.stderr.Close()
 	})
-	return result
+	return t.closeErr
+}
+
+func (t *guestTransport) readGuestFrames() {
+	defer close(t.readDone)
+	defer close(t.frames)
+	for {
+		frame, err := t.decoder.Read()
+		if err != nil {
+			t.stateMu.Lock()
+			t.readErr = err
+			if !errors.Is(err, io.EOF) && t.terminal == nil {
+				t.terminalErr = errors.Join(t.terminalErr, err)
+			}
+			t.stateMu.Unlock()
+			return
+		}
+		terminal := t.observeGuestFrame(frame, nil)
+		select {
+		case t.frames <- frame:
+		case <-t.closing:
+		}
+		if terminal {
+			return
+		}
+	}
+}
+
+func (t *guestTransport) observeGuestFrame(frame transport.Frame, readErr error) bool {
+	if readErr != nil || frame.Kind != transport.KindTerminal {
+		return false
+	}
+	terminal, decodeErr := transport.DecodeJSON[transport.Terminal](frame)
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
+	if t.terminal != nil || t.terminalErr != nil {
+		t.terminalErr = errors.Join(t.terminalErr, transport.ErrProtocol, fmt.Errorf("world-guest emitted more than one terminal frame"))
+		return true
+	}
+	if decodeErr != nil {
+		t.terminalErr = decodeErr
+		return true
+	}
+	t.terminal = &terminal
+	return true
+}
+
+func (t *guestTransport) guestCleanupResult() error {
+	t.stateMu.Lock()
+	terminal := t.terminal
+	terminalErr := t.terminalErr
+	waitErr := t.waitErr
+	t.stateMu.Unlock()
+	if terminalErr != nil {
+		return errors.Join(transport.ErrCleanupUnknown, terminalErr)
+	}
+	if terminal == nil {
+		return errors.Join(transport.ErrCleanupUnknown, waitErr, fmt.Errorf("world-guest exited without a terminal cleanup receipt"))
+	}
+	if !terminal.CleanupConfirmed {
+		detail := error(nil)
+		if terminal.Error != "" {
+			detail = errors.New(terminal.Error)
+		}
+		return errors.Join(transport.ErrCleanupUnknown, detail)
+	}
+	return nil
 }
 
 type processTransport struct {
@@ -344,6 +450,7 @@ type processTransport struct {
 	receiveSequence uint64
 	closed          bool
 	closeOnce       sync.Once
+	closeErr        error
 	terminalOnce    sync.Once
 	writers         sync.WaitGroup
 }
@@ -444,16 +551,15 @@ func (t *processTransport) Receive(ctx context.Context) (transport.Frame, error)
 }
 
 func (t *processTransport) Close() error {
-	var result error
 	t.closeOnce.Do(func() {
 		t.stateMu.Lock()
 		t.closed = true
 		t.stateMu.Unlock()
 		close(t.closing)
 		_ = t.stdin.Close()
-		result = awaitProcessExit(t.process, t.done, t.cleanupGrace)
+		t.closeErr = awaitProcessExit(t.process, t.done, t.cleanupGrace)
 	})
-	return result
+	return t.closeErr
 }
 
 // awaitProcessExit gives stdin EOF one complete cleanup window to drive the
@@ -461,23 +567,28 @@ func (t *processTransport) Close() error {
 // platforms where os.Interrupt is not a supported process signal. A forced
 // kill gets a second bounded window so Close can never wait forever.
 func awaitProcessExit(process Process, done <-chan struct{}, grace time.Duration) error {
-	timer := time.NewTimer(grace)
-	defer timer.Stop()
-	select {
-	case <-done:
+	if waitForDone(done, grace) {
 		return nil
-	case <-timer.C:
 	}
 	killErr := process.Kill()
 	if errors.Is(killErr, os.ErrProcessDone) {
 		killErr = nil
 	}
-	timer.Reset(grace)
+	_ = waitForDone(done, grace)
+	return errors.Join(killErr, transport.ErrCleanupUnknown)
+}
+
+func waitForDone(done <-chan struct{}, grace time.Duration) bool {
+	if done == nil {
+		return false
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
 	select {
 	case <-done:
-		return killErr
+		return true
 	case <-timer.C:
-		return errors.Join(killErr, transport.ErrCleanupUnknown)
+		return false
 	}
 }
 

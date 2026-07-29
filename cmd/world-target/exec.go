@@ -45,7 +45,7 @@ func runTargetExec(ctx context.Context, client *world.Client, arguments []string
 		nil,
 		func(frame *worldv1.TargetExecFrame) error {
 			return output.Handle(stdout, stderr, frame.Stdout, frame.Stderr, frame.Outcome)
-		})
+		}, worldcli.PumpBidiOptions{})
 	if err != nil {
 		return err
 	}

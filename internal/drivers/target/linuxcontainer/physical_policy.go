@@ -87,7 +87,7 @@ func targetPhysicalPolicyReport(build BuildConfig, capabilities RuntimeCapabilit
 		CommandAuthority: "arbitrary-inside-assigned-target", ExecTransport: "direct-argv-and-explicit-shell",
 		FileTransfer: "push-pull-target-relative", NetworkEndpoints: "none",
 		DeniedInfrastructureAuthority: []string{"host-exec", "docker-api", "host-mounts", "other-targets"},
-		ResetAfterEveryRun:            false, ResetMode: "recreate-new-target-generation",
+		ResetAfterEveryRun:            true, ResetMode: "recreate-new-target-generation",
 		InteractionSupport: ports.PhysicalSupportEnforced, ResetSupport: ports.PhysicalSupportEnforced,
 		Resources: dockercli.PhysicalResourceFacts(support, values),
 	}

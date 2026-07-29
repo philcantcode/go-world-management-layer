@@ -85,6 +85,23 @@ type localArtifactManifest struct {
 	Sensitivity string `json:"sensitivity"`
 }
 
+type localCaptureStream struct {
+	file string
+	role string
+}
+
+type localCaptureContent struct {
+	stream  localCaptureStream
+	content []byte
+}
+
+func localCaptureStreams() [2]localCaptureStream {
+	return [2]localCaptureStream{
+		{file: "stdout.partial", role: CollectorStdoutRole},
+		{file: "stderr.partial", role: CollectorStderrRole},
+	}
+}
+
 func NewLocalOutputFactory(config LocalOutputConfig) (*LocalOutputFactory, error) {
 	configuredRoot := strings.TrimSpace(config.Root)
 	if configuredRoot == "" {
@@ -361,19 +378,9 @@ func (c *localCapture) Finalize(ctx context.Context) ([]domain.ArtifactReference
 	if err := closeCaptureWriters(c.stdout, c.stderr); err != nil {
 		return nil, err
 	}
-	streams := []struct{ file, role string }{{"stdout.partial", CollectorStdoutRole}, {"stderr.partial", CollectorStderrRole}}
-	contents := make([][]byte, len(streams))
-	var totalSize int64
-	for index, stream := range streams {
-		content, err := readBoundedRegularFile(filepath.Join(c.directory, stream.file), c.plan.MaximumBytes)
-		if err != nil {
-			return nil, err
-		}
-		if int64(len(content)) > c.plan.MaximumBytes-totalSize {
-			return nil, domain.NewError(domain.CodeIntegrityViolation, "observer.local_output.finalize", "partial_output", "exceeds the collector's shared byte limit", nil)
-		}
-		totalSize += int64(len(content))
-		contents[index] = content
+	contents, totalSize, err := readLocalCaptureContents(c.directory, c.plan.MaximumBytes)
+	if err != nil {
+		return nil, err
 	}
 	c.budget.mu.Lock()
 	remaining := c.budget.remaining
@@ -383,24 +390,66 @@ func (c *localCapture) Finalize(ctx context.Context) ([]domain.ArtifactReference
 		return nil, domain.NewError(domain.CodeIntegrityViolation, "observer.local_output.finalize", "capture_budget", "retained bytes do not match the authority-owned budget", nil)
 	}
 	exceeded := limitAttempted && totalSize == c.plan.MaximumBytes
-	artifacts := make([]domain.ArtifactReference, 0, 2)
-	for index, stream := range streams {
-		content := contents[index]
-		digest := domain.NewDigest(content)
-		objectPath := filepath.Join(c.factory.root, "objects", strings.TrimPrefix(digest.String(), "sha256:"))
-		if err := ensureLocalObject(objectPath, content); err != nil {
+	artifacts, publishErr := c.factory.publishFinalizedCapture(c.directory, c.signature, c.plan, contents, exceeded)
+	if len(artifacts) == 0 {
+		return nil, publishErr
+	}
+	c.finalized = append([]domain.ArtifactReference(nil), artifacts...)
+	if exceeded {
+		c.finalErr = ErrCaptureLimit
+	}
+	c.factory.release(c.plan.CollectorID.String(), c)
+	return append([]domain.ArtifactReference(nil), artifacts...), errors.Join(c.finalErr, publishErr)
+}
+
+func readLocalCaptureContents(directory string, maximum int64) ([]localCaptureContent, int64, error) {
+	streams := localCaptureStreams()
+	contents := make([]localCaptureContent, 0, len(streams))
+	var totalSize int64
+	for _, stream := range streams {
+		content, err := readBoundedRegularFile(filepath.Join(directory, stream.file), maximum)
+		if err != nil {
+			return nil, 0, err
+		}
+		if int64(len(content)) > maximum-totalSize {
+			return nil, 0, domain.NewError(domain.CodeIntegrityViolation, "observer.local_output.finalize", "partial_output", "exceeds the collector's shared byte limit", nil)
+		}
+		totalSize += int64(len(content))
+		contents = append(contents, localCaptureContent{stream: stream, content: content})
+	}
+	return contents, totalSize, nil
+}
+
+// publishFinalizedCapture is the single publication path for both an orderly
+// Finalize and recovery after authoritative proof that the old process died.
+// A non-empty artifact result means finalized.json is durable; any accompanying
+// error is limited to post-publication partial cleanup and is safe to replay.
+func (f *LocalOutputFactory) publishFinalizedCapture(directory, signature string, plan ports.CollectorPlan, contents []localCaptureContent, exceeded bool) ([]domain.ArtifactReference, error) {
+	streams := localCaptureStreams()
+	if len(contents) != len(streams) {
+		return nil, domain.NewError(domain.CodeIntegrityViolation, "observer.local_output.finalize", "partial_output", "does not contain both collector streams", nil)
+	}
+	artifacts := make([]domain.ArtifactReference, 0, len(contents))
+	for index, value := range contents {
+		stream := streams[index]
+		if value.stream != stream {
+			return nil, domain.NewError(domain.CodeIntegrityViolation, "observer.local_output.finalize", "partial_output", "stream order or role is invalid", nil)
+		}
+		digest := domain.NewDigest(value.content)
+		objectPath := filepath.Join(f.root, "objects", strings.TrimPrefix(digest.String(), "sha256:"))
+		if err := ensureLocalObject(objectPath, value.content); err != nil {
 			return nil, err
 		}
 		artifact, err := domain.NewArtifactReference(domain.ArtifactReferenceSpec{
-			Reference: "observer://collectors/" + c.plan.CollectorID.String() + "/" + strings.TrimPrefix(stream.role, "collector.") + "/" + digest.String(),
-			Digest:    digest, Size: int64(len(content)), Role: stream.role, Sensitivity: c.factory.sensitivity,
+			Reference: "observer://collectors/" + plan.CollectorID.String() + "/" + strings.TrimPrefix(stream.role, "collector.") + "/" + digest.String(),
+			Digest:    digest, Size: int64(len(value.content)), Role: stream.role, Sensitivity: f.sensitivity,
 		})
 		if err != nil {
 			return nil, err
 		}
 		artifacts = append(artifacts, artifact)
 	}
-	manifest := localCaptureManifest{Version: localCaptureManifestVersion, Signature: c.signature, Exceeded: exceeded}
+	manifest := localCaptureManifest{Version: localCaptureManifestVersion, Signature: signature, Exceeded: exceeded}
 	for _, artifact := range artifacts {
 		spec := artifact.Spec()
 		manifest.Artifacts = append(manifest.Artifacts, localArtifactManifest{spec.Reference, spec.Digest.String(), spec.Size, spec.Role, string(spec.Sensitivity)})
@@ -409,16 +458,10 @@ func (c *localCapture) Finalize(ctx context.Context) ([]domain.ArtifactReference
 	if err != nil {
 		return nil, err
 	}
-	if err := publishCaptureControlFile(c.directory, "finalized.json", encoded, maximumLocalCaptureManifestBytes); err != nil {
+	if err := publishCaptureControlFile(directory, "finalized.json", encoded, maximumLocalCaptureManifestBytes); err != nil {
 		return nil, err
 	}
-	c.finalized = append([]domain.ArtifactReference(nil), artifacts...)
-	if exceeded {
-		c.finalErr = ErrCaptureLimit
-	}
-	cleanupErr := removeCapturePartials(c.directory)
-	c.factory.release(c.plan.CollectorID.String(), c)
-	return append([]domain.ArtifactReference(nil), artifacts...), errors.Join(c.finalErr, cleanupErr)
+	return artifacts, removeCapturePartials(directory)
 }
 
 func (c *localCapture) Abort(ctx context.Context) error {
@@ -639,8 +682,8 @@ func syncCaptureDirectory(directory string) error {
 
 func removeCapturePartials(directory string) error {
 	var result []error
-	for _, name := range []string{"stdout.partial", "stderr.partial"} {
-		if err := removeVerifiedRegularFile(filepath.Join(directory, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	for _, stream := range localCaptureStreams() {
+		if err := removeVerifiedRegularFile(filepath.Join(directory, stream.file)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			result = append(result, err)
 		}
 	}

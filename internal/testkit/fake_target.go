@@ -3,6 +3,7 @@ package testkit
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -103,7 +104,7 @@ func (d *FakeTargetDriver) Create(ctx context.Context, plan ports.TargetPlan) (p
 		return ports.TargetResult{}, err
 	}
 	ref := ports.TargetRef{ID: plan.Target.ID(), Generation: plan.Generation.Spec().Generation}
-	signature := fmt.Sprintf("%s/%d/%s/%s/%s", ref.ID, ref.Generation, plan.Template.Name, plan.Template.ImageDigest, plan.PolicyDigest)
+	signature := targetPlanSignature(plan)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if previous, found := d.createRequests[plan.IdempotencyKey]; found {
@@ -149,7 +150,7 @@ func (d *FakeTargetDriver) PrepareRun(ctx context.Context, plan ports.TargetRunP
 		return ports.PreparedTargetRun{}, err
 	}
 	spec := plan.Run.Spec()
-	signature := fmt.Sprintf("%s/%s/%d/%s/%v", spec.ID, spec.TargetID, spec.TargetGeneration, spec.MaterializationDigest, plan.RequiredCoverage)
+	signature := targetRunPlanSignature(plan)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if previous, found := d.runRequests[plan.IdempotencyKey]; found {
@@ -279,7 +280,7 @@ func (d *FakeTargetDriver) Quarantine(ctx context.Context, plan ports.TargetQuar
 	if err := d.faults.Check("target.quarantine.before"); err != nil {
 		return ports.TargetQuarantineEvidence{}, err
 	}
-	signature := fmt.Sprintf("%s/%d/%s", plan.Target.ID, plan.Target.Generation, plan.Reason)
+	signature := deterministicPlanSignature(plan)
 	d.mu.Lock()
 	if prior, found := d.quarantineRequests[plan.IdempotencyKey]; found {
 		result := d.quarantineResults[plan.IdempotencyKey]
@@ -345,7 +346,7 @@ func (d *FakeTargetDriver) Reset(ctx context.Context, targetID domain.TargetID, 
 	if err := d.faults.Check("target.reset.before"); err != nil {
 		return ports.TargetResult{}, err
 	}
-	signature := fmt.Sprintf("%s/%d/%d/%s/%s", targetID, plan.Previous.Generation, plan.NextGeneration, plan.Mode, plan.SnapshotName)
+	signature := deterministicPlanSignature(targetID, plan)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if previous, found := d.resetRequests[plan.IdempotencyKey]; found {
@@ -467,6 +468,61 @@ func cloneTargetRunStopReceipt(receipt ports.TargetRunStopReceipt) ports.TargetR
 		receipt.TargetChanges = cloned
 	}
 	return receipt
+}
+
+type targetMaterialRequestIdentity struct {
+	Artifact      domain.ArtifactReferenceSpec
+	LogicalPath   string
+	Mode          uint32
+	ContentDigest domain.Digest
+	ContentSize   int64
+}
+
+func targetPlanSignature(plan ports.TargetPlan) string {
+	return deterministicPlanSignature(
+		plan.IdempotencyKey,
+		plan.LeaseID,
+		plan.Target,
+		plan.Generation,
+		plan.Template,
+		plan.PolicyDigest,
+		plan.CapabilityFingerprintDigest,
+		plan.Resources,
+	)
+}
+
+func targetRunPlanSignature(plan ports.TargetRunPlan) string {
+	material := make([]targetMaterialRequestIdentity, len(plan.Material))
+	for index, entry := range plan.Material {
+		material[index] = targetMaterialRequestIdentity{
+			Artifact:      entry.Artifact.Spec(),
+			LogicalPath:   entry.LogicalPath,
+			Mode:          entry.Mode,
+			ContentDigest: entry.Content.Digest(),
+			ContentSize:   entry.Content.Size(),
+		}
+	}
+	return deterministicPlanSignature(
+		plan.IdempotencyKey,
+		plan.Run,
+		plan.RequiredCoverage,
+		plan.Collectors,
+		material,
+		plan.MaximumDuration,
+	)
+}
+
+// deterministicPlanSignature is intentionally process-local: fake-driver
+// request histories are never persisted. Go-syntax formatting preserves every
+// aggregate field (including unexported domain state), sorts string-keyed maps,
+// and the length framing prevents distinct field sequences from colliding.
+func deterministicPlanSignature(fields ...any) string {
+	var canonical strings.Builder
+	for _, field := range fields {
+		value := fmt.Sprintf("%#v", field)
+		_, _ = fmt.Fprintf(&canonical, "%d:%s", len(value), value)
+	}
+	return domain.NewDigest([]byte(canonical.String())).String()
 }
 
 func targetOwnershipID(ref ports.TargetRef) string {

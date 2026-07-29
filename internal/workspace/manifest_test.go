@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/philcantcode/go-world-management-layer/internal/domain"
 )
 
 func writeFixture(t *testing.T, root, name, value string, mode os.FileMode) {
@@ -53,6 +55,26 @@ func TestScanDiffAndRename(t *testing.T) {
 	}
 	if kinds[ChangeAdded] != 1 || kinds[ChangeModified] != 1 || kinds[ChangeRenamed] != 1 {
 		t.Fatalf("unexpected changes: %#v", changes)
+	}
+	domainChanges, err := DomainChanges(before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(domainChanges) != 3 {
+		t.Fatalf("domain changes = %#v", domainChanges)
+	}
+	byPath := make(map[string]domain.ChangeEntrySpec, len(domainChanges))
+	for _, change := range domainChanges {
+		byPath[change.Path()] = change.Spec()
+	}
+	if modified := byPath["modified.txt"]; modified.Kind != domain.ChangeModified || modified.BeforeDigest != domain.NewDigest([]byte("old")) || modified.AfterDigest != domain.NewDigest([]byte("new")) || modified.Metadata["before_size_bytes"] != "3" {
+		t.Fatalf("modified domain change = %#v", modified)
+	}
+	if renamed := byPath["moved.txt"]; renamed.Kind != domain.ChangeRenamed || renamed.PreviousPath != "renamed.txt" {
+		t.Fatalf("renamed domain change = %#v", renamed)
+	}
+	if added := byPath["added.txt"]; added.Kind != domain.ChangeAdded || !added.BeforeDigest.IsZero() || added.AfterDigest != domain.NewDigest([]byte("added")) {
+		t.Fatalf("added domain change = %#v", added)
 	}
 }
 

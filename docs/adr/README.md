@@ -16,3 +16,4 @@ plan and its phase exit gates.
 | [0008](0008-device-specific-recovery-guarantees.md) | Accepted | Keep virtual- and physical-device recovery guarantees distinct |
 | [0009](0009-persistent-agent-workspace-and-observable-target-runs.md) | Accepted | Separate the persistent agent workspace from observable target runs |
 | [0010](0010-arbitrary-guest-control-through-scoped-target-transports.md) | Accepted | Permit arbitrary guest control through scoped target transports |
+| [0011](0011-stimulus-classification-and-action-evidence-bundles.md) | Accepted | Classify stimuli and seal per-action evidence bundles with explicit gaps |

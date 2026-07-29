@@ -14,7 +14,7 @@ Linux-target drivers through a trusted deployment profile.
 3. Open a `control_plane_failure` incident. Record the first failed operation,
    daemon/service state, Docker client/server versions, host pressure, and the
    affected lease, exec, target, generation, and run IDs.
-4. Preserve version-5 observer markers, collector output transactions/objects,
+4. Preserve version-6 observer markers, collector output transactions/objects,
    bundle reservations/stages/files/indexes/completions, local seals, and ledger
    segments. Record coverage gaps from the first interval whose collection or
    attribution is uncertain.
@@ -34,8 +34,9 @@ Linux-target drivers through a trusted deployment profile.
    under the old generation. A uniquely owned terminal orphan is removed only
    through its driver and a second inventory must prove it absent.
 5. Stop/finalize affected execs and runs. For an interrupted process observer,
-   require the supported Linux direct-child death proof and exact output/object
-   reconciliation; retained finalized artifacts do not restore continuity.
+   require the supported Linux direct-child or Windows per-collector Job death
+   proof and exact output/object reconciliation; retained or crash-finalized
+   artifacts do not restore continuity.
    Complete the reservation-to-stage-to-Core-to-index-to-observer-to-completion
    bundle saga, and seal explicit Docker/collector gaps. If policy authorizes
    recovery, create only the failed resource's next generation.

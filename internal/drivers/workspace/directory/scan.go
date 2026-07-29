@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"time"
 
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
@@ -158,77 +157,7 @@ func requireUnchanged(expected, actual workspacepkg.Manifest) error {
 }
 
 func changesBetween(before, after workspacepkg.Manifest) ([]domain.ChangeEntry, error) {
-	changes, err := workspacepkg.Diff(before, after)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]domain.ChangeEntry, 0, len(changes))
-	for index, change := range changes {
-		kind, err := domainChangeKind(change.Kind)
-		if err != nil {
-			return nil, fmt.Errorf("change %d: %w", index, err)
-		}
-		beforeDigest, err := entryDigest(change.Before)
-		if err != nil {
-			return nil, fmt.Errorf("change %d before digest: %w", index, err)
-		}
-		afterDigest, err := entryDigest(change.After)
-		if err != nil {
-			return nil, fmt.Errorf("change %d after digest: %w", index, err)
-		}
-		entry, err := domain.NewChangeEntry(domain.ChangeEntrySpec{
-			Kind: kind, Path: change.Path, PreviousPath: change.PreviousPath,
-			BeforeDigest: beforeDigest, AfterDigest: afterDigest,
-			Metadata: changeMetadata(change.Before, change.After),
-		})
-		if err != nil {
-			return nil, fmt.Errorf("change %d: %w", index, err)
-		}
-		result = append(result, entry)
-	}
-	return result, nil
-}
-
-func domainChangeKind(kind workspacepkg.ChangeKind) (domain.ChangeKind, error) {
-	switch kind {
-	case workspacepkg.ChangeAdded:
-		return domain.ChangeAdded, nil
-	case workspacepkg.ChangeModified:
-		return domain.ChangeModified, nil
-	case workspacepkg.ChangeDeleted:
-		return domain.ChangeDeleted, nil
-	case workspacepkg.ChangeRenamed:
-		return domain.ChangeRenamed, nil
-	case workspacepkg.ChangeMetadata:
-		return domain.ChangeMetadataOnly, nil
-	case workspacepkg.ChangeOpaque:
-		return domain.ChangeOpaqueDirectory, nil
-	default:
-		return "", fmt.Errorf("unsupported change kind %q", kind)
-	}
-}
-
-func entryDigest(entry *workspacepkg.Entry) (domain.Digest, error) {
-	if entry == nil {
-		return domain.Digest{}, nil
-	}
-	return domain.ParseDigest(entry.Digest)
-}
-
-func changeMetadata(before, after *workspacepkg.Entry) map[string]string {
-	metadata := make(map[string]string, 6)
-	appendEntryMetadata(metadata, "before", before)
-	appendEntryMetadata(metadata, "after", after)
-	return metadata
-}
-
-func appendEntryMetadata(metadata map[string]string, prefix string, entry *workspacepkg.Entry) {
-	if entry == nil {
-		return
-	}
-	metadata[prefix+"_size_bytes"] = strconv.FormatInt(entry.Size, 10)
-	metadata[prefix+"_mode"] = fmt.Sprintf("%#o", entry.Mode)
-	metadata[prefix+"_modified_ns"] = strconv.FormatInt(entry.ModifiedNS, 10)
+	return workspacepkg.DomainChanges(before, after)
 }
 
 func classifyScanError(operation string, err error) error {

@@ -28,7 +28,7 @@ func TestTargetPhysicalPolicyReportsInteractionAndStorageBoundaries(t *testing.T
 	if report.WritableStateMode != "private-directory-non-production" || report.WritableStateEnforced || report.Resources.WritableStateBytes.Support != ports.PhysicalSupportUnsupported {
 		t.Fatalf("writable-state facts = %#v", report)
 	}
-	if report.NetworkEndpoints != "none" || report.ResetAfterEveryRun || report.InteractionSupport != ports.PhysicalSupportEnforced || report.ResetSupport != ports.PhysicalSupportEnforced {
+	if report.NetworkEndpoints != "none" || !report.ResetAfterEveryRun || report.ResetMode != "recreate-new-target-generation" || report.InteractionSupport != ports.PhysicalSupportEnforced || report.ResetSupport != ports.PhysicalSupportEnforced {
 		t.Fatalf("interaction/reset facts = %#v", report)
 	}
 	for name, support := range map[string]ports.PhysicalSupport{

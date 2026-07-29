@@ -168,6 +168,7 @@ type TargetRuntimePolicy struct {
 	Headless                    bool              `yaml:"headless" json:"headless,omitempty"`
 	Rooted                      bool              `yaml:"rooted" json:"rooted,omitempty"`
 	Debuggable                  bool              `yaml:"debuggable" json:"debuggable,omitempty"`
+	GuestMemory                 ByteQuantity      `yaml:"guestMemory" json:"guestMemory,omitempty"`
 	BootTimeout                 Duration          `yaml:"bootTimeout" json:"bootTimeout,omitempty"`
 }
 

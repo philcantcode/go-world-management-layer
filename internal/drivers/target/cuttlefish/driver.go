@@ -26,6 +26,8 @@ type Allocator interface {
 	Release(context.Context, Allocation) error
 }
 
+type allocatorCloser interface{ Close() error }
+
 type Gateway interface {
 	Open(context.Context, deviceproxy.Scope, Allocation) (ports.ScopedADBEndpoint, error)
 }
@@ -52,23 +54,55 @@ type Config struct {
 }
 
 type Driver struct {
-	build      BuildConfig
-	backend    Backend
-	allocator  Allocator
-	gateway    Gateway
-	files      ScopedFileGateway
-	collectors CollectorReadiness
-	random     io.Reader
-	now        func() time.Time
+	build              BuildConfig
+	backend            Backend
+	allocator          Allocator
+	gateway            Gateway
+	files              ScopedFileGateway
+	collectors         CollectorReadiness
+	random             io.Reader
+	now                func() time.Time
+	commitResetOutcome func(VirtualDevicePlan, resetTransitionManifest, ports.TargetResult, error, time.Time) (resetOutcome, error)
+	resetCheckpoint    func(resetCheckpoint) error
+	prepareCheckpoint  func(prepareCheckpoint) error
+	createCheckpoint   func(createCheckpoint) error
 
 	mu           sync.Mutex
 	lifecycleMu  sync.Mutex
 	targets      map[string]deviceRecord
+	cleanupOnly  map[string]cleanupDeviceRecord
 	runs         map[string]*runRecord
 	idempotency  map[string]string
 	resetResults map[string]resetOutcome
 	quarantines  map[string]quarantineOutcome
 }
+
+type resetCheckpoint string
+
+const (
+	resetCheckpointTransitionCommitted resetCheckpoint = "transition_committed"
+	resetCheckpointReplacementManifest resetCheckpoint = "replacement_manifest_committed"
+	resetCheckpointPreviousRetired     resetCheckpoint = "previous_retired"
+	resetCheckpointOutcomeCommitted    resetCheckpoint = "outcome_committed"
+)
+
+type createCheckpoint string
+
+const (
+	createCheckpointAllocationReserved createCheckpoint = "allocation_reserved"
+	createCheckpointIntentCommitted    createCheckpoint = "intent_committed"
+	createCheckpointRuntimeCreated     createCheckpoint = "runtime_created"
+	createCheckpointRuntimeReady       createCheckpoint = "runtime_ready"
+	createCheckpointManifestsCommitted createCheckpoint = "manifests_committed"
+)
+
+type prepareCheckpoint string
+
+const (
+	prepareCheckpointIntentCommitted   prepareCheckpoint = "intent_committed"
+	prepareCheckpointMaterialized      prepareCheckpoint = "materialized"
+	prepareCheckpointGenerationClaimed prepareCheckpoint = "generation_claimed"
+)
 
 type resetOutcome struct {
 	targetID domain.TargetID
@@ -83,34 +117,50 @@ type quarantineOutcome struct {
 }
 
 type deviceRecord struct {
-	input    ports.TargetPlan
-	plan     VirtualDevicePlan
-	instance Instance
-	status   ports.TargetStatus
+	input         ports.TargetPlan
+	planSignature domain.Digest
+	plan          VirtualDevicePlan
+	instance      Instance
+	status        ports.TargetStatus
+}
+
+type cleanupDeviceRecord struct {
+	record         deviceRecord
+	runtimePresent bool
 }
 
 type runRecord struct {
-	plan            ports.TargetRunPlan
-	scope           deviceproxy.Scope
-	allocation      Allocation
-	sourceInstance  string
-	directory       string
-	prepared        ports.PreparedTargetRun
-	starting        bool
-	startDone       chan struct{}
-	startCancel     context.CancelFunc
-	started         bool
-	startedAt       time.Time
-	stopped         bool
-	quarantined     bool
-	receipt         *ports.TargetRunStopReceipt
-	observations    []ports.TargetRunObservation
-	deadlineCancel  context.CancelFunc
-	cleanupRunning  bool
-	cleanupDone     chan struct{}
-	cleanupComplete bool
-	cleanupErr      error
-	transports      map[*androidTransport]struct{}
+	plan                 ports.TargetRunPlan
+	planSignature        domain.Digest
+	scope                deviceproxy.Scope
+	allocation           Allocation
+	sourceInstance       string
+	directory            string
+	prepared             ports.PreparedTargetRun
+	starting             bool
+	startDone            chan struct{}
+	startCancel          context.CancelFunc
+	started              bool
+	startedAt            time.Time
+	finishing            bool
+	controlPlaneLost     bool
+	interruptedExecution bool
+	durationExceeded     bool
+	stopped              bool
+	quarantined          bool
+	receipt              *ports.TargetRunStopReceipt
+	observations         []ports.TargetRunObservation
+	deadlineCancel       context.CancelFunc
+	transports           map[*androidTransport]struct{}
+	scopedWrites         map[string]scopedWriteEvidence
+	adbAuthorityIssued   bool
+	opaqueMutationReason string
+	containment          *BackendQuarantineState
+}
+
+type scopedWriteEvidence struct {
+	file DeviceFile
+	mode uint32
 }
 
 func New(config Config) (*Driver, error) {
@@ -120,16 +170,39 @@ func New(config Config) (*Driver, error) {
 	if config.Build.TargetRoot == "" || config.Build.SystemImageRoot == "" || config.Build.BackendVersion == "" || config.Build.RuntimeVersion == "" || config.Build.DeviceConfigDigest.IsZero() {
 		return nil, fmt.Errorf("complete virtual-device build configuration is required")
 	}
+	if _, err := ports.ParseADBServerEndpoint(config.Build.ADBServerEndpoint); err != nil {
+		return nil, fmt.Errorf("virtual-device observation ADB server: %w", err)
+	}
 	if config.Random == nil {
 		config.Random = rand.Reader
 	}
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	return &Driver{build: config.Build, backend: config.Backend, allocator: config.Allocator, gateway: config.Gateway, files: config.Files, collectors: config.Collectors, random: config.Random, now: config.Now, targets: make(map[string]deviceRecord), runs: make(map[string]*runRecord), idempotency: make(map[string]string), resetResults: make(map[string]resetOutcome), quarantines: make(map[string]quarantineOutcome)}, nil
+	return &Driver{build: config.Build, backend: config.Backend, allocator: config.Allocator, gateway: config.Gateway, files: config.Files, collectors: config.Collectors, random: config.Random, now: config.Now, commitResetOutcome: commitExpectedResetOutcome, targets: make(map[string]deviceRecord), cleanupOnly: make(map[string]cleanupDeviceRecord), runs: make(map[string]*runRecord), idempotency: make(map[string]string), resetResults: make(map[string]resetOutcome), quarantines: make(map[string]quarantineOutcome)}, nil
 }
 
 func NewDriver(config Config) (*Driver, error) { return New(config) }
+
+// Close releases durable allocator ownership after all run capabilities have
+// been stopped. Live target generations and their manifests are deliberately
+// preserved for restart reconciliation.
+func (d *Driver) Close() error {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	d.mu.Lock()
+	for _, run := range d.runs {
+		if !run.stopped && !run.quarantined {
+			d.mu.Unlock()
+			return domain.NewError(domain.CodeFailedPrecondition, "cuttlefish.close", "runs", "all prepared Android runs must be stopped or quarantined before allocator ownership is released", nil)
+		}
+	}
+	d.mu.Unlock()
+	if closer, ok := d.allocator.(allocatorCloser); ok {
+		return closer.Close()
+	}
+	return nil
+}
 
 func (d *Driver) Probe(ctx context.Context, template ports.TargetTemplate) (domain.CapabilityFingerprint, error) {
 	if err := ports.RequireDeadline(ctx, "cuttlefish.probe"); err != nil {
@@ -145,9 +218,25 @@ func (d *Driver) Probe(ctx context.Context, template ports.TargetTemplate) (doma
 	if err != nil {
 		return domain.CapabilityFingerprint{}, domain.NewError(domain.CodeCapabilityUnavailable, "cuttlefish.probe", "backend", "virtual-device backend probe failed", err)
 	}
+	if err := d.validateObservedBackendVersions(probe); err != nil {
+		return domain.CapabilityFingerprint{}, domain.NewError(domain.CodeCapabilityUnavailable, "cuttlefish.probe", "backend_identity", "observed backend/runtime identity does not match driver configuration", err)
+	}
 	virtualConstraints := map[string]string{"backend_version": probe.BackendVersion, "runtime_version": probe.RuntimeVersion}
 	if probe.KVMKnown {
 		virtualConstraints["kvm"] = strconv.FormatBool(probe.KVM)
+	}
+	virtualConstraints["managed"] = strconv.FormatBool(probe.Managed)
+	if probe.HardwareAccelerationKnown {
+		virtualConstraints["hardware_acceleration"] = strconv.FormatBool(probe.HardwareAcceleration)
+	}
+	if probe.HeadlessKnown {
+		virtualConstraints["headless"] = strconv.FormatBool(probe.Headless)
+	}
+	if probe.RootedKnown {
+		virtualConstraints["rooted"] = strconv.FormatBool(probe.Rooted)
+	}
+	if probe.DebuggableKnown {
+		virtualConstraints["debuggable"] = strconv.FormatBool(probe.Debuggable)
 	}
 	virtual, _ := domain.NewCapability(domain.CapabilitySupported, virtualConstraints, nil)
 	resetStatus := domain.CapabilityUnsupported
@@ -168,9 +257,28 @@ func (d *Driver) Probe(ctx context.Context, template ports.TargetTemplate) (doma
 	if backendKind == "" {
 		backendKind = "cuttlefish"
 	}
-	evidence := cloneLabels(probe.Evidence)
+	evidence := normalizedProbeEvidence(probe.Evidence, d.build.DeviceConfigDigest)
 	evidence["driver"] = backendKind
 	return domain.NewCapabilityFingerprint(map[string]domain.Capability{"target.android-virtual": virtual, "target.android-reset": reset, "target.scoped-adb": adb}, evidence)
+}
+
+func normalizedProbeEvidence(observed map[string]string, deviceConfigDigest domain.Digest) map[string]string {
+	evidence := cloneLabels(observed)
+	for _, imageSpecific := range []string{"system_image_package", "system_image_directory", "system_image_digest"} {
+		delete(evidence, imageSpecific)
+	}
+	evidence["device_config_digest"] = deviceConfigDigest.String()
+	return evidence
+}
+
+func (d *Driver) validateObservedBackendVersions(capabilities BackendCapabilities) error {
+	if strings.TrimSpace(capabilities.BackendVersion) == "" || strings.TrimSpace(capabilities.RuntimeVersion) == "" {
+		return fmt.Errorf("backend and runtime versions must be observed and non-blank")
+	}
+	if capabilities.BackendVersion != d.build.BackendVersion || capabilities.RuntimeVersion != d.build.RuntimeVersion {
+		return fmt.Errorf("observed backend/runtime %q/%q differs from configured reset identity %q/%q", capabilities.BackendVersion, capabilities.RuntimeVersion, d.build.BackendVersion, d.build.RuntimeVersion)
+	}
+	return nil
 }
 
 func (d *Driver) Create(ctx context.Context, input ports.TargetPlan) (ports.TargetResult, error) {
@@ -180,6 +288,12 @@ func (d *Driver) Create(ctx context.Context, input ports.TargetPlan) (ports.Targ
 	if err := input.Validate(); err != nil {
 		return ports.TargetResult{}, err
 	}
+	requestedSignature, err := targetPlanSignature(input)
+	if err != nil {
+		return ports.TargetResult{}, domain.NewError(domain.CodeInternal, "cuttlefish.create", "plan_signature", "could not bind the exact target request: "+err.Error(), err)
+	}
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
 	spec := input.Generation.Spec()
 	key := deviceKey(spec.TargetID, spec.Generation)
 	d.mu.Lock()
@@ -189,7 +303,18 @@ func (d *Driver) Create(ctx context.Context, input ports.TargetPlan) (ports.Targ
 		if !exists || prior != key {
 			return ports.TargetResult{}, domain.NewError(domain.CodeConflict, "cuttlefish.create", "idempotency_key", "was used for another device generation", nil)
 		}
+		if record.planSignature.IsZero() || record.planSignature != requestedSignature {
+			return ports.TargetResult{}, domain.NewError(domain.CodeConflict, "cuttlefish.create", "idempotency_key", "was reused with a different target plan", nil)
+		}
 		return ports.TargetResult{Status: record.status, Created: false}, nil
+	}
+	if _, exists := d.targets[key]; exists {
+		d.mu.Unlock()
+		return ports.TargetResult{}, domain.NewError(domain.CodeAlreadyExists, "cuttlefish.create", "generation", "target generation already exists", nil)
+	}
+	if _, exists := d.cleanupOnly[key]; exists {
+		d.mu.Unlock()
+		return ports.TargetResult{}, domain.NewError(domain.CodeAlreadyExists, "cuttlefish.create", "generation", "target generation is retained for cleanup", nil)
 	}
 	d.mu.Unlock()
 	allocation, err := d.allocator.Reserve(ctx, spec.TargetID, spec.Generation)
@@ -208,20 +333,87 @@ func (d *Driver) Create(ctx context.Context, input ports.TargetPlan) (ports.Targ
 	if err != nil {
 		return ports.TargetResult{}, err
 	}
-	instance, state, err := d.createInstance(ctx, plan)
+	if err := d.passCreateCheckpoint(createCheckpointAllocationReserved); err != nil {
+		keepAllocation = true
+		return ports.TargetResult{}, err
+	}
+	_, intentFound, err := loadExpectedCreateIntent(input, plan)
 	if err != nil {
-		if mustRetainAllocation(err) {
+		keepAllocation = true
+		return ports.TargetResult{}, domain.NewError(domain.CodeConflict, "cuttlefish.create", "intent", "durable create intent belongs to another exact target request", err)
+	}
+	if _, err := commitExpectedCreateIntent(input, plan, d.now()); err != nil {
+		keepAllocation = true
+		return ports.TargetResult{}, domain.NewError(domain.CodeUnavailable, "cuttlefish.create", "intent", "exact create intent could not be committed before launching the runtime", err)
+	}
+	if err := d.passCreateCheckpoint(createCheckpointIntentCommitted); err != nil {
+		keepAllocation = true
+		return ports.TargetResult{}, err
+	}
+	var instance Instance
+	var state ReadinessState
+	if intentFound {
+		inventoryBackend, supported := d.backend.(BackendInventory)
+		if !supported {
 			keepAllocation = true
+			return ports.TargetResult{}, domain.NewError(domain.CodeCapabilityUnavailable, "cuttlefish.create", "inventory", "backend cannot resume a durable Android create intent", nil)
 		}
+		inventory, inventoryErr := loadExactAndroidRuntimeInventory(ctx, inventoryBackend)
+		if inventoryErr != nil {
+			keepAllocation = true
+			return ports.TargetResult{}, inventoryErr
+		}
+		instance, state, _, err = d.ensureManifestedAndroidInstance(ctx, plan, inventory)
+		if err != nil {
+			keepAllocation = true
+			return ports.TargetResult{}, classifiedDriverFailure("cuttlefish.create", "recovery", "durable Android create intent could not be resumed", err)
+		}
+	} else {
+		instance, state, err = d.createInstance(ctx, plan)
+		if err != nil {
+			if mustRetainAllocation(err) {
+				keepAllocation = true
+			} else if removeErr := os.RemoveAll(plan.StateDirectory); removeErr != nil {
+				err = errors.Join(err, removeErr)
+			}
+			return ports.TargetResult{}, err
+		}
+		if err := d.passCreateCheckpoint(createCheckpointRuntimeReady); err != nil {
+			keepAllocation = true
+			return ports.TargetResult{}, err
+		}
+		if err := persistTargetRuntimeManifests(plan, instance, state, d.now()); err != nil {
+			cause := domain.NewError(domain.CodeUnavailable, "cuttlefish.create", "manifest", "exact target/runtime plan could not be persisted", err)
+			cleanupErr := d.cleanupFailedInstance(instance, cause)
+			if mustRetainAllocation(cleanupErr) {
+				keepAllocation = true
+			} else if removeErr := os.RemoveAll(plan.StateDirectory); removeErr != nil {
+				cleanupErr = errors.Join(cleanupErr, removeErr)
+			}
+			return ports.TargetResult{}, cleanupErr
+		}
+	}
+	if err := d.passCreateCheckpoint(createCheckpointManifestsCommitted); err != nil {
+		keepAllocation = true
 		return ports.TargetResult{}, err
 	}
 	status := ports.TargetStatus{TargetID: plan.TargetID, Generation: plan.Generation, Kind: domain.TargetAndroidVirtualDevice, State: domain.TargetGenerationReady, Ready: state.Ready(), RuntimeID: instance.RuntimeID, DeviceSerial: instance.Allocation.Serial, ObservedAt: d.now().UTC()}
 	d.mu.Lock()
-	d.targets[key] = deviceRecord{input: input, plan: plan, instance: instance, status: status}
+	d.targets[key] = deviceRecord{input: input, planSignature: requestedSignature, plan: plan, instance: instance, status: status}
 	d.idempotency[input.IdempotencyKey] = key
 	d.mu.Unlock()
 	keepAllocation = true
 	return ports.TargetResult{Status: status, Created: true}, nil
+}
+
+func (d *Driver) passCreateCheckpoint(checkpoint createCheckpoint) error {
+	if d.createCheckpoint == nil {
+		return nil
+	}
+	if err := d.createCheckpoint(checkpoint); err != nil {
+		return domain.NewError(domain.CodeUnavailable, "cuttlefish.create", "checkpoint", "target creation was interrupted after "+string(checkpoint), err)
+	}
+	return nil
 }
 
 func (d *Driver) createInstance(ctx context.Context, plan VirtualDevicePlan) (Instance, ReadinessState, error) {
@@ -229,17 +421,23 @@ func (d *Driver) createInstance(ctx context.Context, plan VirtualDevicePlan) (In
 	if err != nil {
 		return Instance{}, ReadinessState{}, domain.NewError(domain.CodeUnavailable, "cuttlefish.create", "backend.create", "device creation failed", err)
 	}
+	if err := d.passCreateCheckpoint(createCheckpointRuntimeCreated); err != nil {
+		return Instance{}, ReadinessState{}, &retainedPhysicalStateError{cause: err}
+	}
 	if err := d.backend.Start(ctx, instance); err != nil {
 		cause := domain.NewError(domain.CodeUnavailable, "cuttlefish.create", "backend.start", "device start failed", err)
 		return Instance{}, ReadinessState{}, d.cleanupFailedInstance(instance, cause)
 	}
 	state, err := d.backend.WaitReady(ctx, instance)
 	if err != nil || !state.Ready() {
-		cause := domain.NewError(domain.CodeFailedPrecondition, "cuttlefish.create", "readiness", "multi-signal Android readiness was not reached", err)
+		if err == nil {
+			err = incompleteAndroidReadinessError(state, instance.Allocation.InstanceName)
+		}
+		cause := domain.NewError(domain.CodeFailedPrecondition, "cuttlefish.create", "readiness", "multi-signal Android readiness was not reached: "+err.Error(), err)
 		return Instance{}, ReadinessState{}, d.cleanupFailedInstance(instance, cause)
 	}
-	if !instance.Fingerprint.Compatible(plan.Fingerprint) || instance.Allocation.Serial != plan.Allocation.Serial || filepath.Clean(instance.StateDirectory) != filepath.Clean(plan.StateDirectory) || filepath.Clean(instance.SystemImageDirectory) != filepath.Clean(plan.SystemImageDirectory) {
-		cause := domain.NewError(domain.CodeIntegrityViolation, "cuttlefish.create", "instance", "backend returned a different reset fingerprint or serial", nil)
+	if !instanceMatchesPlan(instance, plan) {
+		cause := domain.NewError(domain.CodeIntegrityViolation, "cuttlefish.create", "instance", "backend returned a different physical runtime plan", nil)
 		return Instance{}, ReadinessState{}, d.cleanupFailedInstance(instance, cause)
 	}
 	return instance, state, nil
@@ -251,21 +449,21 @@ func (d *Driver) cleanupInstance(instance Instance) error {
 	return d.backend.Destroy(ctx, instance)
 }
 
-type instanceCleanupFailure struct{ cause error }
+type retainedPhysicalStateError struct{ cause error }
 
-func (e *instanceCleanupFailure) Error() string { return e.cause.Error() }
-func (e *instanceCleanupFailure) Unwrap() error { return e.cause }
+func (e *retainedPhysicalStateError) Error() string { return e.cause.Error() }
+func (e *retainedPhysicalStateError) Unwrap() error { return e.cause }
 
 func (d *Driver) cleanupFailedInstance(instance Instance, cause error) error {
 	if cleanupErr := d.cleanupInstance(instance); cleanupErr != nil {
-		return &instanceCleanupFailure{cause: errors.Join(cause, cleanupErr)}
+		return &retainedPhysicalStateError{cause: errors.Join(cause, cleanupErr)}
 	}
 	return cause
 }
 
 func mustRetainAllocation(err error) bool {
-	var cleanupFailure *instanceCleanupFailure
-	return errors.As(err, &cleanupFailure)
+	var retained *retainedPhysicalStateError
+	return errors.As(err, &retained)
 }
 
 func (d *Driver) restoreInstance(instance Instance) error {
@@ -289,11 +487,21 @@ func (d *Driver) restoreInstance(instance Instance) error {
 }
 
 func (d *Driver) PrepareRun(ctx context.Context, input ports.TargetRunPlan) (ports.PreparedTargetRun, error) {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	return d.prepareRun(ctx, input)
+}
+
+func (d *Driver) prepareRun(ctx context.Context, input ports.TargetRunPlan) (ports.PreparedTargetRun, error) {
 	if err := ports.RequireDeadline(ctx, "cuttlefish.prepare_run"); err != nil {
 		return ports.PreparedTargetRun{}, err
 	}
 	if err := input.Validate(); err != nil {
 		return ports.PreparedTargetRun{}, err
+	}
+	requestedSignature, err := runPlanSignature(input)
+	if err != nil {
+		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeInternal, "cuttlefish.prepare_run", "plan_signature", "could not bind the exact run request", err)
 	}
 	spec := input.Run.Spec()
 	device, err := d.requireDevice(spec.TargetID, spec.TargetGeneration)
@@ -313,48 +521,189 @@ func (d *Driver) PrepareRun(ctx context.Context, input ports.TargetRunPlan) (por
 		if !exists || prior != spec.ID.String() {
 			return ports.PreparedTargetRun{}, domain.NewError(domain.CodeConflict, "cuttlefish.prepare_run", "idempotency_key", "was used for another run", nil)
 		}
+		if run.planSignature.IsZero() || run.planSignature != requestedSignature {
+			return ports.PreparedTargetRun{}, domain.NewError(domain.CodeConflict, "cuttlefish.prepare_run", "idempotency_key", "was reused with a different run plan", nil)
+		}
 		return runevidence.ClonePrepared(run.prepared), nil
 	}
+	for _, run := range d.runs {
+		if run.scope.TargetID == spec.TargetID && run.scope.Generation == spec.TargetGeneration {
+			d.mu.Unlock()
+			return ports.PreparedTargetRun{}, domain.NewError(domain.CodeFailedPrecondition, "cuttlefish.prepare_run", "target_generation", "mutable Android authority is single-use per target generation; reset is required", nil)
+		}
+	}
 	d.mu.Unlock()
+	persisted, intentFound, generationClaimed, err := loadRunPreparation(device.plan, input)
+	if err != nil {
+		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeConflict, "cuttlefish.prepare_run", "durable_intent", "target generation is bound to another exact run preparation", err)
+	}
+	if !intentFound && !generationClaimed {
+		if err := requireGenerationAvailableForRun(device.plan); err != nil {
+			return ports.PreparedTargetRun{}, domain.NewError(domain.CodeFailedPrecondition, "cuttlefish.prepare_run", "target_generation", "mutable Android authority is single-use per target generation", err)
+		}
+	}
+	if !intentFound {
+		persisted, err = d.commitRunPreparationIntent(input, device)
+		if err != nil {
+			return ports.PreparedTargetRun{}, err
+		}
+		if err := d.passPrepareCheckpoint(prepareCheckpointIntentCommitted); err != nil {
+			return ports.PreparedTargetRun{}, err
+		}
+	}
+	if !generationClaimed || !intentFound {
+		if err := d.materializePreparedRun(ctx, input, persisted, device.plan.StateDirectory); err != nil {
+			return ports.PreparedTargetRun{}, err
+		}
+		if err := d.passPrepareCheckpoint(prepareCheckpointMaterialized); err != nil {
+			return ports.PreparedTargetRun{}, err
+		}
+		if err := persistRunGenerationUse(device.plan, input, d.now()); err != nil {
+			return ports.PreparedTargetRun{}, domain.NewError(domain.CodeUnavailable, "cuttlefish.prepare_run", "generation_use", "durable single-use Android generation gate could not be persisted: "+err.Error(), err)
+		}
+		if err := d.passPrepareCheckpoint(prepareCheckpointGenerationClaimed); err != nil {
+			return ports.PreparedTargetRun{}, err
+		}
+	}
+	return d.commitPreparedRun(input, requestedSignature, device, persisted)
+}
+
+func loadRunPreparation(plan VirtualDevicePlan, input ports.TargetRunPlan) (runPlanManifest, bool, bool, error) {
+	use, generationClaimed, err := loadGenerationUseManifest(plan)
+	if err != nil {
+		return runPlanManifest{}, false, false, err
+	}
+	runDigest, err := persistedRunPlanDigest(persistedRunPlanFrom(input))
+	if err != nil {
+		return runPlanManifest{}, false, false, err
+	}
+	if generationClaimed && (use.Reason != generationUseRunPrepared || use.RunID != input.Run.ID().String() || use.RunPlanDigest != runDigest.String()) {
+		return runPlanManifest{}, false, true, fmt.Errorf("generation-use gate identifies another run plan")
+	}
+	directory := filepath.Join(plan.StateDirectory, "runs", input.Run.ID().String())
+	info, err := os.Lstat(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return runPlanManifest{}, false, generationClaimed, nil
+	}
+	if err != nil {
+		return runPlanManifest{}, false, generationClaimed, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return runPlanManifest{}, false, generationClaimed, fmt.Errorf("run preparation path is not an exact regular directory")
+	}
+	manifestPath := filepath.Join(directory, runPlanManifestFilename)
+	if _, err := os.Lstat(manifestPath); errors.Is(err, os.ErrNotExist) {
+		return runPlanManifest{}, false, generationClaimed, nil
+	} else if err != nil {
+		return runPlanManifest{}, false, generationClaimed, err
+	}
+	persisted, err := loadExpectedRunManifest(directory, input)
+	if err != nil {
+		return runPlanManifest{}, false, generationClaimed, err
+	}
+	expectedInstance := instanceFromPlan(plan)
+	expectedAttachment, err := androidObservationAttachment(plan, expectedInstance.RuntimeID)
+	if err != nil {
+		return runPlanManifest{}, false, generationClaimed, err
+	}
+	if persisted.Allocation != expectedInstance.Allocation || persisted.RuntimeID != expectedInstance.RuntimeID || persisted.Prepared.Attachment != expectedAttachment {
+		return runPlanManifest{}, false, generationClaimed, fmt.Errorf("run preparation intent identifies another physical runtime")
+	}
+	return persisted, true, generationClaimed, nil
+}
+
+func (d *Driver) commitRunPreparationIntent(input ports.TargetRunPlan, device deviceRecord) (runPlanManifest, error) {
+	spec := input.Run.Spec()
 	directory := filepath.Join(device.plan.StateDirectory, "runs", spec.ID.String())
 	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return ports.PreparedTargetRun{}, err
+		return runPlanManifest{}, err
+	}
+	info, err := os.Lstat(directory)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return runPlanManifest{}, domain.NewError(domain.CodeIntegrityViolation, "cuttlefish.prepare_run", "directory", "run intent path is not an exact regular directory", err)
 	}
 	scope, err := deviceproxy.IssueScope(spec.LeaseID, spec.TargetID, spec.TargetGeneration, spec.ID, device.instance.Allocation.Serial, d.random)
 	if err != nil {
 		_ = os.RemoveAll(directory)
-		return ports.PreparedTargetRun{}, err
-	}
-	if err := d.files.PrepareRun(ctx, scope, device.instance.Allocation); err != nil {
-		cause := d.cleanupPreparedRun(scope, device.instance.Allocation, directory, err)
-		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeUnavailable, "cuttlefish.prepare_run", "device_directory", "could not prepare the scoped Android run directory", cause)
-	}
-	if err := d.materializeRun(ctx, scope, device.instance.Allocation, input.Material); err != nil {
-		return ports.PreparedTargetRun{}, d.cleanupPreparedRun(scope, device.instance.Allocation, directory, err)
+		return runPlanManifest{}, err
 	}
 	sourceInstance := device.instance.RuntimeID
 	if sourceInstance == "" {
 		sourceInstance = device.instance.Allocation.Serial
 	}
-	preparedAt := runevidence.AtOrAfter(d.now(), spec.CreatedAt)
+	attachment, err := androidObservationAttachment(device.plan, sourceInstance)
+	if err != nil {
+		return runPlanManifest{}, domain.NewError(domain.CodeIntegrityViolation, "cuttlefish.prepare_run", "attachment", "exact Android observation attachment could not be constructed", err)
+	}
 	prepared := ports.PreparedTargetRun{
 		RunID: spec.ID, TargetID: spec.TargetID, TargetGeneration: spec.TargetGeneration,
 		MaterializationDigest: spec.MaterializationDigest,
 		RequiredCoverage:      append([]string(nil), input.RequiredCoverage...),
-		Attachment:            ports.ObservationAttachment{TargetKind: domain.TargetAndroidVirtualDevice, RuntimeID: sourceInstance},
-		PreparedAt:            preparedAt,
+		Attachment:            attachment,
+		PreparedAt:            runevidence.AtOrAfter(d.now(), spec.CreatedAt),
 	}
+	if err := persistRunPlanManifest(directory, input, scope, device.instance.Allocation, sourceInstance, prepared, d.now()); err != nil {
+		if _, statErr := os.Lstat(filepath.Join(directory, runPlanManifestFilename)); errors.Is(statErr, os.ErrNotExist) {
+			_ = os.RemoveAll(directory)
+		}
+		return runPlanManifest{}, domain.NewError(domain.CodeUnavailable, "cuttlefish.prepare_run", "intent", "exact run preparation intent could not be committed", err)
+	}
+	persisted, err := loadExpectedRunManifest(directory, input)
+	if err != nil {
+		return runPlanManifest{}, domain.NewError(domain.CodeIntegrityViolation, "cuttlefish.prepare_run", "intent", "committed run preparation intent could not be reloaded", err)
+	}
+	return persisted, nil
+}
+
+func androidObservationAttachment(plan VirtualDevicePlan, runtimeID string) (ports.ObservationAttachment, error) {
+	device, err := ports.NewADBDeviceSelection(plan.ADBServer, plan.Allocation.Serial)
+	if err != nil {
+		return ports.ObservationAttachment{}, err
+	}
+	attachment := ports.ObservationAttachment{TargetKind: domain.TargetAndroidVirtualDevice, RuntimeID: runtimeID, ADBDevice: device}
+	if err := attachment.Validate(); err != nil {
+		return ports.ObservationAttachment{}, err
+	}
+	return attachment, nil
+}
+
+func (d *Driver) materializePreparedRun(ctx context.Context, input ports.TargetRunPlan, persisted runPlanManifest, stateDirectory string) error {
+	directory := filepath.Join(stateDirectory, "runs", input.Run.ID().String())
+	if err := d.files.PrepareRun(ctx, persisted.Scope, persisted.Allocation); err != nil {
+		cause := d.cleanupFailedRunPreparation(persisted.Scope, persisted.Allocation, directory, err)
+		return domain.NewError(domain.CodeUnavailable, "cuttlefish.prepare_run", "device_directory", "could not prepare the scoped Android run directory", cause)
+	}
+	if err := d.materializeRun(ctx, persisted.Scope, persisted.Allocation, input.Material); err != nil {
+		return d.cleanupFailedRunPreparation(persisted.Scope, persisted.Allocation, directory, err)
+	}
+	return nil
+}
+
+func (d *Driver) commitPreparedRun(input ports.TargetRunPlan, signature domain.Digest, device deviceRecord, persisted runPlanManifest) (ports.PreparedTargetRun, error) {
+	spec := input.Run.Spec()
 	d.mu.Lock()
+	defer d.mu.Unlock()
 	currentDevice, exists := d.targets[deviceKey(spec.TargetID, spec.TargetGeneration)]
-	if !exists || currentDevice.status.State == domain.TargetGenerationQuarantined {
-		d.mu.Unlock()
-		cause := d.cleanupPreparedRun(scope, device.instance.Allocation, directory, nil)
-		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeInvalidState, "cuttlefish.prepare_run", "target", "target generation was quarantined while material was prepared", cause)
+	if !exists || currentDevice.status.State == domain.TargetGenerationQuarantined || currentDevice.instance.RuntimeID != device.instance.RuntimeID {
+		return ports.PreparedTargetRun{}, domain.NewError(domain.CodeInvalidState, "cuttlefish.prepare_run", "target", "target generation changed while its run preparation was committed", nil)
 	}
-	d.runs[spec.ID.String()] = &runRecord{plan: runevidence.ClonePlan(input), scope: scope, allocation: device.instance.Allocation, sourceInstance: sourceInstance, directory: directory, prepared: prepared, transports: make(map[*androidTransport]struct{})}
+	d.runs[spec.ID.String()] = &runRecord{
+		plan: runevidence.ClonePlan(input), planSignature: signature, scope: persisted.Scope, allocation: persisted.Allocation,
+		sourceInstance: persisted.RuntimeID, directory: filepath.Join(device.plan.StateDirectory, "runs", spec.ID.String()), prepared: runevidence.ClonePrepared(persisted.Prepared),
+		transports: make(map[*androidTransport]struct{}), scopedWrites: make(map[string]scopedWriteEvidence),
+	}
 	d.idempotency[input.IdempotencyKey] = spec.ID.String()
-	d.mu.Unlock()
-	return runevidence.ClonePrepared(prepared), nil
+	return runevidence.ClonePrepared(persisted.Prepared), nil
+}
+
+func (d *Driver) passPrepareCheckpoint(checkpoint prepareCheckpoint) error {
+	if d.prepareCheckpoint == nil {
+		return nil
+	}
+	if err := d.prepareCheckpoint(checkpoint); err != nil {
+		return domain.NewError(domain.CodeUnavailable, "cuttlefish.prepare_run", "checkpoint", "run preparation was interrupted after "+string(checkpoint), err)
+	}
+	return nil
 }
 
 func (d *Driver) materializeRun(ctx context.Context, scope deviceproxy.Scope, allocation Allocation, material []ports.TargetMaterialPlan) error {
@@ -391,12 +740,10 @@ func (d *Driver) materializeRun(ctx context.Context, scope deviceproxy.Scope, al
 	return nil
 }
 
-func (d *Driver) cleanupPreparedRun(scope deviceproxy.Scope, allocation Allocation, directory string, cause error) error {
+func (d *Driver) cleanupFailedRunPreparation(scope deviceproxy.Scope, allocation Allocation, directory string, cause error) error {
 	cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	deviceErr := d.files.RemoveRun(cleanup, scope, allocation)
-	hostErr := os.RemoveAll(directory)
-	return errors.Join(cause, deviceErr, hostErr)
+	return errors.Join(cause, d.files.RemoveRun(cleanup, scope, allocation), os.RemoveAll(directory))
 }
 
 func (d *Driver) StartRun(ctx context.Context, runID domain.TargetRunID) error {
@@ -410,9 +757,9 @@ func (d *Driver) StartRun(ctx context.Context, runID domain.TargetRunID) error {
 			d.mu.Unlock()
 			return domain.NewError(domain.CodeNotFound, "cuttlefish.start_run", "run_id", "run is not prepared", nil)
 		}
-		if run.stopped || run.quarantined {
+		if run.stopped || run.quarantined || run.finishing || run.controlPlaneLost {
 			d.mu.Unlock()
-			return domain.NewError(domain.CodeInvalidState, "cuttlefish.start_run", "run", "run was stopped or quarantined", nil)
+			return domain.NewError(domain.CodeInvalidState, "cuttlefish.start_run", "run", "run was stopped, quarantined, finishing, or recovered after control-plane loss", nil)
 		}
 		if run.started {
 			d.mu.Unlock()
@@ -443,27 +790,32 @@ func (d *Driver) StartRun(ctx context.Context, runID domain.TargetRunID) error {
 		if readinessErr == nil {
 			readinessErr = ctx.Err()
 		}
+		d.lifecycleMu.Lock()
 		d.mu.Lock()
 		current := d.runs[runID.String()]
 		if current != run {
 			finishRunStartLocked(run)
 			d.mu.Unlock()
+			d.lifecycleMu.Unlock()
 			return domain.NewError(domain.CodeNotFound, "cuttlefish.start_run", "run_id", "run was removed while awaiting collector readiness", nil)
 		}
-		if current.stopped || current.quarantined {
+		if current.stopped || current.quarantined || current.finishing || current.controlPlaneLost {
 			finishRunStartLocked(current)
 			d.mu.Unlock()
+			d.lifecycleMu.Unlock()
 			return domain.NewError(domain.CodeInvalidState, "cuttlefish.start_run", "run", "run stopped or was quarantined while awaiting collector readiness", nil)
 		}
-		device := d.targets[deviceKey(current.scope.TargetID, current.scope.Generation)]
-		if device.status.State == domain.TargetGenerationQuarantined {
+		device, exists := d.targets[deviceKey(current.scope.TargetID, current.scope.Generation)]
+		if !exists || device.status.State == domain.TargetGenerationQuarantined || !device.status.Ready {
 			finishRunStartLocked(current)
 			d.mu.Unlock()
+			d.lifecycleMu.Unlock()
 			return domain.NewError(domain.CodeInvalidState, "cuttlefish.start_run", "target", "target generation was quarantined while awaiting collector readiness", nil)
 		}
 		if readinessErr != nil {
 			finishRunStartLocked(current)
 			d.mu.Unlock()
+			d.lifecycleMu.Unlock()
 			return domain.NewError(domain.CodeFailedPrecondition, "cuttlefish.start_run", "collectors", "required Android collectors are not ready", readinessErr)
 		}
 		startedAt := runevidence.AtOrAfter(d.now(), current.prepared.PreparedAt)
@@ -474,7 +826,36 @@ func (d *Driver) StartRun(ctx context.Context, runID domain.TargetRunID) error {
 		if encodeErr != nil {
 			finishRunStartLocked(current)
 			d.mu.Unlock()
+			d.lifecycleMu.Unlock()
 			return domain.NewError(domain.CodeInternal, "cuttlefish.start_run", "observation", "could not encode the intrinsic start fact", encodeErr)
+		}
+		plan := runevidence.ClonePlan(current.plan)
+		allocation := current.allocation
+		runtimeID := current.sourceInstance
+		directory := current.directory
+		minimumStartedAt := current.prepared.PreparedAt
+		d.mu.Unlock()
+		startRecord, commitErr := commitExpectedRunStart(directory, plan, allocation, runtimeID, startedAt, minimumStartedAt)
+		if commitErr != nil {
+			d.mu.Lock()
+			if latest := d.runs[runID.String()]; latest == current {
+				finishRunStartLocked(latest)
+			}
+			d.mu.Unlock()
+			d.lifecycleMu.Unlock()
+			return domain.NewError(domain.CodeUnavailable, "cuttlefish.start_run", "run_start", "could not durably commit the Android target run start", commitErr)
+		}
+		startedAt = startRecord.StartedAt
+		d.mu.Lock()
+		current = d.runs[runID.String()]
+		device, exists = d.targets[deviceKey(plan.Run.Spec().TargetID, plan.Run.Spec().TargetGeneration)]
+		if current != run || current.stopped || current.quarantined || current.finishing || current.controlPlaneLost || !exists || !device.status.Ready || device.instance.RuntimeID != runtimeID {
+			if current == run {
+				finishRunStartLocked(current)
+			}
+			d.mu.Unlock()
+			d.lifecycleMu.Unlock()
+			return domain.NewError(domain.CodeInvalidState, "cuttlefish.start_run", "run", "run or target ownership changed while durable start was committed", nil)
 		}
 		deadlineContext, cancelDeadline := context.WithCancel(context.Background())
 		current.started = true
@@ -486,6 +867,7 @@ func (d *Driver) StartRun(ctx context.Context, runID domain.TargetRunID) error {
 		maximumDuration := current.plan.MaximumDuration
 		finishRunStartLocked(current)
 		d.mu.Unlock()
+		d.lifecycleMu.Unlock()
 		go d.enforceRunDuration(deadlineContext, runID, maximumDuration)
 		return nil
 	}
@@ -499,7 +881,7 @@ func (d *Driver) OpenTransport(ctx context.Context, runID domain.TargetRunID) (p
 	if err != nil {
 		return nil, err
 	}
-	if !run.started || run.stopped || run.quarantined {
+	if !run.started || run.stopped || run.quarantined || run.finishing || run.controlPlaneLost {
 		return nil, domain.NewError(domain.CodeFailedPrecondition, "cuttlefish.open_transport", "run", "run is not active", nil)
 	}
 	device, err := d.requireDevice(run.scope.TargetID, run.scope.Generation)
@@ -509,11 +891,11 @@ func (d *Driver) OpenTransport(ctx context.Context, runID domain.TargetRunID) (p
 	if device.status.State == domain.TargetGenerationQuarantined {
 		return nil, domain.NewError(domain.CodeFailedPrecondition, "cuttlefish.open_transport", "target", "target generation is quarantined", nil)
 	}
-	transport := &androidTransport{gateway: d.gateway, files: d.files, scope: run.scope, allocation: device.instance.Allocation}
+	transport := &androidTransport{driver: d, gateway: d.gateway, files: d.files, scope: run.scope, allocation: device.instance.Allocation}
 	d.mu.Lock()
 	current := d.runs[runID.String()]
 	currentDevice := d.targets[deviceKey(run.scope.TargetID, run.scope.Generation)]
-	if current != nil && current.started && !current.stopped && !current.quarantined && currentDevice.status.State != domain.TargetGenerationQuarantined {
+	if current != nil && current.started && !current.stopped && !current.quarantined && !current.finishing && !current.controlPlaneLost && currentDevice.status.State != domain.TargetGenerationQuarantined && currentDevice.status.Ready {
 		current.transports[transport] = struct{}{}
 		d.mu.Unlock()
 		return transport, nil
@@ -536,7 +918,7 @@ func (d *Driver) StopRun(ctx context.Context, runID domain.TargetRunID, mode por
 		cause = runevidence.CauseNeverStarted
 	}
 	d.mu.Unlock()
-	return d.stopRun(ctx, runID, cause)
+	return d.stopRun(ctx, runID, mode, cause)
 }
 
 func (d *Driver) enforceRunDuration(ctx context.Context, runID domain.TargetRunID, maximumDuration time.Duration) {
@@ -549,10 +931,16 @@ func (d *Driver) enforceRunDuration(ctx context.Context, runID domain.TargetRunI
 	}
 	cleanupContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_, _ = d.stopRun(cleanupContext, runID, runevidence.CauseDurationExceeded)
+	_, _ = d.stopRun(cleanupContext, runID, ports.StopForce, runevidence.CauseDurationExceeded)
 }
 
-func (d *Driver) stopRun(ctx context.Context, runID domain.TargetRunID, cause runevidence.Cause) (ports.TargetRunStopReceipt, error) {
+func (d *Driver) stopRun(ctx context.Context, runID domain.TargetRunID, mode ports.StopMode, cause runevidence.Cause) (ports.TargetRunStopReceipt, error) {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	return d.stopRunLocked(ctx, runID, mode, cause)
+}
+
+func (d *Driver) stopRunLocked(ctx context.Context, runID domain.TargetRunID, mode ports.StopMode, cause runevidence.Cause) (ports.TargetRunStopReceipt, error) {
 	d.mu.Lock()
 	current := d.runs[runID.String()]
 	if current == nil {
@@ -563,17 +951,20 @@ func (d *Driver) stopRun(ctx context.Context, runID domain.TargetRunID, cause ru
 		d.mu.Unlock()
 		return ports.TargetRunStopReceipt{}, domain.NewError(domain.CodeInvalidState, "cuttlefish.stop_run", "run", "quarantined run state is preserved for evidence", nil)
 	}
-	if !current.stopped {
-		result, buildErr := d.buildStopReceipt(current, cause)
-		if buildErr != nil {
-			d.mu.Unlock()
-			return ports.TargetRunStopReceipt{}, buildErr
-		}
-		current.stopped = true
-		stored := cloneStopReceipt(result)
-		current.receipt = &stored
+	if current.stopped {
+		result := runevidence.CloneStopReceipt(*current.receipt)
+		d.mu.Unlock()
+		return result, nil
 	}
-	result := cloneStopReceipt(*current.receipt)
+	device, found := d.targets[deviceKey(current.scope.TargetID, current.scope.Generation)]
+	if !found || device.instance.RuntimeID != current.sourceInstance {
+		d.mu.Unlock()
+		return ports.TargetRunStopReceipt{}, domain.NewError(domain.CodeFailedPrecondition, "cuttlefish.stop_run", "target", "exact target generation disappeared before execution could be contained", nil)
+	}
+	current.finishing = true
+	if cause == runevidence.CauseDurationExceeded {
+		current.durationExceeded = true
+	}
 	if current.startCancel != nil {
 		current.startCancel()
 	}
@@ -583,60 +974,75 @@ func (d *Driver) stopRun(ctx context.Context, runID domain.TargetRunID, cause ru
 	}
 	transports := make([]*androidTransport, 0, len(current.transports))
 	for transport := range current.transports {
+		transport.revoke()
 		transports = append(transports, transport)
 	}
-	current.transports = nil
-	if current.cleanupComplete {
-		d.mu.Unlock()
-		return result, nil
-	}
-	if current.cleanupRunning {
-		done := current.cleanupDone
-		d.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return result, ctx.Err()
-		case <-done:
-			d.mu.Lock()
-			cleanupErr := current.cleanupErr
-			d.mu.Unlock()
-			return result, cleanupErr
-		}
-	}
-	current.cleanupRunning = true
-	current.cleanupDone = make(chan struct{})
 	d.mu.Unlock()
 
-	cleanupErr := d.cleanupRunResources(ctx, current, transports)
+	contained, cleanupErr := d.cleanupRunResources(ctx, current, device.instance, mode, transports)
+	if cleanupErr != nil {
+		d.mu.Lock()
+		if latest := d.runs[runID.String()]; latest == current && !latest.stopped {
+			latest.finishing = false
+		}
+		d.mu.Unlock()
+		return ports.TargetRunStopReceipt{}, cleanupErr
+	}
 	d.mu.Lock()
-	current.cleanupRunning = false
-	current.cleanupComplete = cleanupErr == nil
-	current.cleanupErr = cleanupErr
-	close(current.cleanupDone)
+	current = d.runs[runID.String()]
+	device, found = d.targets[deviceKey(device.plan.TargetID, device.plan.Generation)]
+	if current == nil || current.stopped || !found || device.instance.RuntimeID != current.sourceInstance {
+		d.mu.Unlock()
+		return ports.TargetRunStopReceipt{}, domain.NewError(domain.CodeConflict, "cuttlefish.stop_run", "run", "run or target ownership changed while execution was being contained", nil)
+	}
+	result, buildErr := d.buildStopReceipt(current, cause, contained.ObservedAt)
+	if buildErr != nil {
+		current.finishing = false
+		d.mu.Unlock()
+		return ports.TargetRunStopReceipt{}, buildErr
+	}
+	result, contained, buildErr = commitExpectedRunStop(current.directory, current.plan, device.plan, current.allocation, current.sourceInstance, contained, result)
+	if buildErr != nil {
+		current.finishing = false
+		d.mu.Unlock()
+		return ports.TargetRunStopReceipt{}, domain.NewError(domain.CodeUnavailable, "cuttlefish.stop_run", "stop_manifest", "exact stopped-run evidence could not be committed", buildErr)
+	}
+	current.stopped = true
+	current.finishing = false
+	current.transports = nil
+	containedCopy := contained
+	current.containment = &containedCopy
+	stored := runevidence.CloneStopReceipt(result)
+	current.receipt = &stored
+	device.status.Ready = false
+	device.status.State = domain.TargetGenerationResettable
+	device.status.ObservedAt = contained.ObservedAt
+	d.targets[deviceKey(device.plan.TargetID, device.plan.Generation)] = device
 	d.mu.Unlock()
-	return result, cleanupErr
+	return runevidence.CloneStopReceipt(result), nil
 }
 
-func (d *Driver) buildStopReceipt(run *runRecord, cause runevidence.Cause) (ports.TargetRunStopReceipt, error) {
-	stoppedAt := runevidence.AtOrAfter(d.now(), run.prepared.PreparedAt)
+func (d *Driver) buildStopReceipt(run *runRecord, cause runevidence.Cause, containedAt time.Time) (ports.TargetRunStopReceipt, error) {
+	stoppedAt := runevidence.AtOrAfter(d.now(), containedAt)
+	stoppedAt = runevidence.AtOrAfter(stoppedAt, run.prepared.PreparedAt)
 	outcome := ports.RunCompleted
 	failureKind := ports.TargetRunFailureNone
 	terminalKind := "target.run.stopped"
-	switch cause {
-	case runevidence.CauseNeverStarted:
+	switch {
+	case run.interruptedExecution:
+		outcome = ports.RunFailed
+		failureKind = ports.TargetRunFailureTarget
+		terminalKind = "target.run.control-plane-failure"
+	case !run.started:
 		outcome = ports.RunFailed
 		failureKind = ports.TargetRunFailureNeverStarted
 		terminalKind = "target.run.never_started"
-	case runevidence.CauseDurationExceeded:
+	case run.durationExceeded || cause == runevidence.CauseDurationExceeded:
 		outcome = ports.RunFailed
 		failureKind = ports.TargetRunFailureDurationExceeded
 		terminalKind = "target.run.duration_exceeded"
 	}
-	if !run.started {
-		outcome = ports.RunFailed
-		failureKind = ports.TargetRunFailureNeverStarted
-		terminalKind = "target.run.never_started"
-	} else {
+	if run.started || run.interruptedExecution {
 		stoppedAt = runevidence.AtOrAfter(stoppedAt, run.startedAt)
 	}
 	payload, err := json.Marshal(struct {
@@ -649,7 +1055,7 @@ func (d *Driver) buildStopReceipt(run *runRecord, cause runevidence.Cause) (port
 	}
 	observations := append([]ports.TargetRunObservation(nil), run.observations...)
 	observations = append(observations, ports.TargetRunObservation{Kind: terminalKind, ObservedAt: stoppedAt, Payload: payload})
-	changes, err := domain.NewChangeSet(domain.ChangeScopeTarget, nil, domain.InitialRevision, stoppedAt)
+	changes, err := d.targetRunChanges(run, stoppedAt)
 	if err != nil {
 		return ports.TargetRunStopReceipt{}, err
 	}
@@ -670,30 +1076,132 @@ func requiredExternalRequirements(collectors []ports.CollectorSpec) []ports.Obse
 	return result
 }
 
-func cloneStopReceipt(receipt ports.TargetRunStopReceipt) ports.TargetRunStopReceipt {
-	receipt.Observations = append([]ports.TargetRunObservation(nil), receipt.Observations...)
-	for index := range receipt.Observations {
-		receipt.Observations[index].Payload = append([]byte(nil), receipt.Observations[index].Payload...)
+func (d *Driver) recordRunFact(runID domain.TargetRunID, observation ports.TargetRunObservation, mutate func(*runRecord)) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	run := d.runs[runID.String()]
+	if run == nil || !run.started || run.stopped || run.quarantined || run.controlPlaneLost {
+		return io.ErrClosedPipe
 	}
-	return receipt
+	minimum := run.startedAt
+	if count := len(run.observations); count > 0 && run.observations[count-1].ObservedAt.After(minimum) {
+		minimum = run.observations[count-1].ObservedAt
+	}
+	observation.ObservedAt = runevidence.AtOrAfter(observation.ObservedAt, minimum)
+	observation.Payload = append(json.RawMessage(nil), observation.Payload...)
+	run.observations = append(run.observations, observation)
+	if mutate != nil {
+		mutate(run)
+	}
+	return nil
 }
 
-func (d *Driver) cleanupRunResources(ctx context.Context, run *runRecord, transports []*androidTransport) error {
-	errorsFound := make([]error, 0, len(transports)+2)
-	for _, transport := range transports {
-		if err := transport.Close(); err != nil {
-			errorsFound = append(errorsFound, err)
+func (d *Driver) cleanupRunResources(ctx context.Context, run *runRecord, instance Instance, mode ports.StopMode, transports []*androidTransport) (BackendQuarantineState, error) {
+	var contained BackendQuarantineState
+	var containmentErr error
+	d.mu.Lock()
+	priorContainment := run.containment
+	d.mu.Unlock()
+	if priorContainment != nil {
+		if priorContainment.RuntimeID != instance.RuntimeID || !priorContainment.ExecutionStopped || !priorContainment.NetworkUnreachable || !priorContainment.StatePreserved || priorContainment.ObservedAt.IsZero() {
+			containmentErr = domain.NewError(domain.CodeIntegrityViolation, "cuttlefish.stop_run", "execution_containment", "recovered run lacks exact authoritative containment proof", nil)
+		} else {
+			contained = *priorContainment
+		}
+	} else if run.controlPlaneLost {
+		if run.containment == nil || run.containment.RuntimeID != instance.RuntimeID || !run.containment.ExecutionStopped || !run.containment.NetworkUnreachable || !run.containment.StatePreserved || run.containment.ObservedAt.IsZero() {
+			containmentErr = domain.NewError(domain.CodeIntegrityViolation, "cuttlefish.stop_run", "execution_containment", "recovered run lacks exact authoritative containment proof", nil)
+		} else {
+			contained = *run.containment
+		}
+	} else {
+		contained, containmentErr = d.verifyBackendContainment(ctx, instance, mode)
+		if containmentErr != nil {
+			containmentErr = classifiedDriverFailure("cuttlefish.stop_run", "execution_containment", "could not prove all guest execution stopped and the exact device became unreachable", containmentErr)
+		} else {
+			containedCopy := contained
+			d.mu.Lock()
+			if run.containment == nil {
+				run.containment = &containedCopy
+			}
+			d.mu.Unlock()
 		}
 	}
-	if err := d.files.RemoveRun(ctx, run.scope, run.allocation); err != nil {
-		errorsFound = append(errorsFound, err)
+	errorsFound := make([]error, 0, len(transports)+1)
+	if containmentErr != nil {
+		errorsFound = append(errorsFound, containmentErr)
 	}
-	if run.directory == "" {
-		errorsFound = append(errorsFound, fmt.Errorf("prepared run has no host directory"))
-	} else if err := os.RemoveAll(run.directory); err != nil {
-		errorsFound = append(errorsFound, err)
+	for _, transport := range transports {
+		if err := transport.closeWithContext(ctx); err != nil {
+			errorsFound = append(errorsFound, domain.NewError(domain.CodeUnavailable, "cuttlefish.stop_run", "transport_cleanup", "could not drain and revoke a scoped Android transport", err))
+		}
 	}
-	return errors.Join(errorsFound...)
+	if err := errors.Join(errorsFound...); err != nil {
+		return contained, err
+	}
+	return contained, nil
+}
+
+func (d *Driver) verifyBackendContainment(ctx context.Context, instance Instance, mode ports.StopMode) (BackendQuarantineState, error) {
+	if !mode.IsValid() {
+		return BackendQuarantineState{}, domain.NewError(domain.CodeInvalidArgument, "cuttlefish.execution_containment", "mode", "is not recognized", nil)
+	}
+	quarantiner, supported := d.backend.(BackendQuarantiner)
+	if !supported {
+		return BackendQuarantineState{}, domain.NewError(domain.CodeCapabilityUnavailable, "cuttlefish.execution_containment", "backend", "backend cannot prove execution stop, network unreachability, and state preservation", nil)
+	}
+	state, err := quarantiner.Quarantine(ctx, instance, mode)
+	if err != nil {
+		return state, err
+	}
+	if state.RuntimeID != instance.RuntimeID || !state.ExecutionStopped || !state.NetworkUnreachable || !state.StatePreserved || state.ObservedAt.IsZero() {
+		return state, domain.NewError(domain.CodeFailedPrecondition, "cuttlefish.execution_containment", "proof", "backend returned incomplete or foreign containment evidence", nil)
+	}
+	state.ObservedAt = runevidence.AtOrAfter(state.ObservedAt, d.now())
+	return state, nil
+}
+
+func (d *Driver) targetRunChanges(run *runRecord, sealedAt time.Time) (domain.ChangeSet, error) {
+	entries := make([]domain.ChangeEntry, 0, len(run.scopedWrites)+1)
+	if run.opaqueMutationReason != "" || run.adbAuthorityIssued {
+		reason := run.opaqueMutationReason
+		if reason == "" {
+			reason = "arbitrary-scoped-adb-authority"
+		}
+		entry, err := domain.NewChangeEntry(domain.ChangeEntrySpec{
+			Kind: domain.ChangeOpaqueDirectory, Path: ".",
+			Metadata: map[string]string{
+				"reason": reason, "serial": run.allocation.Serial,
+				"mutation_coverage": "opaque", "known_scoped_write_count": strconv.Itoa(len(run.scopedWrites)),
+			},
+		})
+		if err != nil {
+			return domain.ChangeSet{}, err
+		}
+		entries = append(entries, entry)
+	} else {
+		paths := make([]string, 0, len(run.scopedWrites))
+		for logicalPath := range run.scopedWrites {
+			paths = append(paths, logicalPath)
+		}
+		sort.Strings(paths)
+		for _, logicalPath := range paths {
+			write := run.scopedWrites[logicalPath]
+			devicePath := strings.TrimPrefix(scopedDevicePath(run.scope, DeviceFileWritable, logicalPath), "/")
+			entry, err := domain.NewChangeEntry(domain.ChangeEntrySpec{
+				Kind: domain.ChangeAdded, Path: devicePath, AfterDigest: write.file.Digest,
+				Metadata: map[string]string{
+					"size_bytes": strconv.FormatInt(write.file.Size, 10), "mode": fmt.Sprintf("%#o", write.mode),
+					"evidence": "exact-scoped-push",
+				},
+			})
+			if err != nil {
+				return domain.ChangeSet{}, err
+			}
+			entries = append(entries, entry)
+		}
+	}
+	return domain.NewChangeSet(domain.ChangeScopeTarget, entries, domain.InitialRevision, sealedAt)
 }
 
 func finishRunStartLocked(run *runRecord) {
@@ -724,6 +1232,12 @@ func (d *Driver) Reset(ctx context.Context, targetID domain.TargetID, reset port
 			return ports.TargetResult{}, domain.NewError(domain.CodeConflict, "cuttlefish.reset", "idempotency_key", "was used for a different reset", nil)
 		}
 		return prior.result, prior.err
+	}
+	for _, prior := range d.resetResults {
+		if prior.targetID == targetID && prior.plan.Previous == reset.Previous {
+			d.mu.Unlock()
+			return ports.TargetResult{}, domain.NewError(domain.CodeConflict, "cuttlefish.reset", "idempotency_key", "another exact reset request already advanced this previous generation", nil)
+		}
 	}
 	d.mu.Unlock()
 	if targetID != reset.Previous.ID {
@@ -770,20 +1284,46 @@ func (d *Driver) Reset(ctx context.Context, targetID domain.TargetID, reset port
 	if err := next.Validate(d.build.TargetRoot, d.build.SystemImageRoot); err != nil {
 		return ports.TargetResult{}, err
 	}
-	instance, _, err := d.createInstance(ctx, next)
+	transition, err := commitExpectedResetTransition(previous, next, reset, d.now())
+	if err != nil {
+		return ports.TargetResult{}, domain.NewError(domain.CodeUnavailable, "cuttlefish.reset", "transition_manifest", "exact reset semantics could not be committed before replacement creation", err)
+	}
+	if err := d.passResetCheckpoint(resetCheckpointTransitionCommitted); err != nil {
+		keep = true
+		return ports.TargetResult{}, err
+	}
+	instance, readiness, err := d.createInstance(ctx, next)
 	if err != nil {
 		if mustRetainAllocation(err) {
 			keep = true
+		} else if removeErr := os.RemoveAll(next.StateDirectory); removeErr != nil {
+			err = errors.Join(err, removeErr)
 		}
 		return ports.TargetResult{}, domain.NewError(domain.CodeUnavailable, "cuttlefish.reset", "replacement", "could not create a reachable next device generation", err)
+	}
+	if err := persistTargetRuntimeManifests(next, instance, readiness, d.now()); err != nil {
+		cleanupErr := d.cleanupInstance(instance)
+		if cleanupErr != nil {
+			keep = true
+		}
+		return ports.TargetResult{}, domain.NewError(domain.CodeUnavailable, "cuttlefish.reset", "manifest", "replacement target/runtime plan could not be persisted", errors.Join(err, cleanupErr))
+	}
+	if err := d.passResetCheckpoint(resetCheckpointReplacementManifest); err != nil {
+		keep = true
+		return ports.TargetResult{}, err
 	}
 	if err := d.backend.Destroy(ctx, previous.instance); err != nil {
 		restoreErr := d.restoreInstance(previous.instance)
 		if restoreErr != nil {
-			status := ports.TargetStatus{TargetID: targetID, Generation: reset.NextGeneration, Kind: domain.TargetAndroidVirtualDevice, State: domain.TargetGenerationReady, Ready: true, RuntimeID: instance.RuntimeID, DeviceSerial: instance.Allocation.Serial, ObservedAt: d.now().UTC()}
-			result := ports.TargetResult{Status: status, Created: true}
+			result := readyResetTargetResult(next, instance, d.now())
+			status := result.Status
 			outcomeErr := domain.NewError(domain.CodeUnavailable, "cuttlefish.reset", "retire_previous", "replacement is ready but the previous device could neither retire nor be restored", errors.Join(err, restoreErr))
-			d.commitReset(previous, next, instance, status, targetID, reset, result, outcomeErr)
+			persisted, persistErr := d.commitDurableResetOutcome(next, transition, result, outcomeErr)
+			if persistErr != nil {
+				outcomeErr = domain.NewError(domain.CodeUnavailable, "cuttlefish.reset", "outcome_manifest", "authoritative replacement exists but its exact reset outcome could not be persisted", errors.Join(outcomeErr, persistErr))
+				persisted = resetOutcome{targetID: targetID, plan: reset, result: result, err: outcomeErr}
+			}
+			d.commitReset(previous, next, instance, status, persisted)
 			// The old allocation is retained because the old process state is
 			// uncertain. Next remains the authoritative reachable generation.
 			keep = true
@@ -794,12 +1334,29 @@ func (d *Driver) Reset(ctx context.Context, targetID domain.TargetID, reset port
 			// Retain the allocation if the replacement could not be
 			// destroyed; releasing it could collide with a live instance.
 			keep = true
+		} else if removeErr := os.RemoveAll(next.StateDirectory); removeErr != nil {
+			rollbackErr = removeErr
 		}
 		return ports.TargetResult{}, domain.NewError(domain.CodeUnavailable, "cuttlefish.reset", "retire_previous", "could not retire the previous device; replacement rollback was attempted", errors.Join(err, restoreErr, rollbackErr))
 	}
-	status := ports.TargetStatus{TargetID: targetID, Generation: reset.NextGeneration, Kind: domain.TargetAndroidVirtualDevice, State: domain.TargetGenerationReady, Ready: true, RuntimeID: instance.RuntimeID, DeviceSerial: instance.Allocation.Serial, ObservedAt: d.now().UTC()}
-	result := ports.TargetResult{Status: status, Created: true}
-	d.commitReset(previous, next, instance, status, targetID, reset, result, nil)
+	if err := d.passResetCheckpoint(resetCheckpointPreviousRetired); err != nil {
+		keep = true
+		return ports.TargetResult{}, err
+	}
+	result := readyResetTargetResult(next, instance, d.now())
+	status := result.Status
+	persisted, persistErr := d.commitDurableResetOutcome(next, transition, result, nil)
+	if persistErr != nil {
+		outcomeErr := domain.NewError(domain.CodeUnavailable, "cuttlefish.reset", "outcome_manifest", "replacement became authoritative but its exact reset outcome could not be persisted", persistErr)
+		d.commitReset(previous, next, instance, status, resetOutcome{targetID: targetID, plan: reset, result: result, err: outcomeErr})
+		keep = true
+		return result, outcomeErr
+	}
+	if err := d.passResetCheckpoint(resetCheckpointOutcomeCommitted); err != nil {
+		keep = true
+		return result, err
+	}
+	d.commitReset(previous, next, instance, status, persisted)
 	cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = d.allocator.Release(cleanup, previous.plan.Allocation)
@@ -822,20 +1379,25 @@ func (d *Driver) Quarantine(ctx context.Context, plan ports.TargetQuarantinePlan
 		if prior.plan != plan {
 			return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeConflict, "cuttlefish.quarantine", "idempotency_key", "was used for another quarantine", nil)
 		}
+		if err := d.drainQuarantinedTransports(ctx, plan.Target); err != nil {
+			return prior.evidence, err
+		}
 		return prior.evidence, nil
+	}
+	for _, prior := range d.quarantines {
+		if prior.plan.Target == plan.Target {
+			d.mu.Unlock()
+			return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeConflict, "cuttlefish.quarantine", "idempotency_key", "another exact quarantine request already quarantined this target generation", nil)
+		}
 	}
 	d.mu.Unlock()
 	device, err := d.requireDevice(plan.Target.ID, plan.Target.Generation)
 	if err != nil {
 		return ports.TargetQuarantineEvidence{}, err
 	}
-	quarantiner, supported := d.backend.(BackendQuarantiner)
-	if !supported {
-		return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeCapabilityUnavailable, "cuttlefish.quarantine", "backend", "backend cannot prove execution stop and network isolation", nil)
-	}
-	state, err := quarantiner.Quarantine(ctx, device.instance)
+	state, err := d.verifyBackendContainment(ctx, device.instance, ports.StopForce)
 	if err != nil {
-		return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeUnavailable, "cuttlefish.quarantine", "backend", "backend quarantine failed", err)
+		return ports.TargetQuarantineEvidence{}, classifiedDriverFailure("cuttlefish.quarantine", "backend", "backend quarantine failed", err)
 	}
 	evidence := ports.TargetQuarantineEvidence{
 		Target: plan.Target, RuntimeID: state.RuntimeID,
@@ -848,6 +1410,15 @@ func (d *Driver) Quarantine(ctx context.Context, plan ports.TargetQuarantinePlan
 	if state.RuntimeID != device.instance.RuntimeID {
 		return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeIntegrityViolation, "cuttlefish.quarantine", "runtime_id", "backend evidence identifies a different device instance", nil)
 	}
+	state, err = commitExpectedGenerationQuarantine(device.plan, device.instance, plan, state)
+	if err != nil {
+		return ports.TargetQuarantineEvidence{}, domain.NewError(domain.CodeUnavailable, "cuttlefish.quarantine", "quarantine_manifest", "durable Android generation quarantine proof could not be persisted: "+err.Error(), err)
+	}
+	evidence = ports.TargetQuarantineEvidence{
+		Target: plan.Target, RuntimeID: state.RuntimeID,
+		ExecutionStopped: state.ExecutionStopped, NetworkUnreachable: state.NetworkUnreachable,
+		StatePreserved: state.StatePreserved, ObservedAt: state.ObservedAt,
+	}
 	d.mu.Lock()
 	current, found := d.targets[deviceKey(plan.Target.ID, plan.Target.Generation)]
 	if !found || current.instance.RuntimeID != device.instance.RuntimeID {
@@ -858,7 +1429,6 @@ func (d *Driver) Quarantine(ctx context.Context, plan ports.TargetQuarantinePlan
 	current.status.Ready = false
 	current.status.ObservedAt = state.ObservedAt
 	d.targets[deviceKey(plan.Target.ID, plan.Target.Generation)] = current
-	transports := make([]*androidTransport, 0)
 	for _, run := range d.runs {
 		if run.scope.TargetID != plan.Target.ID || run.scope.Generation != plan.Target.Generation {
 			continue
@@ -871,30 +1441,90 @@ func (d *Driver) Quarantine(ctx context.Context, plan ports.TargetQuarantinePlan
 			run.deadlineCancel()
 			run.deadlineCancel = nil
 		}
-		for transport := range run.transports {
-			transports = append(transports, transport)
-		}
-		run.transports = nil
 	}
 	if d.quarantines == nil {
 		d.quarantines = make(map[string]quarantineOutcome)
 	}
 	d.quarantines[plan.IdempotencyKey] = quarantineOutcome{plan: plan, evidence: evidence}
 	d.mu.Unlock()
-	for _, transport := range transports {
-		_ = transport.Close()
+	if err := d.drainQuarantinedTransports(ctx, plan.Target); err != nil {
+		return evidence, err
 	}
 	return evidence, nil
 }
 
-func (d *Driver) commitReset(previous deviceRecord, next VirtualDevicePlan, instance Instance, status ports.TargetStatus, targetID domain.TargetID, reset ports.ResetPlan, result ports.TargetResult, outcomeErr error) {
+func (d *Driver) drainQuarantinedTransports(ctx context.Context, ref ports.TargetRef) error {
+	type ownedTransport struct {
+		run       *runRecord
+		transport *androidTransport
+	}
+	d.mu.Lock()
+	owned := make([]ownedTransport, 0)
+	for _, run := range d.runs {
+		if run.scope.TargetID != ref.ID || run.scope.Generation != ref.Generation || !run.quarantined {
+			continue
+		}
+		for transport := range run.transports {
+			owned = append(owned, ownedTransport{run: run, transport: transport})
+		}
+	}
+	d.mu.Unlock()
+	errorsFound := make([]error, 0, len(owned))
+	for _, item := range owned {
+		if err := item.transport.closeWithContext(ctx); err != nil {
+			errorsFound = append(errorsFound, err)
+			continue
+		}
+		d.mu.Lock()
+		delete(item.run.transports, item.transport)
+		if len(item.run.transports) == 0 {
+			item.run.transports = nil
+		}
+		d.mu.Unlock()
+	}
+	if err := errors.Join(errorsFound...); err != nil {
+		return domain.NewError(domain.CodeUnavailable, "cuttlefish.quarantine", "transport_cleanup", "could not drain every scoped Android transport after containment", err)
+	}
+	return nil
+}
+
+func (d *Driver) commitDurableResetOutcome(next VirtualDevicePlan, transition resetTransitionManifest, result ports.TargetResult, outcomeErr error) (resetOutcome, error) {
+	commit := d.commitResetOutcome
+	if commit == nil {
+		commit = commitExpectedResetOutcome
+	}
+	return commit(next, transition, result, outcomeErr, d.now())
+}
+
+func (d *Driver) passResetCheckpoint(checkpoint resetCheckpoint) error {
+	if d.resetCheckpoint == nil {
+		return nil
+	}
+	if err := d.resetCheckpoint(checkpoint); err != nil {
+		return domain.NewError(domain.CodeUnavailable, "cuttlefish.reset", "checkpoint", "reset was interrupted after "+string(checkpoint), err)
+	}
+	return nil
+}
+
+func readyResetTargetResult(plan VirtualDevicePlan, instance Instance, observedAt time.Time) ports.TargetResult {
+	return ports.TargetResult{
+		Status: ports.TargetStatus{
+			TargetID: plan.TargetID, Generation: plan.Generation, Kind: domain.TargetAndroidVirtualDevice,
+			State: domain.TargetGenerationReady, Ready: true, RuntimeID: instance.RuntimeID,
+			DeviceSerial: instance.Allocation.Serial, ObservedAt: observedAt.UTC(),
+		},
+		Created: true,
+	}
+}
+
+func (d *Driver) commitReset(previous deviceRecord, next VirtualDevicePlan, instance Instance, status ports.TargetStatus, outcome resetOutcome) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.removeRunsLocked(targetID, reset.Previous.Generation)
-	delete(d.targets, deviceKey(targetID, reset.Previous.Generation))
+	d.removeRunsLocked(outcome.targetID, outcome.plan.Previous.Generation)
+	delete(d.targets, deviceKey(outcome.targetID, outcome.plan.Previous.Generation))
 	delete(d.idempotency, previous.input.IdempotencyKey)
-	d.targets[deviceKey(targetID, reset.NextGeneration)] = deviceRecord{input: previous.input, plan: next, instance: instance, status: status}
-	d.resetResults[reset.IdempotencyKey] = resetOutcome{targetID: targetID, plan: reset, result: result, err: outcomeErr}
+	d.targets[deviceKey(outcome.targetID, outcome.plan.NextGeneration)] = deviceRecord{input: previous.input, plan: next, instance: instance, status: status}
+	d.resetResults[outcome.plan.IdempotencyKey] = outcome
 }
 
 func (d *Driver) Destroy(ctx context.Context, ref ports.TargetRef) error {
@@ -906,42 +1536,98 @@ func (d *Driver) Destroy(ctx context.Context, ref ports.TargetRef) error {
 	}
 	d.lifecycleMu.Lock()
 	defer d.lifecycleMu.Unlock()
+	key := deviceKey(ref.ID, ref.Generation)
 	d.mu.Lock()
-	device, found := d.targets[deviceKey(ref.ID, ref.Generation)]
+	device, activeFound := d.targets[key]
+	cleanupDevice, cleanupFound := d.cleanupOnly[key]
 	d.mu.Unlock()
-	if !found {
-		return nil
+	if activeFound && cleanupFound {
+		return domain.NewError(domain.CodeIntegrityViolation, "cuttlefish.destroy", "ownership", "generation is both active and cleanup-only", nil)
 	}
-	if d.hasUnstoppedRun(ref.ID, ref.Generation) {
+	if cleanupFound {
+		device = cleanupDevice.record
+	}
+	found := activeFound || cleanupFound
+	if activeFound && d.hasUnstoppedRun(ref.ID, ref.Generation) {
 		return domain.NewError(domain.CodeFailedPrecondition, "cuttlefish.destroy", "run", "all prepared runs must stop before destroy", nil)
 	}
-	if err := d.cleanupStoppedRuns(ctx, ref.ID, ref.Generation); err != nil {
-		return domain.NewError(domain.CodeUnavailable, "cuttlefish.destroy", "run_cleanup", "stopped run resources could not be cleaned", err)
+	if activeFound {
+		if err := d.cleanupStoppedRuns(ctx, ref.ID, ref.Generation); err != nil {
+			return domain.NewError(domain.CodeUnavailable, "cuttlefish.destroy", "run_cleanup", "stopped run resources could not be cleaned", err)
+		}
 	}
-	if err := d.backend.Destroy(ctx, device.instance); err != nil {
-		return domain.NewError(domain.CodeUnavailable, "cuttlefish.destroy", "backend", "device destruction failed", err)
+	absent := false
+	if cleanupFound && !cleanupDevice.runtimePresent {
+		if err := d.requireAndroidRuntimeAbsent(ctx, device.instance.RuntimeID); err != nil {
+			return err
+		}
+		absent = true
+	} else {
+		var err error
+		device, absent, err = d.resolveAndroidDestroy(ctx, ref, device, found)
+		if err != nil {
+			return err
+		}
 	}
-	if err := os.RemoveAll(device.plan.StateDirectory); err != nil {
-		return domain.NewError(domain.CodeUnavailable, "cuttlefish.destroy", "state_directory", "target state directory cleanup failed", err)
+	if absent && device.plan.Allocation.InstanceName == "" {
+		return nil
+	}
+	if !absent {
+		if err := d.backend.Destroy(ctx, device.instance); err != nil {
+			return domain.NewError(domain.CodeUnavailable, "cuttlefish.destroy", "backend", "device destruction failed", err)
+		}
+		if err := d.requireAndroidRuntimeAbsent(ctx, device.instance.RuntimeID); err != nil {
+			return err
+		}
 	}
 	if err := d.allocator.Release(ctx, device.plan.Allocation); err != nil {
 		return domain.NewError(domain.CodeUnavailable, "cuttlefish.destroy", "allocation", "device endpoint release failed", err)
 	}
-	d.mu.Lock()
-	delete(d.targets, deviceKey(ref.ID, ref.Generation))
-	delete(d.idempotency, device.input.IdempotencyKey)
-	d.removeRunsLocked(ref.ID, ref.Generation)
-	for key, outcome := range d.resetResults {
-		if outcome.result.Status.TargetID == ref.ID && outcome.result.Status.Generation == ref.Generation {
-			delete(d.resetResults, key)
-		}
+	if err := os.RemoveAll(device.plan.StateDirectory); err != nil {
+		return domain.NewError(domain.CodeUnavailable, "cuttlefish.destroy", "state_directory", "target state directory cleanup failed", err)
 	}
-	for key, outcome := range d.quarantines {
-		if outcome.plan.Target == ref {
-			delete(d.quarantines, key)
+	if found {
+		d.mu.Lock()
+		if activeFound {
+			delete(d.targets, key)
+			delete(d.idempotency, device.input.IdempotencyKey)
+			d.removeRunsLocked(ref.ID, ref.Generation)
+			for resetKey, outcome := range d.resetResults {
+				if outcome.result.Status.TargetID == ref.ID && outcome.result.Status.Generation == ref.Generation {
+					delete(d.resetResults, resetKey)
+				}
+			}
+			for quarantineKey, outcome := range d.quarantines {
+				if outcome.plan.Target == ref {
+					delete(d.quarantines, quarantineKey)
+				}
+			}
 		}
+		delete(d.cleanupOnly, key)
+		d.mu.Unlock()
 	}
-	d.mu.Unlock()
+	return nil
+}
+
+func (d *Driver) requireAndroidRuntimeAbsent(ctx context.Context, runtimeID string) error {
+	if !safeInstanceName(runtimeID) {
+		return domain.NewError(domain.CodeIntegrityViolation, "cuttlefish.destroy", "runtime_id", "cleanup authority has an invalid Android runtime identity", nil)
+	}
+	inventoryBackend, supported := d.backend.(BackendInventory)
+	if !supported {
+		return domain.NewError(domain.CodeCapabilityUnavailable, "cuttlefish.destroy", "inventory", "backend cannot prove Android runtime absence", nil)
+	}
+	runtimeIDs, err := inventoryBackend.ListRuntimeIDs(ctx)
+	if err != nil {
+		return domain.NewError(domain.CodeUnavailable, "cuttlefish.destroy", "inventory", "could not verify Android runtime absence", err)
+	}
+	inventory, err := exactRuntimeIDSet(runtimeIDs)
+	if err != nil {
+		return domain.NewError(domain.CodeIntegrityViolation, "cuttlefish.destroy", "inventory", "Android runtime inventory is ambiguous", err)
+	}
+	if _, remains := inventory[runtimeID]; remains {
+		return domain.NewError(domain.CodeFailedPrecondition, "cuttlefish.destroy", "absence", "exact Android runtime remains present", nil)
+	}
 	return nil
 }
 
@@ -960,7 +1646,7 @@ func (d *Driver) cleanupStoppedRuns(ctx context.Context, id domain.TargetID, gen
 	}
 	d.mu.Unlock()
 	for _, runID := range runIDs {
-		if _, err := d.stopRun(ctx, runID, runevidence.CauseCollectorEvidenceUnavailable); err != nil {
+		if _, err := d.stopRunLocked(ctx, runID, ports.StopForce, runevidence.CauseCollectorEvidenceUnavailable); err != nil {
 			return err
 		}
 	}

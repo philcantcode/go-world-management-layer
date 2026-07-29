@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/philcantcode/go-world-management-layer/internal/androidcontract"
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
 )
 
@@ -163,13 +164,9 @@ func validateTargets(v *validationCollector, policy *TargetsPolicy, resources *A
 func validateLinuxTemplate(v *validationCollector, base string, template *TargetTemplate) {
 	runtime := &template.Runtime
 	v.equal(base+".runtime.driver", runtime.Driver, "docker")
-	v.oneOf(base+".runtime.runtime", runtime.Runtime, "runc", "gvisor", "kata")
+	v.equal(base+".runtime.runtime", runtime.Runtime, "runc")
 	v.pinnedImage(base+".runtime.image", runtime.Image)
-	if runtime.Runtime == "runc" {
-		v.equal(base+".runtime.isolationProfile", runtime.IsolationProfile, "observable-container")
-	} else {
-		v.equal(base+".runtime.isolationProfile", runtime.IsolationProfile, "sandboxed-kernel")
-	}
+	v.equal(base+".runtime.isolationProfile", runtime.IsolationProfile, "observable-container")
 	v.equal(base+".runtime.baseImage", runtime.BaseImage, "readOnly")
 	v.user(base+".runtime.user", runtime.User)
 	v.linuxCapabilities(base+".runtime.capabilities", runtime.Capabilities)
@@ -177,7 +174,7 @@ func validateLinuxTemplate(v *validationCollector, base string, template *Target
 	v.required(base+".runtime.seccompProfile", runtime.SeccompProfile)
 	v.mustEmpty(base+".runtime.systemImageDigest", runtime.SystemImageDigest, "is an Android-only field")
 	v.mustEmpty(base+".runtime.baselineState", runtime.BaselineState, "is an Android-only field")
-	if runtime.RequireHardwareAcceleration || runtime.Rooted || runtime.Debuggable || runtime.Headless || runtime.BootTimeout != 0 {
+	if runtime.RequireHardwareAcceleration || runtime.Rooted || runtime.Debuggable || runtime.Headless || runtime.GuestMemory != 0 || runtime.BootTimeout != 0 {
 		v.add(base+".runtime", "contains Android-only runtime fields")
 	}
 	v.absoluteGuestPath(base+".material.mountPoint", template.Material.MountPoint)
@@ -198,21 +195,29 @@ func validateLinuxTemplate(v *validationCollector, base string, template *Target
 
 func validateAndroidTemplate(v *validationCollector, base string, template *TargetTemplate) {
 	runtime := &template.Runtime
-	v.oneOf(base+".runtime.driver", runtime.Driver, "cuttlefish", "android-emulator")
+	v.equal(base+".runtime.driver", runtime.Driver, "android-emulator")
 	v.digestReference(base+".runtime.systemImageDigest", runtime.SystemImageDigest)
 	v.equal(base+".runtime.isolationProfile", runtime.IsolationProfile, "instrumented-android")
-	v.required(base+".runtime.baselineState", runtime.BaselineState)
+	v.equal(base+".runtime.baselineState", runtime.BaselineState, "clean-boot")
 	v.mustTrue(base+".runtime.requireHardwareAcceleration", runtime.RequireHardwareAcceleration)
 	v.mustTrue(base+".runtime.headless", runtime.Headless)
 	v.mustTrue(base+".runtime.rooted", runtime.Rooted)
 	v.mustTrue(base+".runtime.debuggable", runtime.Debuggable)
+	if err := androidcontract.ValidateGuestMemoryBytes(runtime.GuestMemory.Bytes()); err != nil {
+		v.add(base+".runtime.guestMemory", "%v", err)
+	}
+	if err := androidcontract.ValidateHostCPUMilli(template.Resources.Limits.CPU.MilliCPU()); err != nil {
+		v.add(base+".resources.limits.cpu", "%v", err)
+	}
+	if err := androidcontract.ValidateDataPartitionBytes(template.Resources.Limits.WritableState.Bytes()); err != nil {
+		v.add(base+".resources.limits.writableState", "%v", err)
+	}
 	v.positiveDuration(base+".runtime.bootTimeout", runtime.BootTimeout)
 	if runtime.Runtime != "" || runtime.Image != "" || runtime.BaseImage != "" || runtime.User != "" || len(runtime.Capabilities.Drop) != 0 || len(runtime.Capabilities.Add) != 0 || runtime.NoNewPrivileges || runtime.SeccompProfile != "" {
 		v.add(base+".runtime", "contains Linux-container-only runtime fields")
 	}
-	if template.Material.MountPoint != "" || template.Material.WritableState != "" {
-		v.add(base+".material", "must be omitted for an Android virtual device")
-	}
+	v.mustEmpty(base+".material.mountPoint", template.Material.MountPoint, "is a Linux-container-only field")
+	v.equal(base+".material.writableState", template.Material.WritableState, "guest-data-partition")
 	interaction := &template.Interaction
 	v.equal(base+".interaction.commandAuthority", interaction.CommandAuthority, "arbitrary-inside-assigned-device")
 	v.equal(base+".interaction.adb", interaction.ADB, "scoped-gateway")

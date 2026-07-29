@@ -29,22 +29,17 @@ func AgentPhysicalPolicyFingerprint(report ports.AgentWorkspacePhysicalPolicyRep
 func TargetPhysicalPolicyFingerprint(report ports.TargetPhysicalPolicyReport) (policy.CapabilityFingerprint, error) {
 	report.Template = ""
 	report.Runtime.ImageDigest = ""
+	report.Android.SystemImageDigest = ""
+	// Guest RAM and the boot deadline are selected per trusted target template.
+	// Neither is a property of the emulator backend, so templates with different
+	// values must still produce one shared physical-capability identity.
+	report.Android.GuestMemoryBytes = 0
+	report.Android.BootTimeout = 0
 	report.Runtime.CapabilityDrop = sortedStrings(report.Runtime.CapabilityDrop)
 	report.Runtime.CapabilityAdd = sortedStrings(report.Runtime.CapabilityAdd)
 	report.DeniedInfrastructureAuthority = sortedStrings(report.DeniedInfrastructureAuthority)
 	report.Resources = zeroPhysicalResourceValues(report.Resources)
-	return physicalPolicyFingerprint("linux-target", report)
-}
-
-// WithDirectoryWorkspaceEnforcement combines the directory workspace
-// driver's bounded prepare/release scan with the agent runtime's immutable
-// config facts. It intentionally makes no OverlayFS or reflink claim.
-func WithDirectoryWorkspaceEnforcement(report ports.AgentWorkspacePhysicalPolicyReport) ports.AgentWorkspacePhysicalPolicyReport {
-	report.Resources.WorkspaceBytes.Support = ports.PhysicalSupportEnforced
-	report.Resources.WorkspaceBytes.Detail = "copy-backed directory workspace validates the configured byte bound during prepare and release"
-	report.Resources.Inodes.Support = ports.PhysicalSupportEnforced
-	report.Resources.Inodes.Detail = "copy-backed directory workspace validates the configured inode bound during prepare and release"
-	return report
+	return physicalPolicyFingerprint("target", report)
 }
 
 // WithBoundedLedgerCaptureEnforcement binds the configured ledger capture

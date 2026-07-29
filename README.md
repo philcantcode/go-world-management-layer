@@ -13,21 +13,30 @@ failures and observation gaps as evidence.
 **Status:** v0.1.0 — active pre-v1 implementation. Minor 0.x releases may break
 APIs, CLIs, policies, schemas, or on-disk formats; pin consumers to an exact
 tag. `worldd` and `world-node` both ship an authenticated logical control plane
-and an opt-in physical Linux composition: digest-pinned Docker agent workspaces,
-directory-copy workspaces, Docker Linux targets, deployment-authorized local
-material, optional process observers, and ledger capture. Physical startup
-requires an immutable version-2 deployment profile; the daemon probes the
+and opt-in physical Linux and Android composition: digest-pinned Docker agent
+workspaces, directory-copy workspaces, Docker Linux targets, managed Android
+SDK Emulator targets, deployment-authorized local material, optional process
+observers, and ledger capture. Physical startup
+requires an immutable version-3 deployment profile; the daemon probes the
 selected drivers, compiles every strict policy against the complete capability
 fingerprint, preflights every published plan, and fails closed before opening
 its listener if the result cannot be enforced.
 
-Android remains a different boundary. The Cuttlefish-family driver and scoped
-ADB gateway have an opt-in real Android SDK emulator qualification, including
-installing and launching a specimen APK through the run-scoped gateway. Neither
-daemon currently accepts an Android target driver selection, and the attached
-emulator backend deliberately does not boot, reset, stop, or destroy the
-externally owned emulator. Managed Cuttlefish daemon composition, production
-collectors, a remote forensic repository, packaging, and a supported
+The Android composition owns headless hardware-accelerated SDK Emulator AVDs,
+verifies the complete installed system-image tree against its pinned digest,
+allocates durable exact-serial endpoints, enforces one mutable run per target
+generation, and provides scoped ADB/file transport. Reset creates and proves a
+clean replacement generation before retiring the previous AVD. Startup adopts
+only a QEMU process whose executable, complete emitted launch argument vector,
+PID, start token, and exact resource authority match the durable generation
+plan; it fails interrupted runs without resuming the specimen. After a
+launch-window crash, a live candidate must match the exact AVD/port, CPU,
+guest-RAM, data/PID paths, cold-boot/headless/acceleration flags, Windows Job
+membership, and Job limits before its ownership is committed. Intent with no
+such candidate remains an explicit unresolved physical conflict and keeps
+admission closed. Physical devices, a
+daemon-selected Cuttlefish backend, production
+collector programs, a remote forensic repository, packaging, and a supported
 host/version matrix remain release work.
 
 The governing promise is:
@@ -51,11 +60,12 @@ trusted operator / client
               |-- strict policy compile + exact capability binding
               |-- directory-copy workspace + Docker agent -> world-guest
               |-- Docker Linux target -> scoped exec/file transport
+              |-- managed Android SDK Emulator -> scoped ADB/file transport
               |-- optional process observers -> ledger
               `-- optional policy-authorized ledger captures
 
-qualified library boundary (not a daemon-selectable Android composition)
-        Cuttlefish/AttachedEmulator -> scoped one-device ADB
+optional attached-device qualification boundary
+        externally owned SDK Emulator -> scoped one-device ADB
 
 go-agent-runner -> lease-bound ExecutionEnvironment adapter -> world service
 go-forensic-artifacts <- scoped MaterialAuthority adapter <- sealed evidence
@@ -69,16 +79,26 @@ The code is split along those boundaries:
 | Persistence | SQLite WAL with full-sync writes, forward migrations, revisioned snapshots, a chained control journal, startup verification, and replay | Online backup/restore and fleet migration tooling are not shipped |
 | Execution | Versioned bounded frames, opaque stdin/stdout/stderr, direct argv, temporary inputs, cancellation, heartbeat, and process-tree cleanup in `world-guest` | The default `none` composition has no physical exec; image/provider compatibility still requires node qualification |
 | Agent workspace | Fail-closed digest-pinned Docker plan, one configured workspace mount, read-only root, no host namespaces/devices/runtime socket, dropped capabilities, exact plan binding, and a lease-bound runner adapter | The shipped directory workspace is explicitly `directory-copy-non-production`; OverlayFS is not activated by the daemon |
-| Targets | Activated Docker Linux lifecycle with collector-readiness gates, exact generation/run plan binding, scoped exec/transfer, quarantine, reset, destruction, and startup inventory/adoption | Android and physical-device selections are rejected by daemon configuration; their drivers remain integration/qualification packages |
+| Targets | Activated Docker Linux and managed Android SDK Emulator lifecycles with collector-readiness gates, exact generation/run plan binding, scoped exec/transfer or ADB, quarantine, reset, destruction, and startup inventory/adoption | Physical-device selection remains unavailable; Android requires an exact locally installed, debuggable system image and hardware acceleration |
 | Policy/admission | Strict YAML compilation against a complete probed capability fingerprint; durable effective-policy publication; preflight and per-mutation checks for runtime, network, recovery, capture/export, target concurrency, and aggregate live resources | Host pressure sensing and fleet placement are not daemon-composed |
 | Material/workspace | Deployment-authorized local selections and occurrences, digest-verified input projection, directory workspaces, no-follow relative exports, and local content-addressed output/bundle publication | A remote forensic backend, credentials, and cross-system custody are not included |
 | Observation | Durable hash-chained segments, explicit gaps/duplicates, resumable bounded fan-out, deterministic live projections, process-backed observer supervision, ledger capture, and one idempotently sealed bundle per run | Adapter programs are supplied by the deployment and must be qualified; a generic process supervisor is not a collector suite |
 
+The shipped `directory-copy-non-production` workspace checks declared and
+observed byte/inode bounds during preparation, scanning, sealing, and export,
+but it does not impose a live filesystem byte or inode quota while the agent is
+running. Its physical policy facts therefore report workspace bytes and inodes
+as `unsupported`. Admission skips only those two live-quota facts for this
+explicit non-production mode; Docker identity/isolation and CPU, memory, swap,
+PID, and capture enforcement remain mandatory. Production OverlayFS admission
+fails closed unless live workspace byte and inode enforcement is reported.
+
 The default Go suite exercises these boundaries with deterministic fakes,
 fault injection, protocol/server integration tests, and command-plan
 assertions. Opt-in suites additionally run the Docker drivers and full daemon
-lifecycle against a real Docker Engine, and run the Android driver/scoped ADB
-gateway against an already-running SDK emulator. The ordinary `go test ./...`
+lifecycle against a real Docker Engine, run the managed Android driver through
+AVD create/boot/APK execution/reset/destruction, and separately qualify the
+scoped ADB gateway against an already-running SDK emulator. The ordinary `go test ./...`
 run does not start Docker or an emulator, mount OverlayFS, attach eBPF, or
 contact a remote artifact service.
 
@@ -86,40 +106,56 @@ contact a remote artifact service.
 
 | Surface | Available executable or qualified behavior | Deliberately unavailable |
 | --- | --- | --- |
-| `worldd` | Full authenticated `world.v1` endpoint; logical-only defaults; opt-in Docker/directory/process/ledger physical composition from a trusted deployment profile | Android and physical-device composition; fleet controller behavior |
+| `worldd` | Full authenticated `world.v1` endpoint; logical-only defaults; opt-in Docker/directory/process/ledger plus managed Android Emulator physical composition from a trusted deployment profile | Physical-device composition; fleet controller behavior |
 | `world-node` | The same full composition with separate node-prefixed state, directories, socket, and Windows port defaults | It is not a worker registered with `worldd`; no controller-to-node protocol is shipped |
-| Docker/directory | Agent and Linux-target provisioning, input projection, exec/transfer, export, capture, physical reconciliation, lease drain, reset, quarantine, and teardown | Requires explicit matching driver flags, absolute non-overlapping roots, locally present digest-pinned images, and a version-2 deployment profile |
-| Android | Cuttlefish-family driver contracts plus a real AttachedEmulator APK/scoped-ADB qualification test | `android-target-driver` accepts only `none`; the attached backend is not a managed emulator service |
+| Docker/directory | Agent and Linux-target provisioning, input projection, exec/transfer, export, capture, physical reconciliation, lease drain, quarantine, and teardown; one mutable run per generation, exact-container stop proof, and replacement reset before another run | Requires explicit matching driver flags, absolute non-overlapping roots, locally present digest-pinned images, and a version-3 deployment profile |
+| Android | On Windows, `android-target-driver=android-emulator`; exact full-tree system-image identity; durable AVD/port allocation; atomically assigned named-Job CPU/memory containment; independent guest-RAM and exact `/data` sizing; create, clean boot, readiness, scoped ADB/file transfer, one-run generations, quarantine, replacement reset, destruction, and committed-process crash reconciliation; managed and attached real-APK qualification tests | Requires a local Android SDK, a rooted/debuggable image, loopback ADB, hardware acceleration, one exact digest/package identity per deployment, and a trusted exclusive service account; managed resource containment fails closed on non-Windows hosts, a launch interruption with no exactly bound successor remains fail-closed, and physical devices are not composed |
 | Observation/material | Durable ledger/live view, process observer supervision, ledger captures, local selection/content/output/bundle authority, and bundle sealing | Deployment observer binaries and a remote forensic authority are not bundled |
 
 With all drivers left at `none`, lifecycle calls create logical records and
-capability-dependent RPCs fail explicitly. With the physical Linux composition,
+capability-dependent RPCs fail explicitly. With a physical composition,
 the service returns success only after the exact persisted plan crosses its
 physical boundary and the driver returns validated evidence; ambiguous retries
 reuse the durable idempotency/plan binding rather than inventing a new
 realization.
 
 After a daemon interruption, startup reconciles exact physical identities and
-version-5 observer markers before lease cleanup and before RPC. Each marker
+version-6 observer markers before lease cleanup and before RPC. Each marker
 binds the persisted run-plan digest and start signature, every external
 `CollectorPlan` and its durable start-commit flag, and the intrinsic collector
 identity/start time when `target.lifecycle` coverage is required. Its stopped
 phase also binds the digest of the complete persisted run result and the digest
 of the exact version-2 stop preparation that is allowed to consume it; the
 referenced bounded evidence journal makes accepted events, metrics, artifacts,
-coverage, gaps, failures, and recovery output independently replayable. On Linux,
-the built-in observer starter's parent-death `SIGKILL` proves that its directly
-spawned collector process dies with the daemon. Adapters that daemonize or
-leave surviving helpers are unsupported unless a deployment supplies an
-equivalent external process-tree/cgroup proof.
+coverage, gaps, failures, and recovery output independently replayable. The
+built-in Windows starter atomically assigns each collector tree to its own
+kill-on-close Job; Linux uses a parent-death `SIGKILL` for the directly spawned
+collector. Adapters that daemonize on Linux or leave independently surviving
+helpers remain unsupported without an external process-tree/cgroup proof.
 Recovery then validates every local output transaction and object. Verified
-finalized artifacts are retained but continuity is still marked lost,
-incomplete output is durably aborted, and foreign or mismatched entries fail
-startup. A surviving target execution is force-stopped and proved stopped; the
+finalized artifacts and valid committed partial stdout/stderr prefixes are
+published immutably, while continuity is still marked lost; uncommitted output
+is durably aborted, and foreign or mismatched entries fail startup. A surviving target execution is force-stopped and proved stopped; the
 daemon never resumes the specimen, collectors, or duration timer. It seals the
 run as failed with a `control_plane_failure` incident and explicit gaps, marks
 active target operations lost, and fails startup if any identity, cleanup,
 output, or finalization proof is incomplete.
+
+Provisioning recovery is also restart-convergent. An unbound first generation
+is reconstructed only from its immutable acquisition/creation root, bound
+before physical mutation, replayed idempotently, and advanced to ready after a
+validated real result. Bound Docker agents receive a fresh guest protocol
+readiness proof. Later recovery generations and target resets whose original
+request inputs are not durably reconstructible remain explicitly pending for
+the exact client retry; reset reconciliation preserves and verifies the exact
+predecessor/successor pair and never deletes either half. Quarantine closes run
+admission and completes run/bundle evidence before target-wide containment.
+Terminal physical cleanup likewise carries complete trusted-resolver plans in
+a separate cleanup-only inventory channel: references or labels alone cannot
+authorize deletion, cleanup-only records cannot execute work, and a second
+inventory must prove both the runtime and exact driver-local residue absent.
+An absent terminal Docker agent container also triggers exact persisted
+workspace inspection and normal generation-bound workspace teardown.
 
 Run finalization is a crash-resumable saga: durable reservation; byte-identical
 version-2 stop preparation containing scope, initial revision/state, complete
@@ -204,12 +240,15 @@ clients when overriding it.
 On Windows with Docker Desktop running in Linux-container mode, the repository
 harness builds `worldd`, the clients, `world-guest`, `world-idle`, and a native
 specimen; builds and digest-pins a Docker image; compiles the strict E2E policy;
-writes a version-2 deployment profile; and exercises agent exec, target
-exec/push/pull, capture, export, reset, release, and orphan checks. It also
-force-kills the daemon while a long-lived target exec is present, then requires
-startup to terminate that execution, seal the run as failed with an incident
-and continuity gap, deny reopening it, and retain both normal and interrupted
-bundles across a final restart:
+  writes a version-3 deployment profile; and exercises agent exec, target
+exec/push/pull, capture, export, one-run-per-generation denial, replacement
+reset, release, exact-container shutdown, escaped-process containment, and
+orphan checks. It also force-kills the daemon while long-lived agent and target
+execs are both physically present. Startup must cross the agent stop/start and
+fresh-readiness boundary before ordinary provisioning, stop the exact target
+without restarting its tainted run, record the agent exec as lost, seal the
+target run as failed with an incident and continuity gap, deny reopening it,
+and retain both normal and interrupted bundles across a final restart:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\testdata\e2e\run-world-e2e.ps1
@@ -220,14 +259,19 @@ The script leaves a machine-readable `evidence.json` beneath
 but it is not the dedicated-Linux-host security or filesystem-permission
 reference.
 
-Before authoring a physical deployment profile, probe the exact Docker
-composition and optionally compile a strict policy against the resulting
-complete fingerprint:
+Before authoring a physical deployment profile, probe its exact selected
+drivers and optionally compile a strict policy against the resulting complete
+fingerprint. This minimal command probes the default Docker-only composition:
 
 ```powershell
 go run ./cmd/world-capabilities `
   -policy .\policy\deployment\e2e-directory-copy.yaml
 ```
+
+Managed Android requires the exact SDK/tool/image/runtime flags and an exact
+process-observer configuration when the policy requires one. The combined
+qualification script supplies and cross-checks that complete set; use
+`go run ./cmd/world-capabilities -h` for the authoritative standalone flags.
 
 Use `effective_policy.digest` as the authorized policy digest and
 `effective_policy.capability_fingerprint_digest` as the generation capability
@@ -250,7 +294,7 @@ authoritative flags.
 | `world-observe` | Read side for `snapshot`, one-shot table `top`, NDJSON `watch`, NDJSON `metrics`, and sealed `bundle` retrieval. |
 | `world-capture` | Agent-facing `request PROFILE` command for a policy-authorized named capture profile. |
 | `world-export` | Agent-facing declaration of one or more relative `PATH[=ROLE]` workspace outputs; it never accepts a host destination. |
-| `world-capabilities` | Probe the Docker agent/Linux-target composition without provisioning; with `-policy`, compile strict YAML against the complete fingerprint and print its canonical effective-policy digest pair. |
+| `world-capabilities` | Probe the selected Docker agent/Linux-target and managed Android Emulator composition without provisioning; with `-policy`, compile strict YAML against the complete fingerprint and print its canonical effective-policy digest pair. |
 | `world-guest` | Framed exec supervisor intended for agent and target images. It reads protocol frames on stdin and must not be used as an interactive shell. Docker supplies the container init process. |
 | `world-idle` | Inert target-container entrypoint used beneath Docker's `--init`; it exposes no command or management surface. |
 | `verify` | Run the repository's deterministic module, format, schema, fuzz-seed, contract, security, integration, full-test, race, vet, and Linux cross-build gates. |
@@ -284,12 +328,15 @@ Both daemon binaries default to `agent-driver=none`, every target driver set to
 `workspace-driver=none`, and `material-driver=local`. The supported physical
 combination enables `agent-driver=docker` and `workspace-driver=directory`
 together; `linux-target-driver=docker` additionally requires that pair.
+`android-target-driver=android-emulator` also requires that pair plus its
+managed Android roots, SDK/tool paths, loopback ADB endpoint, an even
+`5554..5584` console-port base, and exact observed emulator/runtime versions.
 `observer-driver=process` is valid only when the deployment profile references
 observer adapters, and `capture-driver=ledger` requires a physical local
-material composition. Physical mode also requires an absolute version-2
+material composition. Physical mode also requires an absolute version-3
 `deployment-profile` and absolute, pairwise non-overlapping state, material,
-workspace, target, observer, capture, ledger, bundle, and socket roots as
-applicable. Android and physical-device flags currently accept only `none`.
+workspace, target, Android image/state/SDK, observer, capture, ledger, bundle,
+and socket roots as applicable. Physical-device flags accept only `none`.
 Invalid combinations or unverifiable plans fail before the listener opens.
 
 ## Verification
@@ -384,8 +431,8 @@ production workloads.
 ## External node prerequisites
 
 Only Go and local filesystem access are needed for the logical control-plane
-smoke test. The shipped Linux physical composition additionally has the
-following prerequisites. Flags activate the composition only when its trusted
+smoke test. The shipped physical compositions additionally have the following
+prerequisites. Flags activate the composition only when its trusted
 deployment profile, policy compile, capability probes, exact image inspection,
 physical-policy preflight, and root validation all succeed. No supported
 production version matrix is asserted yet.
@@ -393,12 +440,12 @@ production version matrix is asserted yet.
 | Prerequisite | Required for | Operator responsibility |
 | --- | --- | --- |
 | Dedicated Linux host | Production hostile execution | Use cgroup v2, service isolation, safe configured roots, quotas/reserve, and a qualified Docker/runtime/filesystem tuple. The shipped workspace mode is directory copy; Docker Desktop is integration evidence, not the security/performance reference. |
-| Docker Engine and CLI | Shipped agent and Linux-target physical mode | Keep Docker authority in the daemon service account; never mount the socket into agent/target containers. Qualify Engine/API/runc, cgroup-v2 enforcement, security options, daemon restart behavior, and locally present digest-pinned images. Agent images need the configured `world-guest`; target images need `world-idle` as their inert entrypoint and `world-guest` for framed exec. |
+| Docker Engine and CLI | Shipped agent and Linux-target physical mode | Keep Docker authority in the daemon service account; never mount the socket into agent/target containers. Qualify Engine/API/runc, the engine's exact cgroup-v1 or cgroup-v2 resource enforcement, security options, daemon restart behavior, and locally present digest-pinned images; require cgroup v2 for the production hostile-execution host. Agent images need the configured `world-guest`; target images need `world-idle` as their inert entrypoint and `world-guest` for framed exec. |
 | Absolute managed roots | Physical mode | Give each configured state, source, workspace, target, capture, observer, ledger, bundle, material, profile, and Unix-socket path its intended ownership and a non-overlapping root. Do not place one beneath another. |
-| Collector binaries/adapters | Deployment-profile observers | Select and pin each executable/configuration, readiness command, version probe, placement, coverage, resource estimate, and byte limit. On Linux the process supervisor's parent-death signal covers the directly spawned process only. Adapters that daemonize or leave helpers behind are unsupported without an equivalent external process-tree/cgroup supervisor; the mechanism does not turn an arbitrary program into a trustworthy collector. |
+| Collector binaries/adapters | Deployment-profile observers | Select and pin each executable/configuration, readiness command, version probe, typed runtime binding, placement, coverage, resource estimate, and byte limit. Windows collectors are atomically contained in private kill-on-close Jobs after a live host preflight. On Linux the parent-death signal covers the directly spawned process only, so adapters that daemonize or leave helpers behind require an equivalent external process-tree/cgroup supervisor. Neither mechanism turns an arbitrary program into a trustworthy collector. |
 | Local material catalog | Shipped physical mode | Authorize exact regular source files, digests, sizes, logical paths, modes, sensitivity, selections, and security scope in the deployment profile. Protect the source and publication roots from untrusted mutation. |
 | Remote forensic backend | External custody, if required | The local authority supports scoped inputs and content-addressed local output/bundle publication. A remote repository, credentials, replication, and cross-system custody remain adapter/deployment work. |
-| KVM/SDK emulator/Cuttlefish/ADB | Android driver qualification only | The opt-in AttachedEmulator test requires an already-running SDK emulator and exact ADB serial. It does not activate Android in either daemon or prove managed Cuttlefish boot/reset/destruction. |
+| Windows, Android SDK Emulator, command-line tools, ADB, and hardware acceleration | Managed Android physical mode | Install and pin one rooted/debuggable system-image package, record its complete tree digest, keep ADB loopback-only, reserve the emulator-supported even console-port range, and qualify exact emulator/ADB/sdkmanager/runtime/accelerator versions. Budget host Job CPU/memory separately from guest RAM; `writableState` is the exact guest `/data` block capacity, not a quota for host AVD metadata or logs. Linux and other hosts fail managed resource-containment preflight. The managed E2E owns and removes its AVDs; the separate AttachedEmulator test never owns its device. |
 | Pinned policies and images | Any physical admission | Compile policy against the complete probed fingerprint, keep its immutable `name@revision` source in the profile, and create a new generation whenever runtime, image, observer, or device facts change. |
 
 Start with the [startup and reconciliation runbook](docs/operations/startup-and-reconciliation.md)

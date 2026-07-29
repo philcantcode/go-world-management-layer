@@ -8,10 +8,20 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/philcantcode/go-world-management-layer/internal/admission"
+	"github.com/philcantcode/go-world-management-layer/internal/androidcontract"
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
+)
+
+// Android Emulator's -port contract accepts only even console ports in this
+// inclusive range; the adjacent odd port is reserved for that emulator's ADB
+// transport.
+const (
+	ManagedEmulatorMinConsolePort = 5554
+	ManagedEmulatorMaxConsolePort = 5584
 )
 
 type ResetFingerprint struct {
@@ -79,20 +89,56 @@ func (a Allocation) Validate() error {
 	if a.InstanceNumber <= 0 || a.InstanceName == "" || a.Serial == "" || a.ADBAddress == "" {
 		return fmt.Errorf("positive instance number, name, serial, and ADB address are required")
 	}
+	if ports.ValidateExactADBSerial(a.Serial) != nil || ports.ValidateExactADBSerial(a.ADBAddress) != nil {
+		return fmt.Errorf("allocation serial and ADB address must be safe exact selectors")
+	}
+	if a.Serial != a.ADBAddress {
+		return fmt.Errorf("allocation serial and ADB address must identify the same exact endpoint")
+	}
+	for _, character := range a.InstanceName {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '-' || character == '_' || character == '.' {
+			continue
+		}
+		return fmt.Errorf("allocation instance name is unsafe")
+	}
 	return nil
 }
 
+// EmulatorConsolePort returns the exact even console port encoded by a
+// managed Android SDK emulator allocation.
+func (a Allocation) EmulatorConsolePort() (int, error) {
+	if err := a.Validate(); err != nil {
+		return 0, err
+	}
+	if !strings.HasPrefix(a.Serial, "emulator-") {
+		return 0, fmt.Errorf("allocation is not an Android SDK emulator serial")
+	}
+	port, err := strconv.Atoi(strings.TrimPrefix(a.Serial, "emulator-"))
+	if err != nil || port < ManagedEmulatorMinConsolePort || port > ManagedEmulatorMaxConsolePort || port%2 != 0 || a.InstanceNumber != port {
+		return 0, fmt.Errorf("managed emulator allocation requires an exact even console port from %d through %d", ManagedEmulatorMinConsolePort, ManagedEmulatorMaxConsolePort)
+	}
+	return port, nil
+}
+
 type VirtualDevicePlan struct {
-	Name                 string
-	LeaseID              domain.LeaseID
-	TargetID             domain.TargetID
-	Generation           domain.TargetGeneration
-	StateDirectory       string
-	SystemImageDirectory string
-	Allocation           Allocation
-	Fingerprint          ResetFingerprint
-	Resources            admission.Resources
-	Labels               map[string]string
+	Name                        string
+	LeaseID                     domain.LeaseID
+	TargetID                    domain.TargetID
+	Generation                  domain.TargetGeneration
+	StateDirectory              string
+	SystemImageDirectory        string
+	Allocation                  Allocation
+	ADBServer                   ports.ADBServerEndpoint
+	Fingerprint                 ResetFingerprint
+	Resources                   admission.Resources
+	Labels                      map[string]string
+	BaselineState               string
+	RequireHardwareAcceleration bool
+	Headless                    bool
+	Rooted                      bool
+	Debuggable                  bool
+	GuestMemoryBytes            int64
+	BootTimeout                 time.Duration
 }
 
 func (p VirtualDevicePlan) Validate(targetRoot, imageRoot string) error {
@@ -108,10 +154,19 @@ func (p VirtualDevicePlan) Validate(targetRoot, imageRoot string) error {
 	if err := p.Allocation.Validate(); err != nil {
 		return err
 	}
+	if err := p.ADBServer.Validate(); err != nil {
+		return fmt.Errorf("observation ADB server: %w", err)
+	}
 	if err := p.Fingerprint.Validate(); err != nil {
 		return err
 	}
 	if err := p.Resources.Validate(); err != nil {
+		return err
+	}
+	if p.BaselineState != ports.AndroidBaselineCleanBoot || !p.RequireHardwareAcceleration || !p.Headless || !p.Rooted || !p.Debuggable || p.GuestMemoryBytes <= 0 || p.BootTimeout <= 0 {
+		return fmt.Errorf("complete production Android runtime policy is required")
+	}
+	if err := androidcontract.ValidateGuestMemoryBytes(p.GuestMemoryBytes); err != nil {
 		return err
 	}
 	return nil
@@ -120,6 +175,7 @@ func (p VirtualDevicePlan) Validate(targetRoot, imageRoot string) error {
 type BuildConfig struct {
 	TargetRoot         string
 	SystemImageRoot    string
+	ADBServerEndpoint  string
 	BackendVersion     string
 	RuntimeVersion     string
 	DeviceConfigDigest domain.Digest
@@ -136,6 +192,10 @@ func BuildVirtualDevicePlan(input ports.TargetPlan, config BuildConfig, allocati
 	if config.TargetRoot == "" || config.SystemImageRoot == "" {
 		return VirtualDevicePlan{}, fmt.Errorf("target and system-image roots are required")
 	}
+	adbServer, err := ports.ParseADBServerEndpoint(config.ADBServerEndpoint)
+	if err != nil {
+		return VirtualDevicePlan{}, fmt.Errorf("observation ADB server: %w", err)
+	}
 	generation := input.Generation.Spec()
 	imageName := strings.ReplaceAll(input.Template.ImageDigest.String(), ":", "-")
 	plan := VirtualDevicePlan{
@@ -146,11 +206,16 @@ func BuildVirtualDevicePlan(input ports.TargetPlan, config BuildConfig, allocati
 		StateDirectory:       filepath.Join(config.TargetRoot, generation.TargetID.String(), "generations", strconv.FormatUint(uint64(generation.Generation), 10)),
 		SystemImageDirectory: filepath.Join(config.SystemImageRoot, imageName),
 		Allocation:           allocation,
+		ADBServer:            adbServer,
 		Fingerprint: ResetFingerprint{
 			BackendVersion: config.BackendVersion, RuntimeVersion: config.RuntimeVersion, SystemImageDigest: input.Template.ImageDigest,
 			DeviceConfigDigest: config.DeviceConfigDigest, Features: append([]string(nil), config.Features...),
 		},
-		Resources: input.Resources.Clone(),
+		Resources:     input.Resources.Clone(),
+		BaselineState: input.Template.BaselineState, RequireHardwareAcceleration: input.Template.RequireHardwareAcceleration,
+		Headless: input.Template.Headless, Rooted: input.Template.Rooted, Debuggable: input.Template.Debuggable,
+		GuestMemoryBytes: input.Template.GuestMemoryBytes,
+		BootTimeout:      input.Template.BootTimeout,
 		Labels: map[string]string{
 			"world.role": "android-virtual-target", "world.lease": input.LeaseID.String(), "world.target": generation.TargetID.String(),
 			"world.target-generation": strconv.FormatUint(uint64(generation.Generation), 10), "world.policy-digest": input.PolicyDigest.String(), "world.capability-digest": input.CapabilityFingerprintDigest.String(),

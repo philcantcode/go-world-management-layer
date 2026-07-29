@@ -3,7 +3,9 @@ package orchestration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,12 +39,53 @@ func TestExchangeExecConsumesValidatedProcessLifecycle(t *testing.T) {
 		jsonTransportFrame(t, transport.KindTerminal, transport.Terminal{CleanupConfirmed: true}),
 	}}
 	wire := &exchangeExecWire{}
-	terminal, err := exchangeExec(context.Background(), connection, wire, 64)
+	exchange, err := exchangeExec(context.Background(), connection, wire, 64, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !terminal.CleanupConfirmed || len(wire.outputs) != 1 || wire.outputs[0].kind != transport.KindStdout || string(wire.outputs[0].data) != "result" {
-		t.Fatalf("terminal/output = %#v %#v", terminal, wire.outputs)
+	if !exchange.Terminal.CleanupConfirmed || len(wire.outputs) != 1 || wire.outputs[0].kind != transport.KindStdout || string(wire.outputs[0].data) != "result" {
+		t.Fatalf("terminal/output = %#v %#v", exchange.Terminal, wire.outputs)
+	}
+	if started := exchange.Lifecycle.Started(); started == nil || started.PID != 72 {
+		t.Fatalf("lifecycle = %#v", exchange.Lifecycle.Started())
+	}
+}
+
+func TestExchangeExecKeepsGuestLeaseAliveAfterPublicInputEOF(t *testing.T) {
+	started := transport.ProcessEvent{Kind: "started", PID: 73, ParentPID: 1, ProcessStartNS: 4500}
+	exited := started
+	exited.Kind = "exited"
+	connection := newLeaseMaintainedExecTransport([]transport.Frame{
+		jsonTransportFrame(t, transport.KindProcess, started),
+		jsonTransportFrame(t, transport.KindProcess, exited),
+		jsonTransportFrame(t, transport.KindTerminal, transport.Terminal{CleanupConfirmed: true}),
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	exchange, err := exchangeExec(ctx, connection, &exchangeExecWire{}, 64, 5*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exchange.Terminal.CleanupConfirmed {
+		t.Fatalf("terminal = %#v", exchange.Terminal)
+	}
+	sent := connection.Sent()
+	closeInput := indexOfKind(sent, transport.KindCloseInput)
+	heartbeat := indexOfKind(sent, transport.KindHeartbeat)
+	if closeInput < 0 || heartbeat <= closeInput {
+		t.Fatalf("sent kinds = %v; want heartbeat after public input EOF closed stdin", sent)
+	}
+}
+
+func TestExchangeExecPropagatesHeartbeatFailureThatUnblocksReceive(t *testing.T) {
+	heartbeatErr := errors.New("heartbeat send failed")
+	connection := newLeaseMaintainedExecTransport(nil)
+	connection.heartbeatErr = heartbeatErr
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := exchangeExec(ctx, connection, &exchangeExecWire{}, 64, 5*time.Millisecond)
+	if !errors.Is(err, heartbeatErr) {
+		t.Fatalf("exchange error = %v, want heartbeat failure", err)
 	}
 }
 
@@ -72,6 +115,83 @@ func (t *exchangeExecTransport) Receive(context.Context) (transport.Frame, error
 	return frame, nil
 }
 func (t *exchangeExecTransport) Close() error { return nil }
+
+type leaseMaintainedExecTransport struct {
+	mu           sync.Mutex
+	frames       []transport.Frame
+	index        int
+	sent         []transport.Kind
+	inputClosed  bool
+	heartbeatErr error
+	ready        chan struct{}
+	closed       chan struct{}
+	readyOnce    sync.Once
+	closeOnce    sync.Once
+}
+
+func newLeaseMaintainedExecTransport(frames []transport.Frame) *leaseMaintainedExecTransport {
+	return &leaseMaintainedExecTransport{
+		frames: append([]transport.Frame(nil), frames...),
+		ready:  make(chan struct{}),
+		closed: make(chan struct{}),
+	}
+}
+
+func (t *leaseMaintainedExecTransport) Send(_ context.Context, kind transport.Kind, _ []byte) (transport.Frame, error) {
+	t.mu.Lock()
+	t.sent = append(t.sent, kind)
+	if kind == transport.KindCloseInput {
+		t.inputClosed = true
+	}
+	trigger := kind == transport.KindHeartbeat && t.inputClosed
+	heartbeatErr := t.heartbeatErr
+	t.mu.Unlock()
+	if kind == transport.KindHeartbeat && heartbeatErr != nil {
+		return transport.Frame{}, heartbeatErr
+	}
+	if trigger {
+		t.readyOnce.Do(func() { close(t.ready) })
+	}
+	return transport.Frame{}, nil
+}
+
+func (t *leaseMaintainedExecTransport) Receive(ctx context.Context) (transport.Frame, error) {
+	select {
+	case <-t.ready:
+	case <-t.closed:
+		return transport.Frame{}, io.ErrClosedPipe
+	case <-ctx.Done():
+		return transport.Frame{}, ctx.Err()
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.index == len(t.frames) {
+		return transport.Frame{}, io.EOF
+	}
+	frame := t.frames[t.index]
+	t.index++
+	return frame, nil
+}
+
+func (t *leaseMaintainedExecTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
+}
+
+func (t *leaseMaintainedExecTransport) Sent() []transport.Kind {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]transport.Kind(nil), t.sent...)
+}
+
+func indexOfKind(kinds []transport.Kind, want transport.Kind) int {
+	for index, kind := range kinds {
+		if kind == want {
+			return index
+		}
+	}
+	return -1
+}
 
 type exchangeOutput struct {
 	kind transport.Kind

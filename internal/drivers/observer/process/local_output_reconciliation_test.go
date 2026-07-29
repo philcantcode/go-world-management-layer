@@ -13,24 +13,142 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
 )
 
-func TestLocalOutputReconcileAbortsInterruptedPartialsWithoutOrphans(t *testing.T) {
+func TestLocalOutputReconcileFinalizesInterruptedPartialsDurablyAndIdempotently(t *testing.T) {
 	root := t.TempDir()
 	plan := validCollectorPlan(t)
 	directory := prepareInterruptedPartials(t, root, plan)
 	factory := newLocalOutputFactory(t, root)
+	var synced []string
+	factory.syncFile = func(file *os.File) error {
+		synced = append(synced, filepath.Base(file.Name()))
+		return syncCaptureFile(file)
+	}
 	request := interruptedCollectorRequest(plan, true)
 
 	report, err := factory.ReconcileInterruptedRun(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertInterruptedOutput(t, report, plan.CollectorID, ports.InterruptedCollectorOutputAborted, nil)
-	assertExactDirectoryEntries(t, directory, "aborted")
+	if wanted := []string{"stdout.partial", "stderr.partial"}; !reflect.DeepEqual(synced, wanted) {
+		t.Fatalf("recovery file syncs = %v, want %v", synced, wanted)
+	}
+	if len(report.Outputs) != 1 || report.Outputs[0].CollectorID != plan.CollectorID || report.Outputs[0].State != ports.InterruptedCollectorOutputFinalized || report.Outputs[0].CaptureLimitExceeded {
+		t.Fatalf("reconciliation report = %#v", report)
+	}
+	assertLocalArtifacts(t, root, plan.CollectorID, report.Outputs[0].Artifacts, map[string]string{
+		CollectorStdoutRole: "partial stdout",
+		CollectorStderrRole: "partial stderr",
+	})
+	assertExactDirectoryEntries(t, directory, "finalized.json")
+	normalRoot := t.TempDir()
+	normal := newLocalOutputFactory(t, normalRoot)
+	normalCapture, err := normal.Open(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := normalCapture.Stdout().Write([]byte("partial stdout")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := normalCapture.Stderr().Write([]byte("partial stderr")); err != nil {
+		t.Fatal(err)
+	}
+	normalArtifacts, err := normalCapture.Finalize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(report.Outputs[0].Artifacts, normalArtifacts) {
+		t.Fatalf("recovered artifacts = %#v, want normal Finalize artifacts %#v", report.Outputs[0].Artifacts, normalArtifacts)
+	}
 
 	replayed, err := factory.ReconcileInterruptedRun(context.Background(), request)
 	if err != nil || !reflect.DeepEqual(replayed, report) {
 		t.Fatalf("idempotent reconciliation = %#v, %v; want %#v", replayed, err, report)
 	}
+	if len(synced) != 2 {
+		t.Fatalf("idempotent replay resynced finalized partials: %v", synced)
+	}
+	assertNoPartialFiles(t, filepath.Join(root, "runs", plan.TargetRunID.String()))
+}
+
+func TestLocalOutputReconcileConservativelyReportsExactLimitRecovery(t *testing.T) {
+	root := t.TempDir()
+	plan := validCollectorPlan(t)
+	plan.MaximumBytes = 5
+	factory := newLocalOutputFactory(t, root)
+	capture, err := factory.Open(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := capture.Stdout().Write([]byte("1234")); err != nil {
+		t.Fatal(err)
+	}
+	if written, err := capture.Stderr().Write([]byte("xyz")); written != 1 || !errors.Is(err, ErrCaptureLimit) {
+		t.Fatalf("bounded crash capture = %d, %v", written, err)
+	}
+	if err := errors.Join(capture.Stdout().Close(), capture.Stderr().Close()); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := newLocalOutputFactory(t, root)
+	request := interruptedCollectorRequest(plan, true)
+	report, err := restarted.ReconcileInterruptedRun(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Outputs) != 1 || report.Outputs[0].State != ports.InterruptedCollectorOutputFinalized || !report.Outputs[0].CaptureLimitExceeded {
+		t.Fatalf("exact-limit recovery = %#v", report)
+	}
+	assertLocalArtifacts(t, root, plan.CollectorID, report.Outputs[0].Artifacts, map[string]string{
+		CollectorStdoutRole: "1234",
+		CollectorStderrRole: "x",
+	})
+	replayed, err := restarted.ReconcileInterruptedRun(context.Background(), request)
+	if err != nil || !reflect.DeepEqual(replayed, report) {
+		t.Fatalf("exact-limit replay = %#v, %v; want %#v", replayed, err, report)
+	}
+	assertExactDirectoryEntries(t, collectorOutputDirectory(root, plan), "finalized.json")
+	assertNoPartialFiles(t, filepath.Join(root, "runs", plan.TargetRunID.String()))
+}
+
+func TestLocalOutputReconcileAbortsUncommittedPartialsWithoutObjects(t *testing.T) {
+	root := t.TempDir()
+	plan := validCollectorPlan(t)
+	directory := prepareInterruptedPartials(t, root, plan)
+	factory := newLocalOutputFactory(t, root)
+	report, err := factory.ReconcileInterruptedRun(context.Background(), interruptedCollectorRequest(plan, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertInterruptedOutput(t, report, plan.CollectorID, ports.InterruptedCollectorOutputAborted, nil)
+	assertExactDirectoryEntries(t, directory, "aborted")
+	assertExactDirectoryEntries(t, filepath.Join(root, "objects"))
+	assertNoPartialFiles(t, filepath.Join(root, "runs", plan.TargetRunID.String()))
+}
+
+func TestLocalOutputReconcileSyncFailureFailsClosedAndCanRetry(t *testing.T) {
+	root := t.TempDir()
+	plan := validCollectorPlan(t)
+	directory := prepareInterruptedPartials(t, root, plan)
+	factory := newLocalOutputFactory(t, root)
+	failure := errors.New("injected recovery sync failure")
+	factory.syncFile = func(*os.File) error { return failure }
+	request := interruptedCollectorRequest(plan, true)
+
+	if _, err := factory.ReconcileInterruptedRun(context.Background(), request); !errors.Is(err, failure) {
+		t.Fatalf("recovery sync failure = %v", err)
+	}
+	assertExactDirectoryEntries(t, directory, "stdout.partial", "stderr.partial")
+	assertExactDirectoryEntries(t, filepath.Join(root, "objects"))
+
+	factory.syncFile = syncCaptureFile
+	report, err := factory.ReconcileInterruptedRun(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Outputs) != 1 || report.Outputs[0].State != ports.InterruptedCollectorOutputFinalized {
+		t.Fatalf("recovery after sync retry = %#v", report)
+	}
+	assertExactDirectoryEntries(t, directory, "finalized.json")
 	assertNoPartialFiles(t, filepath.Join(root, "runs", plan.TargetRunID.String()))
 }
 
@@ -145,7 +263,25 @@ func TestLocalOutputReconcileClassifiesOnePartialByStartCommit(t *testing.T) {
 			t.Fatalf("one-partial committed transaction error = %v", err)
 		}
 		assertExactDirectoryEntries(t, directory, "stdout.partial")
+		assertExactDirectoryEntries(t, filepath.Join(root, "objects"))
 	})
+}
+
+func TestLocalOutputReconcileFailsClosedOnOversizedCommittedPartials(t *testing.T) {
+	root := t.TempDir()
+	plan := validCollectorPlan(t)
+	plan.MaximumBytes = 32
+	directory := prepareInterruptedContent(t, root, plan, "stdout", "stderr")
+	if err := os.WriteFile(filepath.Join(directory, "stdout.partial"), make([]byte, plan.MaximumBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	factory := newLocalOutputFactory(t, root)
+	if _, err := factory.ReconcileInterruptedRun(context.Background(), interruptedCollectorRequest(plan, true)); !domain.IsCode(err, domain.CodeIntegrityViolation) {
+		t.Fatalf("oversized committed partials error = %v", err)
+	}
+	assertExactDirectoryEntries(t, directory, "stdout.partial", "stderr.partial")
+	assertExactDirectoryEntries(t, filepath.Join(root, "objects"))
 }
 
 func TestLocalOutputReconcileRejectsUnclaimedEntries(t *testing.T) {
@@ -329,10 +465,19 @@ func TestLocalOutputReconcileClassifiesHardCrashObjectPublicationWindows(t *test
 			t.Fatal(err)
 		}
 		factory := newLocalOutputFactory(t, root)
-		if _, err := factory.ReconcileInterruptedRun(context.Background(), interruptedCollectorRequest(plan, true)); err != nil {
+		report, err := factory.ReconcileInterruptedRun(context.Background(), interruptedCollectorRequest(plan, true))
+		if err != nil {
 			t.Fatal(err)
 		}
-		assertExactDirectoryEntries(t, filepath.Join(root, "objects"))
+		if len(report.Outputs) != 1 || report.Outputs[0].State != ports.InterruptedCollectorOutputFinalized {
+			t.Fatalf("truncated pending recovery = %#v", report)
+		}
+		assertLocalArtifacts(t, root, plan.CollectorID, report.Outputs[0].Artifacts, map[string]string{
+			CollectorStdoutRole: stdout,
+			CollectorStderrRole: "stderr",
+		})
+		assertExactDirectoryEntries(t, collectorOutputDirectory(root, plan), "finalized.json")
+		assertNoPendingObjectFiles(t, filepath.Join(root, "objects"))
 	})
 
 	t.Run("renamed but unmanifested object", func(t *testing.T) {
@@ -346,10 +491,19 @@ func TestLocalOutputReconcileClassifiesHardCrashObjectPublicationWindows(t *test
 			t.Fatal(err)
 		}
 		factory := newLocalOutputFactory(t, root)
-		if _, err := factory.ReconcileInterruptedRun(context.Background(), interruptedCollectorRequest(plan, true)); err != nil {
+		report, err := factory.ReconcileInterruptedRun(context.Background(), interruptedCollectorRequest(plan, true))
+		if err != nil {
 			t.Fatal(err)
 		}
-		assertExactDirectoryEntries(t, filepath.Join(root, "objects"))
+		if len(report.Outputs) != 1 || report.Outputs[0].State != ports.InterruptedCollectorOutputFinalized {
+			t.Fatalf("renamed object recovery = %#v", report)
+		}
+		assertLocalArtifacts(t, root, plan.CollectorID, report.Outputs[0].Artifacts, map[string]string{
+			CollectorStdoutRole: stdout,
+			CollectorStderrRole: "stderr",
+		})
+		assertExactDirectoryEntries(t, collectorOutputDirectory(root, plan), "finalized.json")
+		assertNoPendingObjectFiles(t, filepath.Join(root, "objects"))
 	})
 
 	t.Run("object shared by finalized collector", func(t *testing.T) {
@@ -375,16 +529,25 @@ func TestLocalOutputReconcileClassifiesHardCrashObjectPublicationWindows(t *test
 			t.Fatal(err)
 		}
 		restarted := newLocalOutputFactory(t, root)
-		if _, err := restarted.ReconcileInterruptedRun(context.Background(), interruptedCollectorRequest(interruptedPlan, true)); err != nil {
+		report, err := restarted.ReconcileInterruptedRun(context.Background(), interruptedCollectorRequest(interruptedPlan, true))
+		if err != nil {
 			t.Fatal(err)
 		}
+		if len(report.Outputs) != 1 || report.Outputs[0].State != ports.InterruptedCollectorOutputFinalized {
+			t.Fatalf("shared-object recovery = %#v", report)
+		}
+		assertLocalArtifacts(t, root, interruptedPlan.CollectorID, report.Outputs[0].Artifacts, map[string]string{
+			CollectorStdoutRole: shared,
+			CollectorStderrRole: "orphan bytes",
+		})
 		sharedDigest := strings.TrimPrefix(domain.NewDigest([]byte(shared)).String(), "sha256:")
 		if _, err := os.Stat(filepath.Join(root, "objects", sharedDigest)); err != nil {
 			t.Fatalf("shared referenced object was removed: %v", err)
 		}
-		if _, err := os.Stat(filepath.Join(root, "objects", orphanDigest)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("unmanifested object remains: %v", err)
+		if _, err := os.Stat(filepath.Join(root, "objects", orphanDigest)); err != nil {
+			t.Fatalf("recovered stderr object was not published: %v", err)
 		}
+		assertNoPendingObjectFiles(t, filepath.Join(root, "objects"))
 	})
 
 	t.Run("complete pending object referenced by manifest", func(t *testing.T) {

@@ -1,6 +1,9 @@
 package ports
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // PhysicalSupport states whether a fact is enforced and independently
 // observable by the selected physical backend. Unsupported is a known backend
@@ -69,6 +72,21 @@ type ContainerResourcePhysicalFacts struct {
 	PIDs               PhysicalLimitFact `json:"pids"`
 }
 
+// AndroidRuntimePhysicalFacts records the Android-specific controls that are
+// absent from a container runtime. SystemImageDigest is empty in a
+// configuration-level report and exact in a plan-level report.
+type AndroidRuntimePhysicalFacts struct {
+	SystemImageDigest           string          `json:"system_image_digest,omitempty"`
+	BaselineState               string          `json:"baseline_state,omitempty"`
+	HardwareAcceleration        bool            `json:"hardware_acceleration"`
+	HardwareAccelerationSupport PhysicalSupport `json:"hardware_acceleration_support,omitempty"`
+	Headless                    bool            `json:"headless"`
+	Rooted                      bool            `json:"rooted"`
+	Debuggable                  bool            `json:"debuggable"`
+	GuestMemoryBytes            int64           `json:"guest_memory_bytes"`
+	BootTimeout                 time.Duration   `json:"boot_timeout"`
+}
+
 type AgentWorkspacePhysicalPolicyReport struct {
 	Runtime   ContainerRuntimePhysicalFacts  `json:"runtime"`
 	Network   ContainerNetworkPhysicalFacts  `json:"network"`
@@ -86,12 +104,15 @@ type TargetPhysicalPolicyReport struct {
 	ExecTransport                 string                         `json:"exec_transport"`
 	FileTransfer                  string                         `json:"file_transfer"`
 	NetworkEndpoints              string                         `json:"network_endpoints"`
+	ADB                           string                         `json:"adb,omitempty"`
+	DeviceScopedADBServices       string                         `json:"device_scoped_adb_services,omitempty"`
 	DeniedInfrastructureAuthority []string                       `json:"denied_infrastructure_authority"`
 	ResetAfterEveryRun            bool                           `json:"reset_after_every_run"`
 	ResetMode                     string                         `json:"reset_mode"`
 	InteractionSupport            PhysicalSupport                `json:"interaction_support"`
 	ResetSupport                  PhysicalSupport                `json:"reset_support"`
 	Resources                     ContainerResourcePhysicalFacts `json:"resources"`
+	Android                       AndroidRuntimePhysicalFacts    `json:"android,omitempty"`
 }
 
 // AgentWorkspacePhysicalPolicyReporter is optional. The config-level method

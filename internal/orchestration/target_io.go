@@ -288,13 +288,13 @@ func (s *Service) OpenTargetADB(stream worldv1.WorldService_OpenTargetADBServer)
 	defer tunnel.Close()
 	running, err := s.core.TransitionTargetOperation(ctx, application.TransitionTargetOperationRequest{Meta: childMeta(meta, "operation-running", deadline(ctx)), TargetID: target.ID, OperationID: operation.ID, ExpectedRevision: operation.Revision, State: domain.TargetOperationRunning})
 	if err != nil {
-		return errors.Join(err, tunnel.Close(), endpoint.Close(), connection.Close())
+		return errors.Join(err, closeTargetADBResources(tunnel, endpoint, connection))
 	}
 	if err := stream.Send(&worldv1.ADBFrame{AssignedSerial: endpoint.Serial()}); err != nil {
 		return s.finalizeOperationFailure(ctx, meta, target.ID, running, err)
 	}
 	exchangeErr := s.exchangeADB(ctx, tunnel, stream)
-	closeErr := errors.Join(tunnel.Close(), endpoint.Close(), connection.Close())
+	closeErr := closeTargetADBResources(tunnel, endpoint, connection)
 	if exchangeErr != nil || closeErr != nil {
 		return s.finalizeOperationFailure(ctx, meta, target.ID, running, errors.Join(exchangeErr, closeErr))
 	}
@@ -302,6 +302,19 @@ func (s *Service) OpenTargetADB(stream worldv1.WorldService_OpenTargetADBServer)
 		return err
 	}
 	return stream.Send(&worldv1.ADBFrame{Complete: true})
+}
+
+func closeTargetADBResources(resources ...io.Closer) error {
+	var closeErrors []error
+	for _, resource := range resources {
+		if resource == nil {
+			continue
+		}
+		if err := resource.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			closeErrors = append(closeErrors, err)
+		}
+	}
+	return errors.Join(closeErrors...)
 }
 
 func (s *Service) receivePushContent(stream worldv1.WorldService_PushTargetFileServer) ([]byte, string, error) {

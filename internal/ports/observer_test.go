@@ -70,3 +70,52 @@ func TestCollectorSpecRejectsMalformedName(t *testing.T) {
 		t.Fatalf("overlong collector spec error = %v, want invalid argument", err)
 	}
 }
+
+func TestADBObservationAuthorityRequiresLiteralExactSelection(t *testing.T) {
+	endpoint, err := ParseADBServerEndpoint("127.0.0.1:5041")
+	if err != nil || endpoint != (ADBServerEndpoint{Host: "127.0.0.1", Port: 5041}) {
+		t.Fatalf("parsed endpoint = %#v, %v", endpoint, err)
+	}
+	selection, err := NewADBDeviceSelection(endpoint, "emulator-5578")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachment := ObservationAttachment{
+		TargetKind: domain.TargetAndroidVirtualDevice, RuntimeID: "world-android-generation-2", ADBDevice: selection,
+	}
+	if err := attachment.Validate(); err != nil {
+		t.Fatalf("valid Android attachment rejected: %v", err)
+	}
+
+	for _, value := range []string{"localhost:5037", "192.0.2.1:5037", "127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1"} {
+		if _, err := ParseADBServerEndpoint(value); err == nil {
+			t.Errorf("unsafe ADB server %q accepted", value)
+		}
+	}
+	for _, serial := range []string{"", "-e", "emulator-5578\n-s", strings.Repeat("a", 1025)} {
+		if err := ValidateExactADBSerial(serial); err == nil {
+			t.Errorf("unsafe ADB serial %q accepted", serial)
+		}
+	}
+
+	wrongKind := attachment
+	wrongKind.TargetKind = domain.TargetLinuxContainer
+	if err := wrongKind.Validate(); !domain.IsCode(err, domain.CodeInvalidArgument) {
+		t.Fatalf("non-Android ADB attachment error = %v", err)
+	}
+	invalidPort := attachment
+	invalidPort.ADBDevice.Server.Port = 0
+	if err := invalidPort.Validate(); !domain.IsCode(err, domain.CodeInvalidArgument) {
+		t.Fatalf("zero-port ADB attachment error = %v", err)
+	}
+	remote := attachment
+	remote.ADBDevice.Server.Host = "192.0.2.1"
+	if err := remote.Validate(); !domain.IsCode(err, domain.CodeInvalidArgument) {
+		t.Fatalf("remote ADB attachment error = %v", err)
+	}
+	injected := attachment
+	injected.ADBDevice.Serial = "-s"
+	if err := injected.Validate(); !domain.IsCode(err, domain.CodeInvalidArgument) {
+		t.Fatalf("option-shaped ADB attachment error = %v", err)
+	}
+}

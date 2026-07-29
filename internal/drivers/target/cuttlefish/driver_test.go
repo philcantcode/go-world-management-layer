@@ -33,6 +33,9 @@ func TestPrepareRunMaterializesExactArtifactsInCanonicalOrder(t *testing.T) {
 	if prepared.MaterializationDigest != plan.Run.Spec().MaterializationDigest || prepared.RunID != plan.Run.ID() {
 		t.Fatalf("prepared run = %#v", prepared)
 	}
+	if prepared.Attachment.ADBDevice.Server != (ports.ADBServerEndpoint{Host: "127.0.0.1", Port: 5037}) || prepared.Attachment.ADBDevice.Serial != files.serial {
+		t.Fatalf("prepared run did not bind the authority-owned ADB server/serial: %#v", prepared.Attachment)
+	}
 	files.mu.Lock()
 	paths := []string{files.putPlans[0].LogicalPath, files.putPlans[1].LogicalPath}
 	modes := []uint32{files.putPlans[0].Mode, files.putPlans[1].Mode}
@@ -58,6 +61,48 @@ func TestPrepareRunMaterializesExactArtifactsInCanonicalOrder(t *testing.T) {
 	files.mu.Unlock()
 	if files.PutCount() != 2 || preparedCalls != 1 {
 		t.Fatal("idempotent prepare re-materialized device content")
+	}
+}
+
+func TestAndroidTargetGenerationIsSingleUseAfterEveryTerminalRun(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		start bool
+		want  ports.RunOutcome
+	}{
+		{name: "completed", start: true, want: ports.RunCompleted},
+		{name: "never-started", start: false, want: ports.RunFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			lease, _ := domain.NewLeaseID()
+			target, _ := domain.NewTargetID()
+			files := newRecordingFileGateway("127.0.0.1:6552")
+			driver, _ := materializationTestDriver(t, lease, target, files)
+			first := targetRunPlanForMaterial(t, lease, target, nil, "android-single-use-first")
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if _, err := driver.PrepareRun(ctx, first); err != nil {
+				t.Fatal(err)
+			}
+			if test.start {
+				if err := driver.StartRun(ctx, first.Run.ID()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			receipt, err := driver.StopRun(ctx, first.Run.ID(), ports.StopGraceful)
+			if err != nil || receipt.Outcome != test.want {
+				t.Fatalf("terminal receipt = %#v, %v", receipt, err)
+			}
+			second := targetRunPlanForMaterial(t, lease, target, nil, "android-single-use-second")
+			if _, err := driver.PrepareRun(ctx, second); !domain.IsCode(err, domain.CodeFailedPrecondition) {
+				t.Fatalf("second run on spent Android generation error = %v", err)
+			}
+			device := driver.targets[deviceKey(target, 1)]
+			use, found, err := loadGenerationUseManifest(device.plan)
+			if err != nil || !found || use.RunID != first.Run.ID().String() || use.Reason != generationUseRunPrepared {
+				t.Fatalf("durable generation-use gate = %#v, %v, found=%t", use, err, found)
+			}
+		})
 	}
 }
 
@@ -187,16 +232,35 @@ func materializationTestDriver(t *testing.T, lease domain.LeaseID, target domain
 	if err != nil {
 		t.Fatal(err)
 	}
+	fingerprint := ResetFingerprint{
+		BackendVersion: "cvd-test", RuntimeVersion: "aosp-test",
+		SystemImageDigest: domain.NewDigest([]byte("material-system-image")), DeviceConfigDigest: domain.NewDigest([]byte("material-device-config")),
+		Features: []string{"root", "headless"},
+	}
+	instance := Instance{RuntimeID: allocation.InstanceName, StateDirectory: stateDirectory, Allocation: allocation}
 	driver := &Driver{
+		backend:    newStatefulBackend(instance),
 		files:      files,
 		collectors: CollectorReadinessFunc(func(context.Context, domain.TargetRunID, []ports.ObservationRequirement) error { return nil }),
 		random:     bytes.NewReader(bytes.Repeat([]byte{0x42}, 128)),
 		now:        func() time.Time { return time.Unix(100, 0).UTC() },
 		targets: map[string]deviceRecord{
 			deviceKey(target, 1): {
-				input:    ports.TargetPlan{Target: targetModel},
-				plan:     VirtualDevicePlan{LeaseID: lease, TargetID: target, Generation: 1, StateDirectory: stateDirectory, Allocation: allocation},
-				instance: Instance{RuntimeID: allocation.InstanceName, Allocation: allocation},
+				input: ports.TargetPlan{Target: targetModel},
+				plan: VirtualDevicePlan{
+					Name: "world-android-" + target.UUID() + "-g1", LeaseID: lease, TargetID: target, Generation: 1,
+					StateDirectory: stateDirectory, SystemImageDirectory: filepath.Join(stateDirectory, "system-image"), Allocation: allocation,
+					ADBServer:   ports.ADBServerEndpoint{Host: "127.0.0.1", Port: 5037},
+					Fingerprint: fingerprint, Labels: map[string]string{"world.target-generation": "1"}, BaselineState: ports.AndroidBaselineCleanBoot,
+					RequireHardwareAcceleration: true, Headless: true, Rooted: true, Debuggable: true,
+					GuestMemoryBytes: 2 << 30, BootTimeout: time.Minute,
+				},
+				instance: instance,
+				status: ports.TargetStatus{
+					TargetID: target, Generation: 1, Kind: domain.TargetAndroidVirtualDevice,
+					State: domain.TargetGenerationReady, Ready: true, RuntimeID: instance.RuntimeID,
+					DeviceSerial: allocation.Serial, ObservedAt: time.Unix(99, 0).UTC(),
+				},
 			},
 		},
 		runs:         make(map[string]*runRecord),
@@ -207,7 +271,14 @@ func materializationTestDriver(t *testing.T, lease domain.LeaseID, target domain
 }
 
 func targetRunPlanForMaterial(t *testing.T, lease domain.LeaseID, target domain.TargetID, material []ports.TargetMaterialPlan, key string) ports.TargetRunPlan {
+	return targetRunPlanForGeneration(t, lease, target, 1, material, key)
+}
+
+func targetRunPlanForGeneration(t *testing.T, lease domain.LeaseID, target domain.TargetID, generation domain.TargetGeneration, material []ports.TargetMaterialPlan, key string) ports.TargetRunPlan {
 	t.Helper()
+	if len(material) == 0 {
+		material = []ports.TargetMaterialPlan{targetMaterial(t, "fixture/payload.bin", 0o600, []byte("fixture"), nil)}
+	}
 	runID, _ := domain.NewTargetRunID()
 	agent, _ := domain.NewAgentWorkspaceID()
 	digest, err := ports.TargetMaterializationDigest(material)
@@ -215,7 +286,7 @@ func targetRunPlanForMaterial(t *testing.T, lease domain.LeaseID, target domain.
 		t.Fatal(err)
 	}
 	run, err := domain.NewTargetRun(domain.TargetRunSpec{
-		ID: runID, LeaseID: lease, TargetID: target, TargetGeneration: 1, AgentWorkspaceID: agent, AgentGeneration: 1,
+		ID: runID, LeaseID: lease, TargetID: target, TargetGeneration: generation, AgentWorkspaceID: agent, AgentGeneration: 1,
 		MaterializationDigest: digest, CreatedAt: time.Now().UTC(),
 	})
 	if err != nil {

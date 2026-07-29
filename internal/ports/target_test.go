@@ -11,6 +11,49 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
 )
 
+func TestTargetTemplateSeparatesLinuxAndAndroidRuntimeFields(t *testing.T) {
+	digest := domain.NewDigest([]byte("system-image"))
+	linux := TargetTemplate{
+		Name: "linux", Kind: domain.TargetLinuxContainer, Driver: "docker", Runtime: "runc",
+		ImageDigest: digest, IsolationProfile: "observable-container",
+	}
+	if err := linux.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	missingRuntime := linux
+	missingRuntime.Runtime = ""
+	if err := missingRuntime.Validate(); err == nil {
+		t.Fatal("Linux template without an OCI runtime was accepted")
+	}
+	androidField := linux
+	androidField.BaselineState = AndroidBaselineCleanBoot
+	if err := androidField.Validate(); err == nil {
+		t.Fatal("Linux template with an Android-only field was accepted")
+	}
+
+	android := TargetTemplate{
+		Name: "android", Kind: domain.TargetAndroidVirtualDevice, Driver: "android-emulator",
+		ImageDigest: digest, IsolationProfile: "instrumented-android", BaselineState: AndroidBaselineCleanBoot,
+		RequireHardwareAcceleration: true, Headless: true, Rooted: true, Debuggable: true,
+		GuestMemoryBytes: 2 << 30, BootTimeout: time.Minute,
+	}
+	if err := android.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	linuxRuntime := android
+	linuxRuntime.Runtime = "runc"
+	if err := linuxRuntime.Validate(); err == nil {
+		t.Fatal("Android template with a Linux runtime was accepted")
+	}
+	for _, baseline := range []string{"", "snapshot-v1", " clean-boot", "clean-boot "} {
+		invalidBaseline := android
+		invalidBaseline.BaselineState = baseline
+		if err := invalidBaseline.Validate(); !domain.IsCode(err, domain.CodeInvalidArgument) {
+			t.Errorf("Android template with baseline %q error = %v, want invalid argument", baseline, err)
+		}
+	}
+}
+
 func TestTargetMaterializationDigestIsExactAndOrderStable(t *testing.T) {
 	first := targetMaterial(t, "artifact://one", "one.bin", []byte("one"))
 	second := targetMaterial(t, "artifact://two", "nested/two.bin", []byte("two"))

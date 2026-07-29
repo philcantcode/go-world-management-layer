@@ -1,11 +1,13 @@
 package linuxcontainer
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/philcantcode/go-world-management-layer/internal/admission"
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
@@ -57,7 +59,7 @@ func (p ContainerPlan) Validate(targetRoot string) error {
 		return fmt.Errorf("target image must be digest pinned")
 	}
 	if _, ok := targetIsolationProfile(p.Runtime); !ok {
-		return fmt.Errorf("target runtime must be runc, gvisor, or kata")
+		return fmt.Errorf("target runtime must be runc")
 	}
 	if p.PolicyDigest.IsZero() || p.CapabilityDigest.IsZero() {
 		return fmt.Errorf("policy and capability digests are required")
@@ -91,18 +93,21 @@ func (p ContainerPlan) Validate(targetRoot string) error {
 	if len(p.MountSources) != len(expectedMountSources) {
 		return fmt.Errorf("only target-private writable state and material may be mounted")
 	}
-	for index := range expectedMountSources {
-		if filepath.Clean(p.MountSources[index]) != filepath.Clean(expectedMountSources[index]) {
-			return fmt.Errorf("mount source %d does not match the target layout", index)
-		}
-	}
-	for _, source := range p.MountSources {
+	for index, source := range p.MountSources {
 		if err := requirePathBeneath(targetRoot, source); err != nil {
 			return fmt.Errorf("mount source: %w", err)
+		}
+		if !dockercli.CanonicalHostBindSourceEqual(source, expectedMountSources[index]) {
+			return fmt.Errorf("mount source %d does not match the target layout", index)
 		}
 		lower := strings.ToLower(filepath.ToSlash(source))
 		if strings.Contains(lower, "docker.sock") || strings.Contains(lower, "containerd.sock") || strings.Contains(lower, "/workspace/") {
 			return fmt.Errorf("runtime sockets and agent workspaces may not be mounted")
+		}
+	}
+	for _, mount := range restrictedTargetBindMounts(p) {
+		if _, err := dockercli.RestrictedBindMountArgument(mount.source, mount.target, mount.readOnly); err != nil {
+			return fmt.Errorf("target bind mount: %w", err)
 		}
 	}
 	for _, capability := range p.Capabilities {
@@ -221,6 +226,110 @@ func containerPlanDigest(plan ContainerPlan) (domain.Digest, error) {
 	})
 }
 
+// sameContainerPlanIdentity keeps direct-driver idempotency bound to the same
+// canonical physical identity used by labels and reconciliation.
+func sameContainerPlanIdentity(existing, requested ContainerPlan) (bool, error) {
+	existingDigest, err := containerPlanDigest(existing)
+	if err != nil {
+		return false, err
+	}
+	requestedDigest, err := containerPlanDigest(requested)
+	if err != nil {
+		return false, err
+	}
+	return existingDigest == requestedDigest, nil
+}
+
+// targetPlanDigest binds direct-driver idempotency to the complete semantic
+// request, not merely to the narrowed Docker realization. Fields such as the
+// template name and recovery provenance intentionally remain meaningful even
+// when they do not alter docker create arguments.
+func targetPlanDigest(input ports.TargetPlan) (domain.Digest, error) {
+	generation := input.Generation.Spec()
+	identity := struct {
+		SchemaVersion  int            `json:"schema_version"`
+		IdempotencyKey string         `json:"idempotency_key"`
+		LeaseID        domain.LeaseID `json:"lease_id"`
+		Target         struct {
+			ID                domain.TargetID          `json:"id"`
+			ResearchSessionID domain.ResearchSessionID `json:"research_session_id"`
+			Kind              domain.TargetKind        `json:"kind"`
+			CurrentGeneration domain.TargetGeneration  `json:"current_generation"`
+			Revision          domain.Revision          `json:"revision"`
+			UpdatedAt         time.Time                `json:"updated_at"`
+		} `json:"target"`
+		Generation struct {
+			TargetID                    domain.TargetID              `json:"target_id"`
+			Generation                  domain.TargetGeneration      `json:"generation"`
+			PolicyDigest                domain.Digest                `json:"policy_digest"`
+			CapabilityFingerprintDigest domain.Digest                `json:"capability_fingerprint_digest"`
+			PreviousGeneration          domain.TargetGeneration      `json:"previous_generation,omitempty"`
+			RecoveryIncidentID          string                       `json:"recovery_incident_id,omitempty"`
+			CreatedAt                   time.Time                    `json:"created_at"`
+			State                       domain.TargetGenerationState `json:"state"`
+			Revision                    domain.Revision              `json:"revision"`
+			UpdatedAt                   time.Time                    `json:"updated_at"`
+		} `json:"generation"`
+		Template                    ports.TargetTemplate `json:"template"`
+		PolicyDigest                domain.Digest        `json:"policy_digest"`
+		CapabilityFingerprintDigest domain.Digest        `json:"capability_fingerprint_digest"`
+		Resources                   admission.Resources  `json:"resources"`
+	}{
+		SchemaVersion: 1, IdempotencyKey: input.IdempotencyKey, LeaseID: input.LeaseID,
+		Template: input.Template, PolicyDigest: input.PolicyDigest,
+		CapabilityFingerprintDigest: input.CapabilityFingerprintDigest, Resources: input.Resources.Clone(),
+	}
+	identity.Target.ID = input.Target.ID()
+	identity.Target.ResearchSessionID = input.Target.ResearchSessionID()
+	identity.Target.Kind = input.Target.Kind()
+	identity.Target.CurrentGeneration = input.Target.CurrentGeneration()
+	identity.Target.Revision = input.Target.Revision()
+	identity.Target.UpdatedAt = input.Target.UpdatedAt().UTC()
+	identity.Generation.TargetID = generation.TargetID
+	identity.Generation.Generation = generation.Generation
+	identity.Generation.PolicyDigest = generation.PolicyDigest
+	identity.Generation.CapabilityFingerprintDigest = generation.CapabilityFingerprintDigest
+	identity.Generation.PreviousGeneration = generation.PreviousGeneration
+	identity.Generation.RecoveryIncidentID = generation.RecoveryIncidentID.String()
+	identity.Generation.CreatedAt = generation.CreatedAt.UTC()
+	identity.Generation.State = input.Generation.State()
+	identity.Generation.Revision = input.Generation.Revision()
+	identity.Generation.UpdatedAt = input.Generation.UpdatedAt().UTC()
+	payload, err := json.Marshal(identity)
+	if err != nil {
+		return domain.Digest{}, err
+	}
+	return domain.NewDigest(append([]byte("world.linux-target.request-plan.v1\x00"), payload...)), nil
+}
+
+func sameTargetPlanIdentity(existing, requested ports.TargetPlan) (bool, error) {
+	existingDigest, err := targetPlanDigest(existing)
+	if err != nil {
+		return false, err
+	}
+	requestedDigest, err := targetPlanDigest(requested)
+	if err != nil {
+		return false, err
+	}
+	return existingDigest == requestedDigest, nil
+}
+
+func replacementContainerPlan(previous ContainerPlan, nextGeneration domain.TargetGeneration, targetRoot string) (ContainerPlan, error) {
+	next := cloneContainerPlan(previous)
+	next.Generation = nextGeneration
+	next.Name = targetContainerName(previous.TargetID, nextGeneration)
+	next.TargetDirectory = filepath.Join(targetRoot, previous.TargetID.String(), "generations", strconv.FormatUint(uint64(nextGeneration), 10))
+	next.MountSources = []string{next.writableRoot(), next.materialRoot()}
+	next.Labels["world.target-generation"] = strconv.FormatUint(uint64(nextGeneration), 10)
+	if err := setPlanDigest(&next); err != nil {
+		return ContainerPlan{}, err
+	}
+	if err := next.Validate(targetRoot); err != nil {
+		return ContainerPlan{}, err
+	}
+	return next, nil
+}
+
 func validatePlanLabels(plan ContainerPlan) error {
 	digest, err := containerPlanDigest(plan)
 	if err != nil {
@@ -243,14 +352,18 @@ func (p ContainerPlan) DockerCreateArgs() ([]string, error) {
 		return nil, err
 	}
 	args := []string{"create", "--name", p.Name, "--runtime", p.Runtime, "--init", "--read-only"}
+	args = append(args, dockercli.RestrictedLifecycleArguments(p.Name)...)
 	args = append(args, dockercli.PrivateNamespaceArguments()...)
 	args = append(args, "--cap-drop", "ALL")
 	args = append(args, dockercli.HardenedSecurityArguments()...)
-	args = append(args,
-		"--user", p.User, "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,mode=1777",
-		"--mount", "type=bind,src="+p.writableRoot()+",dst="+TargetMount,
-		"--mount", "type=bind,src="+p.materialRoot()+",dst="+TargetMaterialMount+",readonly",
-	)
+	args = append(args, "--user", p.User, "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,mode=1777")
+	for _, mount := range restrictedTargetBindMounts(p) {
+		value, err := dockercli.RestrictedBindMountArgument(mount.source, mount.target, mount.readOnly)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--mount", value)
+	}
 	for _, capability := range p.Capabilities {
 		args = append(args, "--cap-add", capability)
 	}
@@ -277,15 +390,24 @@ func configuredTargetUser(value string) string {
 	return value
 }
 
-func targetIsolationProfile(runtime string) (string, bool) {
-	switch runtime {
-	case dockercli.RuncRuntime:
-		return "observable-container", true
-	case "gvisor", "kata":
-		return "sandboxed-kernel", true
-	default:
-		return "", false
+type targetBindMount struct {
+	source   string
+	target   string
+	readOnly bool
+}
+
+func restrictedTargetBindMounts(plan ContainerPlan) []targetBindMount {
+	return []targetBindMount{
+		{source: plan.writableRoot(), target: TargetMount},
+		{source: plan.materialRoot(), target: TargetMaterialMount, readOnly: true},
 	}
+}
+
+func targetIsolationProfile(runtime string) (string, bool) {
+	if runtime == dockercli.RuncRuntime {
+		return "observable-container", true
+	}
+	return "", false
 }
 
 func (p ContainerPlan) materialRoot() string {

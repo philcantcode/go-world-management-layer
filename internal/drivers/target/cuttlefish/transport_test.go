@@ -3,6 +3,7 @@ package cuttlefish
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -90,6 +91,62 @@ func TestAndroidTransportAuthorizesOperationsAndUsesScopedGateways(t *testing.T)
 	}
 }
 
+func TestAndroidTransportCloseRetainsFailedEndpointsForRetry(t *testing.T) {
+	endpoint := &retryingScopedADBEndpoint{remainingFailures: 1}
+	transport := &androidTransport{endpoints: []ports.ScopedADBEndpoint{endpoint}}
+	if err := transport.Close(); err == nil {
+		t.Fatal("first endpoint close failure was hidden")
+	}
+	if endpoint.Attempts() != 1 {
+		t.Fatalf("close attempts = %d, want 1", endpoint.Attempts())
+	}
+	if err := transport.Close(); err != nil {
+		t.Fatalf("retry endpoint close: %v", err)
+	}
+	if endpoint.Attempts() != 2 {
+		t.Fatalf("close attempts after retry = %d, want 2", endpoint.Attempts())
+	}
+	if err := transport.Close(); err != nil {
+		t.Fatalf("idempotent close after success: %v", err)
+	}
+	if endpoint.Attempts() != 2 {
+		t.Fatalf("successfully closed endpoint was retried: %d attempts", endpoint.Attempts())
+	}
+}
+
+func TestAndroidTransportCloseDrainsInFlightADBOpen(t *testing.T) {
+	scope, allocation := adbTestScope(t)
+	gateway := &blockingEndpointGateway{entered: make(chan struct{}), release: make(chan struct{})}
+	transport := &androidTransport{gateway: gateway, scope: scope, allocation: allocation}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	openDone := make(chan error, 1)
+	go func() {
+		_, err := transport.OpenADB(ctx)
+		openDone <- err
+	}()
+	<-gateway.entered
+	closeContext, cancelClose := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelClose()
+	started := time.Now()
+	if err := transport.closeWithContext(closeContext); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bounded Close error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("bounded Close ignored its deadline for %s", elapsed)
+	}
+	close(gateway.release)
+	if err := <-openDone; !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("revoked ADB open error = %v", err)
+	}
+	if err := transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !gateway.Closed() {
+		t.Fatal("endpoint created during revocation was not closed")
+	}
+}
+
 func androidTransferPlan(t *testing.T, scope deviceproxy.Scope, kind domain.TargetOperationKind, logicalPath string, maximum int64, digest domain.Digest) ports.TargetTransferPlan {
 	t.Helper()
 	id, _ := domain.NewTargetOperationID()
@@ -112,6 +169,94 @@ type recordingEndpointGateway struct {
 	expectedScope      deviceproxy.Scope
 	expectedAllocation Allocation
 	closed             bool
+	closeFailures      int
+	closeAttempts      int
+}
+
+type blockingEndpointGateway struct {
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	closed  bool
+}
+
+type fixedEndpointGateway struct {
+	expectedScope      deviceproxy.Scope
+	expectedAllocation Allocation
+	endpoint           ports.ScopedADBEndpoint
+}
+
+type blockingPutFileGateway struct {
+	ScopedFileGateway
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *blockingPutFileGateway) Put(ctx context.Context, _ deviceproxy.Scope, _ Allocation, _ DeviceFileWritePlan, _ io.Reader) (DeviceFile, error) {
+	g.once.Do(func() { close(g.entered) })
+	<-g.release
+	return DeviceFile{}, ctx.Err()
+}
+
+func (g *fixedEndpointGateway) Open(_ context.Context, scope deviceproxy.Scope, allocation Allocation) (ports.ScopedADBEndpoint, error) {
+	if scope != g.expectedScope || allocation != g.expectedAllocation {
+		return nil, fmt.Errorf("endpoint scope changed")
+	}
+	return g.endpoint, nil
+}
+
+func (g *blockingEndpointGateway) Open(_ context.Context, scope deviceproxy.Scope, _ Allocation) (ports.ScopedADBEndpoint, error) {
+	close(g.entered)
+	<-g.release
+	return deviceproxy.NewEndpoint(scope.Serial, "127.0.0.1:19001", func() error {
+		g.mu.Lock()
+		g.closed = true
+		g.mu.Unlock()
+		return nil
+	}), nil
+}
+
+func (g *blockingEndpointGateway) Closed() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.closed
+}
+
+type retryingScopedADBEndpoint struct {
+	mu                sync.Mutex
+	serial            string
+	address           string
+	remainingFailures int
+	attempts          int
+}
+
+func (e *retryingScopedADBEndpoint) Serial() string {
+	if e.serial == "" {
+		return "emulator-5554"
+	}
+	return e.serial
+}
+func (e *retryingScopedADBEndpoint) Address() string {
+	if e.address == "" {
+		return "127.0.0.1:19000"
+	}
+	return e.address
+}
+func (e *retryingScopedADBEndpoint) Close() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.attempts++
+	if e.remainingFailures > 0 {
+		e.remainingFailures--
+		return fmt.Errorf("injected endpoint close failure")
+	}
+	return nil
+}
+func (e *retryingScopedADBEndpoint) Attempts() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.attempts
 }
 
 func (g *recordingEndpointGateway) Open(_ context.Context, scope deviceproxy.Scope, allocation Allocation) (ports.ScopedADBEndpoint, error) {
@@ -121,6 +266,11 @@ func (g *recordingEndpointGateway) Open(_ context.Context, scope deviceproxy.Sco
 	return deviceproxy.NewEndpoint(allocation.Serial, "127.0.0.1:19000", func() error {
 		g.mu.Lock()
 		defer g.mu.Unlock()
+		g.closeAttempts++
+		if g.closeFailures > 0 {
+			g.closeFailures--
+			return fmt.Errorf("injected scoped endpoint close failure")
+		}
 		g.closed = true
 		return nil
 	}), nil

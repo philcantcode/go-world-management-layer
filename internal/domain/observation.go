@@ -240,8 +240,10 @@ func NewChangeEntry(spec ChangeEntrySpec) (ChangeEntry, error) {
 	if !spec.Kind.IsValid() {
 		return ChangeEntry{}, NewError(CodeInvalidArgument, "change.new", "kind", "is not recognized", nil)
 	}
-	if err := requireRelativePath("path", spec.Path, false); err != nil {
-		return ChangeEntry{}, err
+	if spec.Kind != ChangeOpaqueDirectory || spec.Path != "." {
+		if err := requireRelativePath("path", spec.Path, false); err != nil {
+			return ChangeEntry{}, err
+		}
 	}
 	if spec.Kind == ChangeRenamed {
 		if err := requireRelativePath("previous_path", spec.PreviousPath, false); err != nil {

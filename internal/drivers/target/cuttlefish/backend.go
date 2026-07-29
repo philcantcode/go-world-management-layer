@@ -3,44 +3,91 @@ package cuttlefish
 import (
 	"context"
 	"fmt"
-	"os"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/philcantcode/go-world-management-layer/internal/domain"
+	"github.com/philcantcode/go-world-management-layer/internal/admission"
 	"github.com/philcantcode/go-world-management-layer/internal/drivers/command"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
 )
 
 type BackendCapabilities struct {
-	BackendKind    string
-	BackendVersion string
-	RuntimeVersion string
-	KVM            bool
-	KVMKnown       bool
-	ResetModes     []ports.ResetMode
-	Evidence       map[string]string
+	BackendKind               string
+	BackendVersion            string
+	RuntimeVersion            string
+	KVM                       bool
+	KVMKnown                  bool
+	ResetModes                []ports.ResetMode
+	Evidence                  map[string]string
+	Managed                   bool
+	Headless                  bool
+	HeadlessKnown             bool
+	Rooted                    bool
+	RootedKnown               bool
+	Debuggable                bool
+	DebuggableKnown           bool
+	CPUEnforced               bool
+	MemoryEnforced            bool
+	WritableStateEnforced     bool
+	HardwareAcceleration      bool
+	HardwareAccelerationKnown bool
 }
 
 type Instance struct {
-	RuntimeID            string
-	StateDirectory       string
-	SystemImageDirectory string
-	Allocation           Allocation
-	Fingerprint          ResetFingerprint
+	RuntimeID                   string
+	StateDirectory              string
+	SystemImageDirectory        string
+	Allocation                  Allocation
+	Fingerprint                 ResetFingerprint
+	Resources                   admission.Resources
+	BaselineState               string
+	RequireHardwareAcceleration bool
+	Headless                    bool
+	Rooted                      bool
+	Debuggable                  bool
+	GuestMemoryBytes            int64
+	BootTimeout                 time.Duration
 }
 
 type ReadinessState struct {
-	ProcessRunning bool
-	ADBReady       bool
-	BootCompleted  bool
-	FrameworkReady bool
-	ObservedAt     time.Time
+	ProcessRunning      bool
+	ADBReady            bool
+	BootCompleted       bool
+	FrameworkReady      bool
+	PackageManagerReady bool
+	DeviceState         string
+	Identity            AndroidIdentity
+	ObservedAt          time.Time
 }
 
 func (r ReadinessState) Ready() bool {
-	return r.ProcessRunning && r.ADBReady && r.BootCompleted && r.FrameworkReady
+	return r.ProcessRunning && r.ADBReady && r.DeviceState == "device" && r.BootCompleted && r.FrameworkReady && r.PackageManagerReady && r.Identity.Validate() == nil
+}
+
+func incompleteAndroidReadinessError(state ReadinessState, expectedAVDName string) error {
+	identityErr := state.Identity.Validate()
+	identityValid := identityErr == nil
+	avdMatches := state.Identity.AVDName == expectedAVDName
+	diagnostic := fmt.Sprintf(
+		"Android readiness incomplete: process_running=%t adb_ready=%t device_state=%q boot_completed=%t framework_ready=%t package_manager_ready=%t rooted=%t debuggable=%t identity_valid=%t avd_name=%q expected_avd_name=%q avd_matches=%t",
+		state.ProcessRunning,
+		state.ADBReady,
+		state.DeviceState,
+		state.BootCompleted,
+		state.FrameworkReady,
+		state.PackageManagerReady,
+		state.Identity.Rooted,
+		state.Identity.Debuggable,
+		identityValid,
+		state.Identity.AVDName,
+		expectedAVDName,
+		avdMatches,
+	)
+	if identityErr != nil {
+		diagnostic += fmt.Sprintf(" identity_error=%q", identityErr.Error())
+	}
+	return fmt.Errorf("%s", diagnostic)
 }
 
 type Backend interface {
@@ -53,10 +100,60 @@ type Backend interface {
 	Destroy(context.Context, Instance) error
 }
 
+// BackendInventory is optional and authoritative only for runtime identities
+// returned by the selected backend. A successful result must be complete.
+type BackendInventory interface {
+	ListRuntimeIDs(context.Context) ([]string, error)
+}
+
+// BackendUnstartedRecovery is implemented by backends whose authoritative
+// inventory includes a fully configured physical resource before its runtime
+// process starts. The method may start only an exact, durably planned resource
+// after proving its endpoint is unused; it returns true only when it started it.
+type BackendUnstartedRecovery interface {
+	ResumeUnstarted(context.Context, Instance) (bool, error)
+}
+
+func instanceFromPlan(plan VirtualDevicePlan) Instance {
+	return Instance{
+		RuntimeID: plan.Allocation.InstanceName, StateDirectory: plan.StateDirectory,
+		SystemImageDirectory: plan.SystemImageDirectory, Allocation: plan.Allocation,
+		Fingerprint: plan.Fingerprint, Resources: plan.Resources.Clone(), BaselineState: plan.BaselineState,
+		RequireHardwareAcceleration: plan.RequireHardwareAcceleration, Headless: plan.Headless,
+		Rooted: plan.Rooted, Debuggable: plan.Debuggable, GuestMemoryBytes: plan.GuestMemoryBytes, BootTimeout: plan.BootTimeout,
+	}
+}
+
+func instanceMatchesPlan(instance Instance, plan VirtualDevicePlan) bool {
+	return instancesEqual(instance, instanceFromPlan(plan))
+}
+
+func instancesEqual(left, right Instance) bool {
+	return left.RuntimeID != "" && left.RuntimeID == right.RuntimeID && left.Allocation == right.Allocation && left.Fingerprint.Compatible(right.Fingerprint) &&
+		filepath.Clean(left.StateDirectory) == filepath.Clean(right.StateDirectory) && filepath.Clean(left.SystemImageDirectory) == filepath.Clean(right.SystemImageDirectory) &&
+		resourcesEqual(left.Resources, right.Resources) && left.BaselineState == right.BaselineState &&
+		left.RequireHardwareAcceleration == right.RequireHardwareAcceleration && left.Headless == right.Headless &&
+		left.Rooted == right.Rooted && left.Debuggable == right.Debuggable && left.GuestMemoryBytes == right.GuestMemoryBytes && left.BootTimeout == right.BootTimeout
+}
+
+func resourcesEqual(left, right admission.Resources) bool {
+	if left.CPUMilli != right.CPUMilli || left.MemoryBytes != right.MemoryBytes || left.SwapBytes != right.SwapBytes || left.StorageBytes != right.StorageBytes || left.CaptureBytes != right.CaptureBytes || left.Inodes != right.Inodes || left.PIDs != right.PIDs || len(left.Devices) != len(right.Devices) {
+		return false
+	}
+	for name, value := range left.Devices {
+		if right.Devices[name] != value {
+			return false
+		}
+	}
+	return true
+}
+
 // BackendQuarantiner is optional because an attached external emulator cannot
-// be stopped or isolated without violating its ownership contract.
+// be stopped or isolated without violating its ownership contract. The stop
+// mode must be preserved so callers can select graceful, immediate, or forced
+// containment while still receiving the same complete containment proof.
 type BackendQuarantiner interface {
-	Quarantine(context.Context, Instance) (BackendQuarantineState, error)
+	Quarantine(context.Context, Instance, ports.StopMode) (BackendQuarantineState, error)
 }
 
 type BackendQuarantineState struct {
@@ -67,147 +164,43 @@ type BackendQuarantineState struct {
 	ObservedAt         time.Time
 }
 
-type CommandBackendConfig struct {
-	Runner         command.Runner
-	LaunchBinary   string
-	StopBinary     string
-	CVDBinary      string
-	ADBBinary      string
-	PollInterval   time.Duration
-	BackendVersion string
-	RuntimeVersion string
+// BackendStoppedAdopter live-verifies that a previously sealed containment
+// boundary still describes the exact preserved runtime, then registers that
+// stopped ownership in a fresh backend process. This is deliberately distinct
+// from Quarantine: reconciliation must never restart a tainted guest merely to
+// recover backend-local process bookkeeping.
+type BackendStoppedAdopter interface {
+	AdoptStopped(context.Context, Instance, BackendQuarantineState) (BackendQuarantineState, error)
 }
 
-type CommandBackend struct{ config CommandBackendConfig }
-
-func NewCommandBackend(config CommandBackendConfig) *CommandBackend {
-	if config.Runner == nil {
-		config.Runner = command.OS{}
-	}
-	if config.LaunchBinary == "" {
-		config.LaunchBinary = "launch_cvd"
-	}
-	if config.StopBinary == "" {
-		config.StopBinary = "stop_cvd"
-	}
-	if config.CVDBinary == "" {
-		config.CVDBinary = "cvd"
-	}
-	if config.ADBBinary == "" {
-		config.ADBBinary = "adb"
-	}
-	if config.PollInterval <= 0 {
-		config.PollInterval = 500 * time.Millisecond
-	}
-	return &CommandBackend{config: config}
+// BackendStoppedInspector live-proves that an unexpectedly stopped runtime is
+// still the exact plan-owned physical resource and registers its stopped
+// ownership in a fresh backend process. Unlike BackendStoppedAdopter, this
+// carries no prior quarantine authority: callers may use it only for
+// cleanup-only work or an already-durable interrupted-run recovery.
+type BackendStoppedInspector interface {
+	InspectStopped(context.Context, Instance) (BackendQuarantineState, error)
 }
 
-func (b *CommandBackend) Probe(ctx context.Context, _ ports.TargetTemplate) (BackendCapabilities, error) {
-	result, err := b.config.Runner.Run(ctx, command.Invocation{Program: b.config.CVDBinary, Args: []string{"version"}})
-	if err != nil {
-		return BackendCapabilities{}, err
+func validateStoppedAdoption(instance Instance, proof BackendQuarantineState) error {
+	if strings.TrimSpace(instance.RuntimeID) == "" || proof.RuntimeID != instance.RuntimeID || !proof.ExecutionStopped || !proof.NetworkUnreachable || !proof.StatePreserved || proof.ObservedAt.IsZero() {
+		return fmt.Errorf("stopped-runtime adoption requires exact complete containment evidence")
 	}
-	backendVersion := b.config.BackendVersion
-	if backendVersion == "" {
-		backendVersion = strings.TrimSpace(string(result.Stdout))
-	}
-	return BackendCapabilities{BackendKind: "cuttlefish", BackendVersion: backendVersion, RuntimeVersion: b.config.RuntimeVersion, KVM: true, KVMKnown: true, ResetModes: []ports.ResetMode{ports.ResetRecreate, ports.ResetBaseline}}, nil
-}
-
-func (b *CommandBackend) Create(_ context.Context, plan VirtualDevicePlan) (Instance, error) {
-	if err := os.MkdirAll(plan.StateDirectory, 0o700); err != nil {
-		return Instance{}, err
-	}
-	return Instance{RuntimeID: plan.Allocation.InstanceName, StateDirectory: plan.StateDirectory, SystemImageDirectory: plan.SystemImageDirectory, Allocation: plan.Allocation, Fingerprint: plan.Fingerprint}, nil
-}
-
-func (b *CommandBackend) Start(ctx context.Context, instance Instance) error {
-	_, err := b.config.Runner.Run(ctx, command.Invocation{Program: b.config.LaunchBinary, Args: []string{"--daemon", "--instance_dir=" + instance.StateDirectory, "--system_image_dir=" + instance.SystemImageDirectory, "--base_instance_num=" + strconv.Itoa(instance.Allocation.InstanceNumber)}})
-	return err
-}
-
-func (b *CommandBackend) WaitReady(ctx context.Context, instance Instance) (ReadinessState, error) {
-	for {
-		state, err := b.Inspect(ctx, instance)
-		if err == nil && state.Ready() {
-			return state, nil
-		}
-		select {
-		case <-ctx.Done():
-			return ReadinessState{}, ctx.Err()
-		case <-time.After(b.config.PollInterval):
-		}
-	}
-}
-
-func (b *CommandBackend) Inspect(ctx context.Context, instance Instance) (ReadinessState, error) {
-	state := ReadinessState{ProcessRunning: true, ObservedAt: time.Now().UTC()}
-	if _, err := b.runADB(ctx, instance, "get-state"); err != nil {
-		return state, err
-	}
-	state.ADBReady = true
-	boot, err := b.runADB(ctx, instance, "shell", "getprop", "sys.boot_completed")
-	if err != nil {
-		return state, err
-	}
-	state.BootCompleted = strings.TrimSpace(string(boot.Stdout)) == "1"
-	framework, err := b.runADB(ctx, instance, "shell", "getprop", "init.svc.bootanim")
-	if err != nil {
-		return state, err
-	}
-	state.FrameworkReady = strings.TrimSpace(string(framework.Stdout)) == "stopped"
-	return state, nil
-}
-
-func (b *CommandBackend) runADB(ctx context.Context, instance Instance, args ...string) (command.Result, error) {
-	return runExactSerialADB(ctx, b.config.Runner, b.config.ADBBinary, instance.Allocation.Serial, command.DefaultOutputLimit, args...)
-}
-
-func (b *CommandBackend) Stop(ctx context.Context, instance Instance, mode ports.StopMode) error {
-	args := []string{"--instance_dir=" + instance.StateDirectory}
-	if mode == ports.StopForce {
-		args = append(args, "--force")
-	}
-	_, err := b.config.Runner.Run(ctx, command.Invocation{Program: b.config.StopBinary, Args: args})
-	return err
-}
-
-func (b *CommandBackend) Destroy(ctx context.Context, instance Instance) error {
-	if err := b.Stop(ctx, instance, ports.StopForce); err != nil {
+	if err := validatePlannedEndpoint(instance.Allocation); err != nil {
 		return err
 	}
-	return os.RemoveAll(instance.StateDirectory)
+	return nil
 }
 
-func (b *CommandBackend) Quarantine(ctx context.Context, instance Instance) (BackendQuarantineState, error) {
-	state := BackendQuarantineState{RuntimeID: instance.RuntimeID, ObservedAt: time.Now().UTC()}
-	if strings.TrimSpace(instance.RuntimeID) == "" || strings.TrimSpace(instance.StateDirectory) == "" || !safeExactADBSerial(instance.Allocation.Serial) {
-		return state, domain.NewError(domain.CodeInvalidArgument, "cuttlefish.backend.quarantine", "instance", "runtime, state directory, and safe exact serial are required", nil)
+func validatePlannedEndpoint(allocation Allocation) error {
+	if err := allocation.Validate(); err != nil {
+		return err
 	}
-	if err := b.Stop(ctx, instance, ports.StopForce); err != nil {
-		return state, err
+	if strings.HasPrefix(allocation.Serial, "emulator-") {
+		_, err := allocation.EmulatorConsolePort()
+		return err
 	}
-	state.ExecutionStopped = true
-	probe, probeErr := b.runADB(ctx, instance, "get-state")
-	if probeErr == nil {
-		return state, domain.NewError(domain.CodeFailedPrecondition, "cuttlefish.backend.quarantine", "adb", "stopped exact device serial remains reachable", nil)
-	}
-	if err := ctx.Err(); err != nil {
-		return state, err
-	}
-	if !confirmedADBUnreachable(probe, probeErr) {
-		return state, domain.NewError(domain.CodeUnavailable, "cuttlefish.backend.quarantine", "adb", "ADB probe failed without confirming that the exact serial is unreachable", probeErr)
-	}
-	state.NetworkUnreachable = true
-	info, err := os.Stat(instance.StateDirectory)
-	if err != nil {
-		return state, err
-	}
-	if !info.IsDir() {
-		return state, fmt.Errorf("Cuttlefish state path is not a directory")
-	}
-	state.StatePreserved = true
-	return state, nil
+	return nil
 }
 
 func confirmedADBUnreachable(result command.Result, err error) bool {
@@ -222,6 +215,3 @@ func confirmedADBUnreachable(result command.Result, err error) bool {
 	}
 	return false
 }
-
-var _ Backend = (*CommandBackend)(nil)
-var _ BackendQuarantiner = (*CommandBackend)(nil)

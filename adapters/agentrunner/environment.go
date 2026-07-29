@@ -11,6 +11,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/application"
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
+	"github.com/philcantcode/go-world-management-layer/internal/research"
 	"github.com/philcantcode/go-world-management-layer/internal/transport"
 )
 
@@ -29,6 +30,9 @@ type Options struct {
 	ControlTimeout            time.Duration
 	HeartbeatInterval         time.Duration
 	ProtocolVersion           uint16
+	// ActionEvidence optionally records multi-dimensional action bundles for
+	// each Execute call. Nil disables capture (no-op).
+	ActionEvidence *research.Store
 }
 
 type Environment struct {
@@ -42,6 +46,7 @@ type Environment struct {
 	heartbeatInterval         time.Duration
 	protocolVersion           uint16
 	authorizedPolicyReference string
+	actionEvidence            *research.Store
 }
 
 func New(options Options) (*Environment, error) {
@@ -52,12 +57,12 @@ func New(options Options) (*Environment, error) {
 		options.ControlTimeout = 10 * time.Second
 	}
 	if options.HeartbeatInterval <= 0 {
-		options.HeartbeatInterval = 10 * time.Second
+		options.HeartbeatInterval = ports.DefaultExecHeartbeatInterval
 	}
 	if options.ProtocolVersion == 0 {
 		options.ProtocolVersion = EnvironmentProtocolVersion
 	}
-	return &Environment{core: options.Core, driver: options.Driver, leaseID: options.LeaseID, agentWorkspaceID: options.AgentWorkspaceID, agentGeneration: options.AgentGeneration, capabilityDigest: options.CapabilityDigest, authorizedPolicyReference: options.AuthorizedPolicyReference, controlTimeout: options.ControlTimeout, heartbeatInterval: options.HeartbeatInterval, protocolVersion: options.ProtocolVersion}, nil
+	return &Environment{core: options.Core, driver: options.Driver, leaseID: options.LeaseID, agentWorkspaceID: options.AgentWorkspaceID, agentGeneration: options.AgentGeneration, capabilityDigest: options.CapabilityDigest, authorizedPolicyReference: options.AuthorizedPolicyReference, controlTimeout: options.ControlTimeout, heartbeatInterval: options.HeartbeatInterval, protocolVersion: options.ProtocolVersion, actionEvidence: options.ActionEvidence}, nil
 }
 
 func (e *Environment) ID() string {
@@ -146,31 +151,47 @@ func (e *Environment) Execute(ctx context.Context, request Request) (Result, err
 	if err != nil {
 		return Result{}, err
 	}
+	// Begin failures are fail-open: marker recorded inside beginAction.
+	actionSession, _ := e.beginAction(ctx, starting, request)
 	execModel, err := domainExec(starting)
 	if err != nil {
-		return Result{}, err
+		return Result{}, e.finalizeWithActionEvidence(ctx, request, starting, domain.ExecFailed, err, actionSession, transport.ProcessLifecycle{})
 	}
 	start := transport.ExecStart{ExecID: starting.ID, IdempotencyKey: request.IdempotencyKey, Executable: starting.Executable, Argv: append([]string(nil), starting.Argv...), WorkingDirectory: starting.WorkingDirectory, Environment: cloneStringMap(request.Environment), TemporaryInputs: cloneTemporaryInputs(request.TemporaryInputs), Terminal: request.Terminal, Deadline: deadline, MaxOutputBytes: request.MaxOutputBytes, CleanupGrace: request.CleanupGrace}
 	stream, err := e.driver.OpenExec(ctx, ports.ExecPlan{LeaseID: e.leaseID, AgentWorkspaceID: e.agentWorkspaceID, AgentGeneration: e.agentGeneration, Exec: execModel, Start: start})
 	if err != nil {
-		return Result{}, e.finalizeFailure(ctx, request, starting, domain.ExecFailed, false, err)
+		return Result{}, e.finalizeWithActionEvidence(ctx, request, starting, domain.ExecFailed, err, actionSession, transport.ProcessLifecycle{})
 	}
 	defer stream.Close()
 	running, err := e.core.TransitionExec(ctx, application.TransitionExecRequest{Meta: e.meta(domain.DeriveIdempotencyKey(request.IdempotencyKey, "running"), request.CorrelationID, deadline), ExecID: starting.ID, ExpectedRevision: starting.Revision, State: domain.ExecRunning})
 	if err != nil {
-		return Result{}, e.finalizeFailure(ctx, request, starting, domain.ExecFailed, false, err)
+		return Result{}, e.finalizeWithActionEvidence(ctx, request, starting, domain.ExecFailed, errors.Join(err, stream.Close()), actionSession, transport.ProcessLifecycle{})
 	}
-	terminal, exchangeErr := exchange(ctx, stream, request, e.heartbeatInterval)
+	if actionSession != nil {
+		originalStdout, originalStderr := request.OnStdout, request.OnStderr
+		request.OnStdout = func(data []byte) error {
+			actionSession.AppendStdout(data)
+			if originalStdout != nil {
+				return originalStdout(data)
+			}
+			return nil
+		}
+		request.OnStderr = func(data []byte) error {
+			actionSession.AppendStderr(data)
+			if originalStderr != nil {
+				return originalStderr(data)
+			}
+			return nil
+		}
+	}
+	terminal, lifecycle, exchangeErr := exchange(ctx, stream, request, e.heartbeatInterval)
 	closeErr := stream.Close()
 	if exchangeErr != nil {
 		state := domain.ExecLost
 		if errors.Is(exchangeErr, context.Canceled) || errors.Is(exchangeErr, context.DeadlineExceeded) {
 			state = domain.ExecCancelled
 		}
-		if closeErr != nil {
-			exchangeErr = errors.Join(exchangeErr, closeErr)
-		}
-		return Result{}, e.finalizeFailure(ctx, request, running, state, false, exchangeErr)
+		return Result{}, e.finalizeWithActionEvidence(ctx, request, running, state, errors.Join(exchangeErr, closeErr), actionSession, lifecycle)
 	}
 	if closeErr != nil {
 		terminal.CleanupConfirmed = false
@@ -178,6 +199,8 @@ func (e *Environment) Execute(ctx context.Context, request Request) (Result, err
 			terminal.Error = closeErr.Error()
 		}
 	}
+	// Fail-open at API boundary: seal errors never fail a successful Execute.
+	_ = e.sealAction(ctx, actionSession, terminal, lifecycle)
 	state := domain.ExecCompleted
 	if terminal.ExitCode != 0 || terminal.Signal != "" || terminal.Error != "" {
 		state = domain.ExecFailed
@@ -193,7 +216,7 @@ func (e *Environment) Execute(ctx context.Context, request Request) (Result, err
 	}
 	result, resultErr := resultFromRecord(finalized)
 	if resultErr != nil {
-		return Result{}, resultErr
+		return result, resultErr
 	}
 	if state != domain.ExecCompleted {
 		return result, &ExecutionError{ExecID: finalized.ID, IncidentID: result.IncidentID, CleanupConfirmed: finalized.CleanupConfirmed, Cause: errors.New(terminal.Error)}
@@ -201,13 +224,81 @@ func (e *Environment) Execute(ctx context.Context, request Request) (Result, err
 	return result, nil
 }
 
-func exchange(ctx context.Context, stream ports.ExecTransport, request Request, heartbeatInterval time.Duration) (transport.Terminal, error) {
+func (e *Environment) beginAction(ctx context.Context, record application.ExecRecord, request Request) (*research.Session, error) {
+	if e.actionEvidence == nil {
+		return nil, nil
+	}
+	startedAt := record.CreatedAt
+	if startedAt.IsZero() {
+		startedAt = time.Now().UTC()
+	}
+	start := research.StartFromCommand(
+		record.ID, research.ActionScopeAgentExec, record.Executable, record.Argv, record.WorkingDirectory,
+		startedAt, research.ResolveObservationLevel(false, "", false),
+	)
+	start.LeaseID = record.LeaseID
+	start.ResearchSessionID = record.SessionID
+	start.AgentWorkspaceID = record.AgentWorkspaceID
+	start.AgentGeneration = record.AgentGeneration
+	start.ExecID = record.ID
+	start.CorrelationID = request.CorrelationID
+	start.IdempotencyKey = request.IdempotencyKey
+	start.EnvironmentKeys = research.EnvironmentKeys(request.Environment)
+	session, err := e.actionEvidence.Begin(ctx, start)
+	if err != nil {
+		e.actionEvidence.RecordBeginFailure(record.ID, research.ReasonBeginConflict)
+		// Callers fail-open and continue with a nil session.
+		return nil, fmt.Errorf("begin action evidence for %s: %w", record.ID, err)
+	}
+	return session, nil
+}
+
+func (e *Environment) sealAction(ctx context.Context, session *research.Session, terminal transport.Terminal, lifecycle transport.ProcessLifecycle) error {
+	if session == nil {
+		return nil
+	}
+	outcome := research.ActionOutcome{
+		EndedAt: time.Now().UTC(), Signal: terminal.Signal, Error: terminal.Error,
+		CleanupConfirmed: terminal.CleanupConfirmed,
+	}
+	if started := lifecycle.Started(); started != nil {
+		outcome.ProcessID = started.PID
+		outcome.ProcessStartNS = started.ProcessStartNS
+		outcome.ParentPID = started.ParentPID
+	}
+	if lifecycle.Started() != nil || terminal.CleanupConfirmed {
+		exit := terminal.ExitCode
+		outcome.ExitCode = &exit
+	}
+	sealCtx, cancel := actionEvidenceContext(ctx, e.controlTimeout)
+	defer cancel()
+	if _, err := session.Seal(sealCtx, outcome); err != nil {
+		return fmt.Errorf("seal action evidence for %s: %w", session.ActionID(), err)
+	}
+	return nil
+}
+
+func (e *Environment) finalizeWithActionEvidence(ctx context.Context, request Request, execution application.ExecRecord, state domain.ExecState, cause error, session *research.Session, lifecycle transport.ProcessLifecycle) error {
+	if cause == nil {
+		cause = errors.New("execution failed")
+	}
+	// Best-effort seal; never join seal errors into the execution cause.
+	_ = e.sealAction(ctx, session, transport.Terminal{Error: cause.Error(), CleanupConfirmed: false}, lifecycle)
+	return e.finalizeFailure(ctx, request, execution, state, false, cause)
+}
+
+func actionEvidenceContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
+}
+
+func exchange(ctx context.Context, stream ports.ExecTransport, request Request, heartbeatInterval time.Duration) (transport.Terminal, transport.ProcessLifecycle, error) {
 	inputContext, cancelInput := context.WithCancel(ctx)
 	defer cancelInput()
-	heartbeatContext, cancelHeartbeat := context.WithCancel(ctx)
-	defer cancelHeartbeat()
-	heartbeatDone := make(chan error, 1)
-	go sendHeartbeats(heartbeatContext, stream, heartbeatInterval, heartbeatDone)
+	stopHeartbeat := ports.MaintainExecHeartbeat(ctx, stream, heartbeatInterval)
+	defer stopHeartbeat()
 	inputDone := make(chan error, 1)
 	stdin := append([]byte(nil), request.Stdin...)
 	go func() {
@@ -226,26 +317,22 @@ func exchange(ctx context.Context, stream ports.ExecTransport, request Request, 
 		inputDone <- err
 	}()
 	var outputBytes int64
+	var lifecycle transport.ProcessLifecycle
 	for {
 		frame, err := stream.Receive(ctx)
 		if err != nil {
 			cancelInput()
-			cancelHeartbeat()
-			select {
-			case heartbeatErr := <-heartbeatDone:
-				if heartbeatErr != nil && !errors.Is(heartbeatErr, context.Canceled) {
-					return transport.Terminal{}, heartbeatErr
-				}
-			default:
+			if heartbeatErr := stopHeartbeat(); heartbeatErr != nil {
+				return transport.Terminal{}, lifecycle, heartbeatErr
 			}
-			return transport.Terminal{}, err
+			return transport.Terminal{}, lifecycle, err
 		}
 		frame.Data = append([]byte(nil), frame.Data...)
 		switch frame.Kind {
 		case transport.KindStdout, transport.KindStderr:
 			if int64(len(frame.Data)) > request.MaxOutputBytes-outputBytes {
 				cancelInput()
-				return transport.Terminal{}, transport.ErrOutputLimit
+				return transport.Terminal{}, lifecycle, transport.ErrOutputLimit
 			}
 			outputBytes += int64(len(frame.Data))
 			callback := request.OnStdout
@@ -255,58 +342,54 @@ func exchange(ctx context.Context, stream ports.ExecTransport, request Request, 
 			if callback != nil {
 				if err := callback(frame.Data); err != nil {
 					cancelInput()
-					return transport.Terminal{}, err
+					return transport.Terminal{}, lifecycle, err
+				}
+			}
+		case transport.KindProcess:
+			if err := lifecycle.Observe(frame); err != nil {
+				cancelInput()
+				return transport.Terminal{}, lifecycle, fmt.Errorf("process lifecycle: %w", err)
+			}
+			if request.OnControl != nil {
+				if err := request.OnControl(frame); err != nil {
+					cancelInput()
+					return transport.Terminal{}, lifecycle, err
 				}
 			}
 		case transport.KindTerminal:
 			terminal, err := transport.DecodeJSON[transport.Terminal](frame)
 			cancelInput()
-			cancelHeartbeat()
 			inputErr := <-inputDone
-			heartbeatErr := <-heartbeatDone
+			heartbeatErr := stopHeartbeat()
 			if inputErr != nil && !errors.Is(inputErr, context.Canceled) {
-				return transport.Terminal{}, inputErr
+				return transport.Terminal{}, lifecycle, inputErr
 			}
-			if heartbeatErr != nil && !errors.Is(heartbeatErr, context.Canceled) {
-				return transport.Terminal{}, heartbeatErr
+			if heartbeatErr != nil {
+				return transport.Terminal{}, lifecycle, heartbeatErr
 			}
 			if err != nil {
-				return transport.Terminal{}, err
+				return transport.Terminal{}, lifecycle, err
+			}
+			if err := lifecycle.ValidateTerminal(terminal); err != nil {
+				// Non-fatal for evidence: still return terminal; lifecycle PID may be partial.
+				_ = err
 			}
 			if request.OnControl != nil {
 				if err := request.OnControl(frame); err != nil {
-					return transport.Terminal{}, err
+					return transport.Terminal{}, lifecycle, err
 				}
 			}
-			return terminal, nil
+			return terminal, lifecycle, nil
 		default:
 			if request.OnControl != nil {
 				if err := request.OnControl(frame); err != nil {
 					cancelInput()
-					return transport.Terminal{}, err
+					return transport.Terminal{}, lifecycle, err
 				}
 			}
 			if frame.Kind == transport.KindError {
 				cancelInput()
-				return transport.Terminal{}, fmt.Errorf("guest protocol: %s", frame.Data)
-			}
-		}
-	}
-}
-
-func sendHeartbeats(ctx context.Context, stream ports.ExecTransport, interval time.Duration, done chan<- error) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			done <- ctx.Err()
-			return
-		case <-ticker.C:
-			if _, err := stream.Send(ctx, transport.KindHeartbeat, nil); err != nil {
-				done <- err
-				_ = stream.Close()
-				return
+				return transport.Terminal{}, lifecycle, fmt.Errorf("guest protocol: %s", frame.Data)
 			}
 		}
 	}

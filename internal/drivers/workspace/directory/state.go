@@ -278,7 +278,14 @@ func (d *Driver) loadRecords() error {
 	for _, entry := range entries {
 		workspaceID, parseErr := domain.ParseWorkspaceID(entry.Name())
 		if parseErr != nil {
-			continue
+			if isWorkspaceStagingName(entry.Name()) {
+				stagingPath := filepath.Join(d.root, entry.Name())
+				if err := removeStagingDirectory(d.root, stagingPath); err != nil {
+					return fmt.Errorf("remove incomplete workspace staging directory %q: %w", entry.Name(), err)
+				}
+				continue
+			}
+			return fmt.Errorf("workspace root contains unrecognized entry %q", entry.Name())
 		}
 		workspacePath := d.workspacePath(workspaceID)
 		if err := requireExactWorkspaceDirectory(d.root, workspacePath, workspaceID); err != nil {
@@ -290,6 +297,9 @@ func (d *Driver) loadRecords() error {
 		}
 		if record.WorkspaceID != workspaceID.String() {
 			return fmt.Errorf("workspace directory %s contains authority for %s", workspaceID, record.WorkspaceID)
+		}
+		if err := removeSnapshotStagingDirectories(workspacePath); err != nil {
+			return fmt.Errorf("recover workspace %s snapshot staging: %w", workspaceID, err)
 		}
 		if prior, duplicate := d.requests[record.IdempotencyKey]; duplicate && prior.workspaceID != workspaceID {
 			return fmt.Errorf("idempotency key %q is persisted for multiple workspaces", record.IdempotencyKey)
@@ -317,6 +327,9 @@ func (d *Driver) loadRecordIfPresent(workspaceID domain.WorkspaceID) (*diskRecor
 	}
 	if record.WorkspaceID != workspaceID.String() {
 		return nil, domain.NewError(domain.CodeIntegrityViolation, "workspace.directory.load", "workspace_id", "persisted authority does not match its directory", nil)
+	}
+	if err := removeSnapshotStagingDirectories(workspacePath); err != nil {
+		return nil, domain.NewError(domain.CodeIntegrityViolation, "workspace.directory.load", "snapshot_staging", "workspace contains invalid sealed-snapshot staging state", err)
 	}
 	return &record, nil
 }

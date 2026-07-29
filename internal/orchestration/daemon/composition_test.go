@@ -2,6 +2,9 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"io"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -9,6 +12,8 @@ import (
 	"time"
 
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
+	observerprocess "github.com/philcantcode/go-world-management-layer/internal/drivers/observer/process"
+	"github.com/philcantcode/go-world-management-layer/internal/drivers/target/cuttlefish"
 	"github.com/philcantcode/go-world-management-layer/internal/drivers/target/linuxcontainer"
 	"github.com/philcantcode/go-world-management-layer/internal/ledger"
 	"github.com/philcantcode/go-world-management-layer/internal/orchestration/policyauthority"
@@ -26,6 +31,91 @@ func requireDirectoryCopyCompositionHost(t *testing.T) {
 		t.Skip("directory-copy-non-production composition requires node.os.windows")
 	}
 }
+
+func TestManagedAndroidFactoryReleasesAllocatorAfterConstructionFailure(t *testing.T) {
+	config := managedAndroidFactoryTestConfig(t, "127.0.0.1:5037")
+	if _, err := newManagedAndroidTargetDriver(config, nil); err == nil || !strings.Contains(err.Error(), "collector gate") {
+		t.Fatalf("construction error = %v", err)
+	}
+	allocator, err := cuttlefish.NewDurableEmulatorAllocator(cuttlefish.DurableEmulatorAllocatorConfig{
+		StateRoot: filepath.Join(config.TargetRoot, "allocations"), FirstConsolePort: config.FirstConsolePort,
+		LastConsolePort: cuttlefish.ManagedEmulatorMaxConsolePort, ListenHost: "127.0.0.1",
+	})
+	if err != nil {
+		t.Fatalf("construction failure leaked durable allocator ownership: %v", err)
+	}
+	if err := allocator.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProductionCompositionFactoryBuildsCompleteManagedAndroidDriver(t *testing.T) {
+	readiness := cuttlefish.CollectorReadinessFunc(func(context.Context, domain.TargetRunID, []ports.ObservationRequirement) error {
+		return nil
+	})
+	driver, err := productionCompositionFactories().newAndroid(managedAndroidFactoryTestConfig(t, "127.0.0.1:5037"), readiness)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closer, ok := driver.(io.Closer)
+	if !ok {
+		t.Fatal("production managed Android driver does not implement io.Closer")
+	}
+	if _, ok := driver.(ports.TargetReconciler); !ok {
+		t.Fatal("production managed Android driver does not implement ports.TargetReconciler")
+	}
+	if _, ok := driver.(ports.TargetRunCrashReconciler); !ok {
+		t.Fatal("production managed Android driver does not implement ports.TargetRunCrashReconciler")
+	}
+	if _, ok := driver.(ports.TargetPhysicalPolicyReporter); !ok {
+		t.Fatal("production managed Android driver does not implement ports.TargetPhysicalPolicyReporter")
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatalf("close production managed Android driver: %v", err)
+	}
+}
+
+func managedAndroidFactoryTestConfig(t *testing.T, adbServer string) androidTargetDriverConfig {
+	t.Helper()
+	digest := domain.NewDigest([]byte("managed-android-image"))
+	toolRoot := t.TempDir()
+	emulatorBinary := filepath.Join(toolRoot, "emulator")
+	if runtime.GOOS == "windows" {
+		emulatorBinary += ".exe"
+	}
+	if err := os.WriteFile(emulatorBinary, []byte("managed Android emulator test executable\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return androidTargetDriverConfig{
+		TargetRoot: t.TempDir(), SystemImageRoot: t.TempDir(), SDKRoot: t.TempDir(),
+		ADBBinary: filepath.Join(toolRoot, "adb"), ADBServer: adbServer,
+		EmulatorBinary: emulatorBinary, SDKManagerBinary: filepath.Join(toolRoot, "sdkmanager"),
+		AVDManagerBinary: filepath.Join(toolRoot, "avdmanager"), BackendVersion: "emulator-1", RuntimeVersion: "android-35",
+		FirstConsolePort: cuttlefish.ManagedEmulatorMinConsolePort, MaximumTransferBytes: 1 << 20, MaximumADBBytes: 1 << 20, ShutdownTimeout: time.Second,
+		SystemImages: map[string]string{digest.String(): "system-images;android-35;google_apis;x86_64"},
+	}
+}
+
+func TestCloseResourceOnConstructionFailureJoinsCloseError(t *testing.T) {
+	constructionErr := errors.New("construct driver")
+	closeErr := errors.New("release allocator lock")
+	closeCalls := 0
+	resource := closeFunc(func() error {
+		closeCalls++
+		return closeErr
+	})
+	resultErr := closeResourceOnConstructionFailure(constructionErr, resource, "close test resource")
+	if !errors.Is(resultErr, constructionErr) || !errors.Is(resultErr, closeErr) || closeCalls != 1 {
+		t.Fatalf("joined construction error = %v; close calls = %d", resultErr, closeCalls)
+	}
+	if resultErr := closeResourceOnConstructionFailure(nil, resource, "close test resource"); resultErr != nil || closeCalls != 1 {
+		t.Fatalf("successful construction closed transferred resource: error=%v calls=%d", resultErr, closeCalls)
+	}
+}
+
+type closeFunc func() error
+
+func (f closeFunc) Close() error { return f() }
 
 func TestConfigureHostDriversUsesProfileAndProbesWithoutDocker(t *testing.T) {
 	requireDirectoryCopyCompositionHost(t)
@@ -203,7 +293,7 @@ func TestConfigureHostDriversComposesProbedExternalObserver(t *testing.T) {
 		Readiness:    observerReadinessProfile{Program: filepath.Join(t.TempDir(), "trusted-ready"), Args: []string{"--ready"}, Interval: "10ms"},
 		MaximumBytes: 64 << 10,
 	}
-	configurationDigest, err := observerConfigurationDigest(observer, 10*time.Millisecond)
+	configurationDigest, err := observerprocess.ConfigurationDigest(observerAdapterConfiguration(observer, 10*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,6 +450,54 @@ func TestParseConfigActivatesPhysicalDriverFlags(t *testing.T) {
 	}
 }
 
+func TestParseConfigActivatesManagedAndroidDriver(t *testing.T) {
+	for name, value := range map[string]string{
+		"WORLD_ALLOW_REMOTE_ADB": "false", "WORLD_TARGET_ALLOW_PTRACE": "false",
+		"WORLD_PHYSICAL_TARGET_DRIVER": "none", "WORLD_CAPTURE_DRIVER": "none", "WORLD_MATERIAL_DRIVER": "local",
+	} {
+		t.Setenv(name, value)
+	}
+	profilePath := filepath.Join(t.TempDir(), "deployment.json")
+	androidRoot, imageRoot, sdkRoot := t.TempDir(), t.TempDir(), t.TempDir()
+	configuration, err := parseConfig([]string{
+		"-state", filepath.Join(t.TempDir(), "state.db"), "-ledger-dir", t.TempDir(),
+		"-orchestration-state-dir", t.TempDir(), "-bundle-dir", t.TempDir(), "-material-dir", t.TempDir(),
+		"-listen", "127.0.0.1:0", "-unix-socket", "", "-agent-driver", "docker", "-workspace-driver", "directory",
+		"-deployment-profile", profilePath, "-agent-workspace-root", t.TempDir(),
+		"-android-target-driver", "android-emulator", "-android-target-root", androidRoot,
+		"-android-system-image-root", imageRoot, "-android-adb-binary", `C:\Android\adb.exe`,
+		"-android-sdk-root", sdkRoot, "-android-sdkmanager-binary", `C:\Android\sdkmanager.bat`,
+		"-android-avdmanager-binary", `C:\Android\avdmanager.bat`,
+		"-android-emulator-binary", `C:\Android\emulator.exe`, "-android-backend-version", "36.3.10",
+		"-android-runtime-version", "aosp-35", "-android-adb-base-port", "5554",
+	}, ModeController)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configuration.androidTargetDriver != "android-emulator" || configuration.androidTargetRoot != androidRoot ||
+		configuration.androidSystemImageRoot != imageRoot || configuration.androidSDKRoot != sdkRoot || configuration.androidADBBasePort != 5554 {
+		t.Fatalf("Android flags were not retained: %#v", configuration)
+	}
+	for _, unsupported := range []int{
+		cuttlefish.ManagedEmulatorMinConsolePort - 2,
+		cuttlefish.ManagedEmulatorMinConsolePort + 1,
+		cuttlefish.ManagedEmulatorMaxConsolePort + 2,
+	} {
+		invalid := configuration
+		invalid.androidADBBasePort = unsupported
+		if err := invalid.validate(); err == nil || !strings.Contains(err.Error(), "5554") || !strings.Contains(err.Error(), "5584") {
+			t.Fatalf("unsupported Android console port %d error = %v", unsupported, err)
+		}
+	}
+	for _, endpoint := range []string{"localhost:5037", "192.0.2.1:5037", "127.0.0.1:0", " 127.0.0.1:5037"} {
+		invalid := configuration
+		invalid.androidADBServer = endpoint
+		if err := invalid.validate(); err == nil || !strings.Contains(err.Error(), "android-adb-server") {
+			t.Fatalf("unsupported Android ADB endpoint %q error = %v", endpoint, err)
+		}
+	}
+}
+
 func physicalTestConfig(t *testing.T, fixture profileFixture, withTarget bool) config {
 	t.Helper()
 	value := baseTestConfig()
@@ -394,6 +532,9 @@ func baseTestConfig() config {
 		materialDriver: "local", androidTargetDriver: "none", physicalTargetDriver: "none",
 		observerDriver: "none", captureDriver: "none", dockerBinary: "docker", agentGuestBinary: "/usr/local/bin/world-guest",
 		agentContainerUser: "65532:65532",
+		androidADBBinary:   "adb", androidADBServer: "127.0.0.1:5037", androidEmulatorBinary: "emulator",
+		androidSDKManagerBinary: "sdkmanager", androidAVDManagerBinary: "avdmanager",
+		androidADBBasePort: 5554,
 	}
 }
 
@@ -566,7 +707,7 @@ func testTargetPhysicalReport(template ports.TargetTemplate) ports.TargetPhysica
 		CommandAuthority: "arbitrary-inside-assigned-target", ExecTransport: "direct-argv-and-explicit-shell",
 		FileTransfer: "push-pull-target-relative", NetworkEndpoints: "none",
 		DeniedInfrastructureAuthority: []string{"host-exec", "docker-api", "host-mounts", "other-targets"},
-		ResetAfterEveryRun:            false, ResetMode: "recreate-new-target-generation",
+		ResetAfterEveryRun:            true, ResetMode: "recreate-new-target-generation",
 		InteractionSupport: ports.PhysicalSupportEnforced, ResetSupport: ports.PhysicalSupportEnforced,
 		Resources: nonProductionTargetResourceFacts(),
 	}

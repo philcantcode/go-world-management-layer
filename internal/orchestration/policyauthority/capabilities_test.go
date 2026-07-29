@@ -2,6 +2,7 @@ package policyauthority
 
 import (
 	"testing"
+	"time"
 
 	"github.com/philcantcode/go-world-management-layer/internal/admission"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
@@ -45,6 +46,35 @@ func TestBuildCapabilityFingerprintPreservesComponentsWithoutInventingFilesystem
 		capability, found := first.Capability(name)
 		if !found || capability.Status() != expected {
 			t.Fatalf("capability %q = %#v, found=%t, want %s", name, capability, found, expected)
+		}
+	}
+}
+
+func TestBuildCapabilityFingerprintDerivesManagedAndroidPolicyVocabulary(t *testing.T) {
+	virtual := supportedCapability(t, map[string]string{"hardware_acceleration": "true"})
+	android, err := policy.NewCapabilityFingerprint(
+		map[string]policy.Capability{"target.android-virtual": virtual},
+		map[string]string{"managed": "true", "os": "android"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := BuildCapabilityFingerprint(CapabilityFacts{
+		HostOS: "windows", HostArchitecture: "amd64", WorkspaceMode: "directory-copy-non-production", DirectoryCopy: true,
+		Components:        []CapabilityComponent{{Name: "android-target", Fingerprint: android}},
+		IntrinsicCoverage: map[string][]string{"android-virtual-device": {ports.TargetLifecycleSignal}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"target.kind.android-virtual-device", "runtime.driver.android-emulator",
+		"runtime.isolation.instrumented-android", "android.hardware-acceleration",
+		"coverage.android-virtual-device.target.lifecycle",
+	} {
+		capability, found := fingerprint.Capability(name)
+		if !found || capability.Status() != policy.CapabilitySupported {
+			t.Fatalf("managed Android capability %q = %#v, found=%t", name, capability, found)
 		}
 	}
 }
@@ -108,6 +138,40 @@ func TestTargetConfiguredResourcesPopulateAdmissionWithoutChangingCapabilityIden
 	}
 	if before.Digest() != after.Digest() {
 		t.Fatal("configured quota values changed the backend capability fingerprint")
+	}
+}
+
+func TestAndroidTemplateGuestMemoryAndBootTimeoutDoNotChangePhysicalCapabilityIdentity(t *testing.T) {
+	report := ports.TargetPhysicalPolicyReport{
+		Template: "android-short-boot", Kind: "android_virtual_device",
+		Android: ports.AndroidRuntimePhysicalFacts{
+			SystemImageDigest: "sha256:image", BaselineState: ports.AndroidBaselineCleanBoot,
+			HardwareAcceleration: true, HardwareAccelerationSupport: ports.PhysicalSupportEnforced,
+			Headless: true, Rooted: true, Debuggable: true, GuestMemoryBytes: 2 << 30, BootTimeout: time.Minute,
+		},
+	}
+	short, err := TargetPhysicalPolicyFingerprint(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report.Template = "android-long-boot"
+	report.Android.SystemImageDigest = "sha256:other-image"
+	report.Android.GuestMemoryBytes = 3 << 30
+	report.Android.BootTimeout = 5 * time.Minute
+	long, err := TargetPhysicalPolicyFingerprint(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if short.Digest() != long.Digest() {
+		t.Fatal("per-template Android image, guest memory, or boot deadline changed the backend physical fingerprint")
+	}
+	report.Android.HardwareAccelerationSupport = ports.PhysicalSupportUnsupported
+	changed, err := TargetPhysicalPolicyFingerprint(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if short.Digest() == changed.Digest() {
+		t.Fatal("an Android backend enforcement change did not change the physical fingerprint")
 	}
 }
 

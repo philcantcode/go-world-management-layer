@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"sort"
 	"strconv"
 	"sync"
@@ -44,6 +43,7 @@ type Adapter struct {
 	SignalFamily        string
 	Placement           domain.CollectorPlacement
 	CoverageLevel       domain.CoverageLevel
+	RuntimeBinding      RuntimeBinding
 	Program             string
 	Args                []string
 	Environment         map[string]string
@@ -55,7 +55,10 @@ func (a Adapter) Validate() error {
 	if a.Name == "" || a.Version == "" || a.ConfigurationDigest.IsZero() || a.SignalFamily == "" || !a.Placement.IsValid() || !a.CoverageLevel.IsValid() || a.CoverageLevel == domain.CoverageLevelUnknown || a.Program == "" || a.Readiness == nil {
 		return fmt.Errorf("observer adapter requires identity, version, configuration digest, signal, placement, concrete coverage, program, and readiness")
 	}
-	return nil
+	if err := validateConfiguredEnvironment(a.Environment); err != nil {
+		return err
+	}
+	return validateAdapterRuntimeBinding(a)
 }
 
 // OutputCapture is an authority-owned, collector-scoped evidence transaction.
@@ -114,6 +117,7 @@ type record struct {
 	waitErr           error
 	stdoutErr         error
 	stderrErr         error
+	stopPrepared      bool
 	stopRequested     bool
 	unexpectedExit    bool
 	teardownConfirmed bool
@@ -196,18 +200,28 @@ func (d *Driver) Probe(ctx context.Context, requirement ports.ObservationRequire
 		if adapter.SignalFamily != requirement.SignalFamily || adapter.Placement != requirement.Placement {
 			continue
 		}
-		result, err := d.runner.Run(ctx, command.Invocation{Program: adapter.Program, Args: adapter.VersionArgs})
+		result, err := d.runner.Run(ctx, command.Invocation{
+			Program: adapter.Program, Args: adapter.VersionArgs,
+			Environment: serializedEnvironment(trustedRuntimeEnvironment(adapter.Environment)),
+		})
 		status := domain.CapabilitySupported
 		reason := "probe succeeded"
 		if err != nil {
 			status = domain.CapabilityUnsupported
 			reason = err.Error()
 		}
-		capability, createErr := domain.NewCapability(status, map[string]string{"placement": string(adapter.Placement), "coverage": string(adapter.CoverageLevel)}, map[string]string{"reason": reason})
+		capability, createErr := domain.NewCapability(status, map[string]string{
+			"placement": string(adapter.Placement), "coverage": string(adapter.CoverageLevel),
+			"version": adapter.Version, "configuration_digest": adapter.ConfigurationDigest.String(),
+			"runtime_binding": adapter.RuntimeBinding.String(),
+		}, map[string]string{"reason": reason})
 		if createErr != nil {
 			return domain.CapabilityFingerprint{}, createErr
 		}
 		capabilities["observer."+adapter.Name] = capability
+		evidence[adapter.Name+".configuration_digest"] = adapter.ConfigurationDigest.String()
+		evidence[adapter.Name+".configured_version"] = adapter.Version
+		evidence[adapter.Name+".runtime_binding"] = adapter.RuntimeBinding.String()
 		if len(result.Stdout) > 0 {
 			evidence[adapter.Name+".version"] = boundedText(result.Stdout, 512)
 		}
@@ -240,6 +254,10 @@ func (d *Driver) Start(ctx context.Context, plan ports.CollectorPlan) (ports.Col
 	if adapter.Version != plan.Version || adapter.ConfigurationDigest != plan.ConfigurationDigest {
 		return ports.Collector{}, domain.NewError(domain.CodeIntegrityViolation, operation, "adapter", "version or configuration digest differs from the authorized plan", nil)
 	}
+	arguments, err := bindRuntimeArguments(adapter.RuntimeBinding, adapter.Args, plan)
+	if err != nil {
+		return ports.Collector{}, domain.NewError(domain.CodeIntegrityViolation, operation, "attachment", "target runtime binding is invalid", err)
+	}
 
 	// Serializing starts prevents duplicate processes while an idempotent start
 	// is still crossing the readiness boundary. Other driver operations remain
@@ -269,7 +287,7 @@ func (d *Driver) Start(ctx context.Context, plan ports.CollectorPlan) (ports.Col
 			abortErr,
 		)
 	}
-	invocation := command.Invocation{Program: adapter.Program, Args: append([]string(nil), adapter.Args...), Environment: observerEnvironment(adapter.Environment, plan)}
+	invocation := command.Invocation{Program: adapter.Program, Args: arguments, Environment: observerEnvironment(adapter.Environment, plan)}
 	process, err := d.starter.Start(ctx, invocation)
 	if err != nil {
 		cleanupErr := d.abortBeforeSupervision(capture, stdout, stderr)
@@ -383,7 +401,7 @@ func (d *Driver) supervise(record *record, stdoutReader, stderrReader io.ReadClo
 	close(record.exited)
 	record.mu.Lock()
 	record.waitErr = waitErr
-	if !record.stopRequested {
+	if !record.stopPrepared && !record.stopRequested {
 		record.unexpectedExit = true
 	}
 	record.mu.Unlock()
@@ -407,6 +425,49 @@ func wrapStreamError(stream, action string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("collector %s %s: %w", stream, action, err)
+}
+
+// PrepareStop arms a boundary before the target is torn down. The collector
+// remains running; if target teardown closes its stream before Stop commits,
+// that exit is deliberate rather than a coverage failure.
+func (d *Driver) PrepareStop(ctx context.Context, id domain.CollectorID) error {
+	return d.setStopPreparation(ctx, id, true, "observer.process.prepare_stop")
+}
+
+// CancelStopPreparation rolls back an uncommitted boundary. An observer that
+// exited while the boundary was armed is then classified as unexpected.
+func (d *Driver) CancelStopPreparation(ctx context.Context, id domain.CollectorID) error {
+	return d.setStopPreparation(ctx, id, false, "observer.process.cancel_stop_preparation")
+}
+
+func (d *Driver) setStopPreparation(ctx context.Context, id domain.CollectorID, prepared bool, operation string) error {
+	if err := ports.RequireDeadline(ctx, operation); err != nil {
+		return err
+	}
+	record, err := d.requireRecord(id)
+	if err != nil {
+		return err
+	}
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	// Once Stop owns an attempt, preparation has been committed and cannot be
+	// rolled back by a racing coordinator retry.
+	if record.attempt != nil || record.stopRequested || record.teardownConfirmed || record.result != nil {
+		return nil
+	}
+	alreadyExited := channelClosed(record.exited)
+	if prepared {
+		if alreadyExited && !record.stopPrepared {
+			record.unexpectedExit = true
+		}
+		record.stopPrepared = true
+		return nil
+	}
+	record.stopPrepared = false
+	if alreadyExited {
+		record.unexpectedExit = true
+	}
+	return nil
 }
 
 func (d *Driver) Stop(ctx context.Context, id domain.CollectorID) (ports.CollectorResult, error) {
@@ -530,19 +591,29 @@ func (d *Driver) ensureTeardown(ctx context.Context, record *record) error {
 		return nil
 	}
 	alreadyExited := channelClosed(record.exited)
-	if alreadyExited && !record.stopRequested {
+	if alreadyExited && !record.stopPrepared && !record.stopRequested {
 		record.unexpectedExit = true
 	}
+	record.stopPrepared = false
 	record.stopRequested = true
 	record.mu.Unlock()
 
 	var lifecycleErr error
 	if !alreadyExited {
 		if err := record.process.Signal(os.Interrupt); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			lifecycleErr = errors.Join(lifecycleErr, fmt.Errorf("signal collector: %w", err))
 			if killErr := record.process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
-				lifecycleErr = errors.Join(lifecycleErr, fmt.Errorf("kill collector after signal failure: %w", killErr))
+				lifecycleErr = errors.Join(lifecycleErr,
+					fmt.Errorf("signal collector: %w", err),
+					fmt.Errorf("kill collector after signal failure: %w", killErr),
+				)
 			}
+		}
+	} else if hasCollectorContainment(record.process) {
+		// A direct collector can exit after creating a descendant that does not
+		// keep either output pipe open. Its Job remains the authority, so an
+		// observed direct exit never exempts the tree from termination.
+		if err := record.process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			lifecycleErr = errors.Join(lifecycleErr, fmt.Errorf("kill collector process tree after direct exit: %w", err))
 		}
 	}
 
@@ -564,6 +635,22 @@ func (d *Driver) ensureTeardown(ctx context.Context, record *record) error {
 	}
 	if !confirmed {
 		err := domain.NewError(domain.CodeUnavailable, "observer.process.stop", "cleanup", "collector process and output stream teardown could not be confirmed", ctx.Err())
+		record.mu.Lock()
+		record.lifecycleErr = errors.Join(record.lifecycleErr, err, lifecycleErr)
+		record.mu.Unlock()
+		return errors.Join(err, lifecycleErr)
+	}
+	cleanupContext := ctx
+	cancelCleanup := func() {}
+	if ctx.Err() != nil {
+		cleanupContext, cancelCleanup = context.WithTimeout(context.Background(), d.cleanupGrace)
+	}
+	containmentConfirmed, containmentErr := confirmAndCloseCollectorContainment(cleanupContext, record.process)
+	cleanupCause := cleanupContext.Err()
+	cancelCleanup()
+	lifecycleErr = errors.Join(lifecycleErr, containmentErr)
+	if !containmentConfirmed {
+		err := domain.NewError(domain.CodeUnavailable, "observer.process.stop", "cleanup", "collector process-tree teardown could not be confirmed", cleanupCause)
 		record.mu.Lock()
 		record.lifecycleErr = errors.Join(record.lifecycleErr, err, lifecycleErr)
 		record.mu.Unlock()
@@ -612,7 +699,7 @@ func (d *Driver) Coverage(ctx context.Context, id domain.CollectorID) (domain.Co
 	}
 	if channelClosed(record.exited) {
 		record.mu.Lock()
-		if !record.stopRequested {
+		if !record.stopPrepared && !record.stopRequested {
 			record.unexpectedExit = true
 		}
 		unexpected := record.unexpectedExit
@@ -645,20 +732,19 @@ func (d *Driver) Coverage(ctx context.Context, id domain.CollectorID) (domain.Co
 	return coverage, nil
 }
 
-// InterruptedCollectorCleanupGuaranteed is true only for the built-in Linux
-// starter and only for its directly spawned collector process. A custom starter
-// is opaque to this driver and therefore cannot be treated as carrying the
-// daemon-parent death invariant. Adapters with independently surviving
-// descendants require external process-tree containment.
+// InterruptedCollectorCleanupGuaranteed is true for the built-in Linux starter
+// after its direct-child parent-death invariant is installed, and for the
+// built-in Windows starter only after its atomic per-collector Job preflight.
+// A custom starter is opaque and can never claim either invariant.
 func (d *Driver) InterruptedCollectorCleanupGuaranteed() bool {
 	return d.crashCleanupGuaranteed
 }
 
-// ReconcileInterruptedCollectors proves that each directly spawned collector
-// owned by a previous daemon cannot still be alive. On dedicated Linux hosts
-// the kernel delivers SIGKILL when the daemon parent dies; other platforms and
-// custom starters fail closed because this process has no authoritative handle
-// for the old child. This is not proof that daemonized descendants are dead.
+// ReconcileInterruptedCollectors proves that collectors owned by a previous
+// daemon cannot still be alive. Linux proves its directly spawned process with
+// PDEATHSIG. Windows proves the complete collector tree because daemon death
+// closes the sole KILL_ON_JOB_CLOSE handle. Other platforms and custom starters
+// fail closed.
 func (d *Driver) ReconcileInterruptedCollectors(ctx context.Context, request ports.InterruptedCollectorReconciliation) (ports.InterruptedCollectorReconciliationReport, error) {
 	const operation = "observer.process.reconcile_interrupted"
 	if err := ports.RequireDeadline(ctx, "observer.process.reconcile_interrupted"); err != nil {
@@ -668,7 +754,7 @@ func (d *Driver) ReconcileInterruptedCollectors(ctx context.Context, request por
 		return ports.InterruptedCollectorReconciliationReport{}, err
 	}
 	if !d.crashCleanupGuaranteed {
-		return ports.InterruptedCollectorReconciliationReport{}, domain.NewError(domain.CodeCapabilityUnavailable, operation, "collector_cleanup", "direct collector-process death after controller loss cannot be proven", nil)
+		return ports.InterruptedCollectorReconciliationReport{}, domain.NewError(domain.CodeCapabilityUnavailable, operation, "collector_cleanup", "collector cleanup after controller loss cannot be proven", nil)
 	}
 	report, err := d.outputs.ReconcileInterruptedRun(ctx, request)
 	if err != nil {
@@ -695,7 +781,7 @@ func (d *Driver) requireRecord(id domain.CollectorID) (*record, error) {
 
 func (d *Driver) rollbackStart(record *record) error {
 	var cleanupErr error
-	if !channelClosed(record.exited) {
+	if !channelClosed(record.exited) || hasCollectorContainment(record.process) {
 		if err := record.process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("kill failed collector start: %w", err))
 		}
@@ -712,6 +798,11 @@ func (d *Driver) rollbackStart(record *record) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), d.cleanupGrace)
 	defer cancel()
+	containmentConfirmed, containmentErr := confirmAndCloseCollectorContainment(ctx, record.process)
+	cleanupErr = errors.Join(cleanupErr, containmentErr)
+	if !containmentConfirmed {
+		cleanupErr = errors.Join(cleanupErr, errors.New("failed collector start process-tree teardown was not confirmed"))
+	}
 	if err := record.capture.Abort(ctx); err != nil {
 		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("abort failed collector evidence: %w", err))
 	}
@@ -743,6 +834,13 @@ func (d *Driver) abortInvalidProcess(process command.Process, capture OutputCapt
 		timer.Stop()
 	case <-timer.C:
 		cleanupErr = errors.Join(cleanupErr, errors.New("invalid collector process teardown was not confirmed"))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), d.cleanupGrace)
+	defer cancel()
+	containmentConfirmed, containmentErr := confirmAndCloseCollectorContainment(ctx, process)
+	cleanupErr = errors.Join(cleanupErr, containmentErr)
+	if !containmentConfirmed {
+		cleanupErr = errors.Join(cleanupErr, errors.New("invalid collector process-tree teardown was not confirmed"))
 	}
 	return errors.Join(cleanupErr, d.abortUnstartedCapture(capture))
 }
@@ -827,7 +925,7 @@ func newCoverage(plan ports.CollectorPlan, level domain.CoverageLevel, status do
 }
 
 func observerEnvironment(base map[string]string, plan ports.CollectorPlan) []string {
-	values := cloneMap(base)
+	values := trustedRuntimeEnvironment(base)
 	values["WORLD_COLLECTOR_ID"] = plan.CollectorID.String()
 	values["WORLD_RESEARCH_SESSION_ID"] = plan.ResearchSessionID.String()
 	values["WORLD_LEASE_ID"] = plan.LeaseID.String()
@@ -839,6 +937,26 @@ func observerEnvironment(base map[string]string, plan ports.CollectorPlan) []str
 	values["WORLD_TARGET_KIND"] = string(plan.Attachment.TargetKind)
 	values["WORLD_TARGET_RUNTIME_ID"] = plan.Attachment.RuntimeID
 	values["WORLD_MAXIMUM_BYTES"] = strconv.FormatInt(plan.MaximumBytes, 10)
+	return serializedEnvironment(values)
+}
+
+func trustedRuntimeEnvironment(base map[string]string) map[string]string {
+	values := cloneMap(base)
+	// Adapter validation rejects these names. Deleting them as well ensures
+	// the platform-owned canonical spelling wins even if a future internal
+	// caller bypasses construction validation.
+	for name := range values {
+		if isPlatformRuntimeEnvironmentName(name) {
+			delete(values, name)
+		}
+	}
+	for name, value := range platformRuntimeEnvironment() {
+		values[name] = value
+	}
+	return values
+}
+
+func serializedEnvironment(values map[string]string) []string {
 	names := make([]string, 0, len(values))
 	for name := range values {
 		names = append(names, name)
@@ -897,52 +1015,5 @@ func (detachedStarter) Start(ctx context.Context, invocation command.Invocation)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	cmd := exec.Command(invocation.Program, append([]string(nil), invocation.Args...)...)
-	configureCollectorParentDeathSignal(cmd)
-	cmd.Dir = invocation.Directory
-	if invocation.Environment != nil {
-		cmd.Env = append([]string(nil), invocation.Environment...)
-	}
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		_ = stdin.Close()
-		return nil, err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		_ = stdin.Close()
-		_ = stdout.Close()
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		_ = stdin.Close()
-		_ = stdout.Close()
-		_ = stderr.Close()
-		return nil, err
-	}
-	process := &detachedProcess{cmd: cmd, stdin: stdin, stdout: stdout, stderr: stderr}
-	if err := ctx.Err(); err != nil {
-		_ = process.Kill()
-		_ = process.Wait()
-		return nil, err
-	}
-	return process, nil
+	return startDetachedCollector(ctx, invocation)
 }
-
-type detachedProcess struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	stderr io.ReadCloser
-}
-
-func (p *detachedProcess) Stdin() io.WriteCloser         { return p.stdin }
-func (p *detachedProcess) Stdout() io.ReadCloser         { return p.stdout }
-func (p *detachedProcess) Stderr() io.ReadCloser         { return p.stderr }
-func (p *detachedProcess) Wait() error                   { return p.cmd.Wait() }
-func (p *detachedProcess) Signal(signal os.Signal) error { return p.cmd.Process.Signal(signal) }
-func (p *detachedProcess) Kill() error                   { return p.cmd.Process.Kill() }

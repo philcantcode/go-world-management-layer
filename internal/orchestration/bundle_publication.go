@@ -314,7 +314,7 @@ func validateBundleReservation(reservation bundleReservation) error {
 
 func validBundleFinalizationNamespace(namespace string) bool {
 	switch namespace {
-	case "stop_target_run", "start_target_run_rollback", "lease_termination_run", "startup_run_recovery":
+	case "stop_target_run", "start_target_run_rollback", "lease_termination_run", "startup_run_recovery", "quarantine_target_run":
 		return true
 	default:
 		return false

@@ -30,6 +30,9 @@ type RuntimeState struct {
 	ID            string
 	Name          string
 	Running       bool
+	Paused        bool
+	Restarting    bool
+	Dead          bool
 	Status        string
 	Labels        map[string]string
 	CgroupID      string
@@ -130,8 +133,8 @@ func (r *DockerRuntime) Create(ctx context.Context, plan ContainerPlan) (string,
 		return "", err
 	}
 	id := strings.TrimSpace(string(result.Stdout))
-	if id == "" {
-		return "", fmt.Errorf("Docker create returned an empty container ID")
+	if err := dockercli.RequireCanonicalContainerID(id); err != nil {
+		return "", fmt.Errorf("Docker create returned an invalid container ID: %w", err)
 	}
 	return id, nil
 }
@@ -174,8 +177,8 @@ func (r *DockerRuntime) Stop(ctx context.Context, id string, mode ports.StopMode
 }
 
 func (r *DockerRuntime) Quarantine(ctx context.Context, id string) (RuntimeContainmentEvidence, error) {
-	if strings.TrimSpace(id) == "" {
-		return RuntimeContainmentEvidence{}, fmt.Errorf("runtime ID is required")
+	if err := dockercli.RequireCanonicalContainerID(id); err != nil {
+		return RuntimeContainmentEvidence{}, fmt.Errorf("canonical runtime ID is required: %w", err)
 	}
 	state, err := r.Inspect(ctx, id)
 	if err != nil {
@@ -192,9 +195,14 @@ func (r *DockerRuntime) Quarantine(ctx context.Context, id string) (RuntimeConta
 		if err != nil {
 			return RuntimeContainmentEvidence{}, err
 		}
-	}
-	if state.ID != id || state.Running {
-		return RuntimeContainmentEvidence{}, fmt.Errorf("Docker runtime %q remains running after containment", id)
+		if state.ID != id {
+			return RuntimeContainmentEvidence{}, fmt.Errorf("Docker inspect returned runtime %q for %q after containment", state.ID, id)
+		}
+		if err := dockercli.RequireExactStoppedState(state.Running, state.Paused, state.Restarting, state.Dead, state.Status, dockercli.StoppedStatusExited); err != nil {
+			return RuntimeContainmentEvidence{}, fmt.Errorf("Docker runtime %q did not reach an exact stopped state after containment: %w", id, err)
+		}
+	} else if err := dockercli.RequireExactStoppedState(state.Running, state.Paused, state.Restarting, state.Dead, state.Status, dockercli.StoppedStatusCreated, dockercli.StoppedStatusExited); err != nil {
+		return RuntimeContainmentEvidence{}, fmt.Errorf("Docker runtime %q is not in an exact containable stopped state: %w", id, err)
 	}
 	// A confirmed stopped container has no executing network namespace, while
 	// successful inspect proves Docker retained its writable layer and metadata.
@@ -210,7 +218,7 @@ func (r *DockerRuntime) Remove(ctx context.Context, id string) error {
 }
 
 func (r *DockerRuntime) OpenExec(ctx context.Context, id string, plan ports.TargetExecPlan) (ports.ExecTransport, error) {
-	invocation := command.Invocation{Program: r.Binary, Args: []string{"exec", "--interactive", id, "/usr/local/bin/world-guest"}}
+	invocation := command.Invocation{Program: r.Binary, Args: []string{"exec", "--interactive", id, targetGuestBinary}}
 	return command.StartGuestTransport(ctx, r.Starter, invocation, plan.Start, plan.Start.CleanupGrace)
 }
 
@@ -220,7 +228,8 @@ var _ RuntimeInventory = (*DockerRuntime)(nil)
 
 func runtimeState(container dockercli.Container) RuntimeState {
 	return RuntimeState{
-		ID: container.ID, Name: container.Name, Running: container.Running, Status: container.Status,
+		ID: container.ID, Name: container.Name, Running: container.Running, Paused: container.Paused,
+		Restarting: container.Restarting, Dead: container.Dead, Status: container.Status,
 		Labels: container.Labels, CgroupID: container.CgroupID, Configuration: container.Configuration,
 	}
 }

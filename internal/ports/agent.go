@@ -2,6 +2,7 @@ package ports
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/philcantcode/go-world-management-layer/internal/admission"
@@ -29,7 +30,7 @@ func (p AgentWorkspacePlan) Validate() error {
 	}
 	generation := p.Generation.Spec()
 	workspace := p.Workspace.Spec()
-	if workspace.LeaseID != p.LeaseID || workspace.AgentWorkspaceID != generation.AgentWorkspaceID || workspace.AgentGeneration != generation.Generation || workspace.ID != generation.WorkspaceID {
+	if workspace.LeaseID != p.LeaseID || workspace.AgentWorkspaceID != generation.AgentWorkspaceID || workspace.AgentGeneration != generation.Generation || workspace.ID != generation.WorkspaceID || workspace.InputViewID != generation.InputViewID {
 		return domain.NewError(domain.CodeConflict, operation, "workspace", "does not match the generation scope", nil)
 	}
 	if p.ImageDigest.IsZero() || p.PolicyDigest.IsZero() || p.CapabilityFingerprintDigest.IsZero() {
@@ -42,6 +43,54 @@ func (p AgentWorkspacePlan) Validate() error {
 		return domain.NewError(domain.CodeInvalidArgument, operation, "resources", "is invalid", err)
 	}
 	return nil
+}
+
+// AgentWorkspacePlanIdentityDigest binds every immutable semantic input to an
+// agent-driver Provision request. Mutable lifecycle state and revisions are
+// intentionally excluded; the immutable generation/workspace specifications,
+// including their provenance and creation times, are included.
+func AgentWorkspacePlanIdentityDigest(p AgentWorkspacePlan) (domain.Digest, error) {
+	if err := p.Validate(); err != nil {
+		return domain.Digest{}, err
+	}
+	generation := p.Generation.Spec()
+	workspace := p.Workspace.Spec()
+	identity := struct {
+		Version                   string              `json:"version"`
+		IdempotencyKey            string              `json:"idempotency_key"`
+		LeaseID                   string              `json:"lease_id"`
+		AgentWorkspaceID          string              `json:"agent_workspace_id"`
+		Generation                uint64              `json:"generation"`
+		WorkspaceID               string              `json:"workspace_id"`
+		InputViewID               string              `json:"input_view_id"`
+		PolicyDigest              string              `json:"policy_digest"`
+		CapabilityFingerprint     string              `json:"capability_fingerprint_digest"`
+		PreviousGeneration        uint64              `json:"previous_generation,omitempty"`
+		RecoveryIncidentID        string              `json:"recovery_incident_id,omitempty"`
+		GenerationCreatedAt       time.Time           `json:"generation_created_at"`
+		WorkspaceLeaseID          string              `json:"workspace_lease_id"`
+		WorkspaceAgentWorkspaceID string              `json:"workspace_agent_workspace_id"`
+		WorkspaceAgentGeneration  uint64              `json:"workspace_agent_generation"`
+		WorkspaceInputViewID      string              `json:"workspace_input_view_id"`
+		WorkspaceCreatedAt        time.Time           `json:"workspace_created_at"`
+		ImageDigest               string              `json:"image_digest"`
+		Resources                 admission.Resources `json:"resources"`
+	}{
+		Version: "world.agent-workspace-plan.v1", IdempotencyKey: p.IdempotencyKey, LeaseID: p.LeaseID.String(),
+		AgentWorkspaceID: generation.AgentWorkspaceID.String(), Generation: uint64(generation.Generation),
+		WorkspaceID: generation.WorkspaceID.String(), InputViewID: generation.InputViewID.String(),
+		PolicyDigest: p.PolicyDigest.String(), CapabilityFingerprint: p.CapabilityFingerprintDigest.String(),
+		PreviousGeneration: uint64(generation.PreviousGeneration), RecoveryIncidentID: generation.RecoveryIncidentID.String(),
+		GenerationCreatedAt: generation.CreatedAt, WorkspaceLeaseID: workspace.LeaseID.String(),
+		WorkspaceAgentWorkspaceID: workspace.AgentWorkspaceID.String(), WorkspaceAgentGeneration: uint64(workspace.AgentGeneration),
+		WorkspaceInputViewID: workspace.InputViewID.String(), WorkspaceCreatedAt: workspace.CreatedAt,
+		ImageDigest: p.ImageDigest.String(), Resources: p.Resources.Clone(),
+	}
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		return domain.Digest{}, err
+	}
+	return domain.NewDigest(encoded), nil
 }
 
 type AgentWorkspaceStatus struct {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"time"
 
 	worldv1 "github.com/philcantcode/go-world-management-layer/api/world/v1"
 	"github.com/philcantcode/go-world-management-layer/internal/application"
@@ -24,8 +25,10 @@ func (s *Service) StopTargetRun(ctx context.Context, request *worldv1.StopTarget
 	if request == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
-	if s.finalization == nil {
-		return nil, status.Error(codes.FailedPrecondition, "run finalization is unavailable because no finalizer/material authority is configured")
+	s.targetRunLifecycleMu.Lock()
+	defer s.targetRunLifecycleMu.Unlock()
+	if err := s.requireRunFinalization(); err != nil {
+		return nil, err
 	}
 	operationCtx, cancel, meta, err := mutationContext(ctx, request.Mutation)
 	if err != nil {
@@ -70,8 +73,8 @@ func (s *Service) StopTargetRun(ctx context.Context, request *worldv1.StopTarget
 // stopAndFinalizeRun is the single evidence-bearing stop path used by both an
 // explicit StopTargetRun and controller compensation after a failed start.
 func (s *Service) stopAndFinalizeRun(ctx context.Context, target application.TargetRecord, run application.TargetRunRecord, driver ports.TargetDriver, mode ports.StopMode, meta application.MutationMeta, namespace, key, signature string, failureCause error) (*worldv1.ObservationBundle, error) {
-	if s.observers == nil {
-		return nil, status.Error(codes.FailedPrecondition, "run observer coordinator is unavailable")
+	if err := s.requireRunFinalization(); err != nil {
+		return nil, err
 	}
 	reservation, err := s.reserveBundle(ctx, target, run, namespace, key, signature)
 	if err != nil {
@@ -104,13 +107,19 @@ func (s *Service) stopAndFinalizeRun(ctx context.Context, target application.Tar
 		return nil, err
 	}
 	if !restored {
+		if err := s.observers.PrepareStop(cleanupCtx, runID); err != nil {
+			return nil, err
+		}
 		var targetErr error
 		receipt, targetErr = driver.StopRun(cleanupCtx, runID, mode)
 		if targetErr != nil {
-			// Without a target stop receipt there is no authoritative terminal
-			// boundary. Leave observers running so a retry cannot silently lose
-			// the tail of the target run.
-			return nil, targetErr
+			// The target did not cross its authoritative terminal boundary. Use
+			// an independent cleanup budget so a target timeout cannot prevent
+			// the collectors from returning to their active state.
+			rollbackCtx, rollbackCancel, _ := cleanupContext(s.controlTimeout)
+			cancelErr := s.observers.CancelStopPreparation(rollbackCtx, runID)
+			rollbackCancel()
+			return nil, errors.Join(targetErr, cancelErr)
 		}
 		evidence, err = s.observers.Finalize(cleanupCtx, receipt)
 		if err != nil {
@@ -135,6 +144,16 @@ func (s *Service) stopAndFinalizeRun(ctx context.Context, target application.Tar
 		return nil, err
 	}
 	return s.completePreparedStoppedBundle(cleanupCtx, run.ID, bundle)
+}
+
+func (s *Service) requireRunFinalization() error {
+	if s.finalization == nil {
+		return status.Error(codes.FailedPrecondition, "run finalization is unavailable because no finalizer/material authority is configured")
+	}
+	if s.observers == nil {
+		return status.Error(codes.FailedPrecondition, "run observer coordinator is unavailable")
+	}
+	return nil
 }
 
 func (s *Service) completePreparedStoppedBundle(ctx context.Context, runID string, bundle *worldv1.ObservationBundle) (*worldv1.ObservationBundle, error) {
@@ -214,17 +233,21 @@ func (s *Service) DestroyTarget(ctx context.Context, request *worldv1.DestroyTar
 		return nil, err
 	}
 	if generation.State == domain.TargetGenerationDestroyed {
-		if err := s.requireReservedOperation(namespace, target.ID, meta.IdempotencyKey, signature); err != nil {
+		if err := s.requireReservedTargetOperation(namespace, target.ID, generation.Generation, meta.IdempotencyKey, signature); err != nil {
 			return nil, err
 		}
 		return &worldv1.Outcome{ResourceId: target.ID, State: string(generation.State), Revision: target.Revision}, nil
 	}
-	if target.Revision != request.ExpectedRevision && !(generation.State == domain.TargetGenerationResettable && target.Revision == request.ExpectedRevision+1) {
-		return nil, status.Errorf(codes.Aborted, "target revision conflict: got %d, current %d", request.ExpectedRevision, target.Revision)
+	_, reserved, err := s.exactReservedTargetOperation(namespace, target.ID, generation.Generation, meta.IdempotencyKey, signature)
+	if err != nil {
+		return nil, err
 	}
-	for _, run := range target.Runs {
-		if run.Generation == target.CurrentGeneration && !run.State.Terminal() {
-			return nil, status.Errorf(codes.FailedPrecondition, "target run %s must be stopped and authoritatively finalized before destruction", run.ID)
+	if !reserved {
+		if target.Revision != request.ExpectedRevision && !(generation.State == domain.TargetGenerationResettable && target.Revision == request.ExpectedRevision+1) {
+			return nil, status.Errorf(codes.Aborted, "target revision conflict: got %d, current %d", request.ExpectedRevision, target.Revision)
+		}
+		if err := requireNoNonterminalTargetRuns(target, target.CurrentGeneration); err != nil {
+			return nil, err
 		}
 	}
 	driver := s.targets[target.Kind]
@@ -234,11 +257,18 @@ func (s *Service) DestroyTarget(ctx context.Context, request *worldv1.DestroyTar
 	if generation.State != domain.TargetGenerationReady && generation.State != domain.TargetGenerationResettable {
 		return nil, status.Errorf(codes.FailedPrecondition, "target generation in %s cannot transition to destroyed through the current domain state machine", generation.State)
 	}
-	if err := s.reserveOperation(operationCtx, namespace, target.ID, meta.IdempotencyKey, signature, ledger.Identity{
-		ResearchSessionID: target.SessionID, LeaseID: target.LeaseID, TargetID: target.ID,
-		TargetGeneration: target.CurrentGeneration,
-	}); err != nil {
-		return nil, err
+	if !reserved {
+		if err := s.reserveOperation(operationCtx, namespace, target.ID, meta.IdempotencyKey, signature, ledger.Identity{
+			ResearchSessionID: target.SessionID, LeaseID: target.LeaseID, TargetID: target.ID,
+			TargetGeneration: target.CurrentGeneration,
+		}); err != nil {
+			return nil, err
+		}
+		if s.lifecycleFaults != nil && s.lifecycleFaults.afterDestroyReserved != nil {
+			if err := s.lifecycleFaults.afterDestroyReserved(); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if generation.State == domain.TargetGenerationReady {
 		target, err = s.core.TransitionTargetGeneration(operationCtx, application.TransitionTargetGenerationRequest{Meta: childMeta(meta, "resettable", deadline(operationCtx)), TargetID: target.ID, Generation: target.CurrentGeneration, ExpectedRevision: generation.Revision, State: domain.TargetGenerationResettable})
@@ -252,6 +282,23 @@ func (s *Service) DestroyTarget(ctx context.Context, request *worldv1.DestroyTar
 	}
 	if generation.State != domain.TargetGenerationResettable {
 		return nil, status.Errorf(codes.FailedPrecondition, "target generation in %s cannot transition to destroyed through the current domain state machine", generation.State)
+	}
+	// The Ready -> Resettable transition is the logical admission barrier. A
+	// run may have linearized between the pre-reservation check and that
+	// barrier, so physical deletion always reloads and reasserts quiescence.
+	target, err = s.core.GetTarget(operationCtx, target.ID)
+	if err != nil {
+		return nil, err
+	}
+	if target.CurrentGeneration != generation.Generation {
+		return nil, status.Error(codes.DataLoss, "destroy reservation no longer identifies the current target generation")
+	}
+	if err := requireNoNonterminalTargetRuns(target, target.CurrentGeneration); err != nil {
+		return nil, err
+	}
+	generation, err = targetGeneration(target)
+	if err != nil {
+		return nil, err
 	}
 	targetID, err := requireStoredID("orchestration.destroy_target", "target_id", target.ID, domain.ParseTargetID)
 	if err != nil {
@@ -271,6 +318,8 @@ func (s *Service) QuarantineTarget(ctx context.Context, request *worldv1.Quarant
 	if request == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
+	s.targetRunLifecycleMu.Lock()
+	defer s.targetRunLifecycleMu.Unlock()
 	operationCtx, cancel, meta, err := mutationContext(ctx, request.Mutation)
 	if err != nil {
 		return nil, err
@@ -301,7 +350,7 @@ func (s *Service) QuarantineTarget(ctx context.Context, request *worldv1.Quarant
 		return nil, err
 	}
 	if generation.State == domain.TargetGenerationQuarantined {
-		if err := s.requireReservedOperation(namespace, target.ID, meta.IdempotencyKey, signature); err != nil {
+		if err := s.requireReservedTargetOperation(namespace, target.ID, generation.Generation, meta.IdempotencyKey, signature); err != nil {
 			return nil, err
 		}
 		return wiremap.Target(target), nil
@@ -309,8 +358,10 @@ func (s *Service) QuarantineTarget(ctx context.Context, request *worldv1.Quarant
 	if generation.State.Terminal() {
 		return nil, status.Errorf(codes.FailedPrecondition, "target generation in %s cannot be quarantined", generation.State)
 	}
-	if target.Revision != request.ExpectedRevision {
-		return nil, status.Errorf(codes.Aborted, "target revision conflict: got %d, current %d", request.ExpectedRevision, target.Revision)
+	if _, found := nonterminalTargetRun(target, target.CurrentGeneration); found {
+		if err := s.requireRunFinalization(); err != nil {
+			return nil, err
+		}
 	}
 	driver := s.targets[target.Kind]
 	if driver == nil {
@@ -328,30 +379,301 @@ func (s *Service) QuarantineTarget(ctx context.Context, request *worldv1.Quarant
 	if err := plan.Validate(); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	if err := s.reserveOperation(operationCtx, namespace, target.ID, meta.IdempotencyKey, signature, ledger.Identity{
-		ResearchSessionID: target.SessionID, LeaseID: target.LeaseID, TargetID: target.ID,
-		TargetGeneration: target.CurrentGeneration,
-	}); err != nil {
+	reservation, reserved, err := s.exactReservedTargetOperation(namespace, target.ID, generation.Generation, meta.IdempotencyKey, signature)
+	if err != nil {
 		return nil, err
 	}
-	evidence, err := driver.Quarantine(operationCtx, plan)
+	if !reserved {
+		if target.Revision != request.ExpectedRevision {
+			return nil, status.Errorf(codes.Aborted, "target revision conflict: got %d, current %d", request.ExpectedRevision, target.Revision)
+		}
+		commitMeta := childMeta(meta, "commit", time.Time{})
+		reservation, err = s.reserveTargetQuarantine(operationCtx, target.ID, meta.IdempotencyKey, signature, ledger.Identity{
+			ResearchSessionID: target.SessionID, LeaseID: target.LeaseID, TargetID: target.ID,
+			TargetGeneration: target.CurrentGeneration,
+		}, targetQuarantineIntent{Plan: plan, CommitMeta: commitMeta})
+		if err != nil {
+			return nil, err
+		}
+		if s.lifecycleFaults != nil && s.lifecycleFaults.afterQuarantineReserved != nil {
+			if err := s.lifecycleFaults.afterQuarantineReserved(); err != nil {
+				return nil, err
+			}
+		}
+	}
+	target, err = s.resumeTargetQuarantine(operationCtx, target.Kind, reservation)
 	if err != nil {
 		if domain.IsCode(err, domain.CodeCapabilityUnavailable) {
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
 		}
 		return nil, err
 	}
-	if err := evidence.Validate(plan.Target); err != nil {
-		return nil, status.Errorf(codes.DataLoss, "target driver returned invalid quarantine evidence: %v", err)
-	}
-	target, err = s.core.QuarantineTarget(operationCtx, application.QuarantineTargetRequest{
-		Meta: childMeta(meta, "commit", deadline(operationCtx)), TargetID: target.ID,
-		ExpectedRevision: target.Revision, Reason: request.Reason, Evidence: evidence,
-	})
-	if err != nil {
-		return nil, err
-	}
 	return wiremap.Target(target), nil
+}
+
+func (s *Service) resumeTargetQuarantine(ctx context.Context, kind domain.TargetKind, reservation operationReservation) (application.TargetRecord, error) {
+	if _, err := s.closeTargetQuarantineAdmission(ctx, kind, reservation); err != nil {
+		return application.TargetRecord{}, err
+	}
+	if _, err := s.finalizeTargetRunsForQuarantine(ctx, kind, reservation); err != nil {
+		return application.TargetRecord{}, err
+	}
+	_, containment, err := s.ensureTargetQuarantineContained(ctx, kind, reservation)
+	if err != nil {
+		return application.TargetRecord{}, err
+	}
+	if s.lifecycleFaults != nil && s.lifecycleFaults.afterQuarantineContained != nil {
+		if err := s.lifecycleFaults.afterQuarantineContained(); err != nil {
+			return application.TargetRecord{}, err
+		}
+	}
+	return s.commitTargetQuarantine(ctx, reservation, containment)
+}
+
+// closeTargetQuarantineAdmission installs the durable logical barrier before
+// any run is stopped or the target-wide physical quarantine begins. A replay
+// observes Resettable and does not repeat the transition.
+func (s *Service) closeTargetQuarantineAdmission(ctx context.Context, kind domain.TargetKind, reservation operationReservation) (application.TargetRecord, error) {
+	target, generation, err := s.requireTargetQuarantineScope(ctx, reservation)
+	if err != nil {
+		return application.TargetRecord{}, err
+	}
+	if target.Kind != kind {
+		return application.TargetRecord{}, status.Error(codes.DataLoss, "quarantine intent identifies a different target kind")
+	}
+	if generation.State == domain.TargetGenerationQuarantined {
+		return target, nil
+	}
+	if generation.State.Terminal() {
+		return application.TargetRecord{}, status.Errorf(codes.FailedPrecondition, "target generation in %s cannot complete quarantine", generation.State)
+	}
+	if generation.State != domain.TargetGenerationReady {
+		return target, nil
+	}
+	meta := childMeta(reservation.Quarantine.CommitMeta, "admission", deadline(ctx))
+	return s.core.TransitionTargetGeneration(ctx, application.TransitionTargetGenerationRequest{
+		Meta: meta, TargetID: target.ID, Generation: target.CurrentGeneration,
+		ExpectedRevision: generation.Revision, State: domain.TargetGenerationResettable,
+	})
+}
+
+// finalizeTargetRunsForQuarantine establishes the ordinary evidence-bearing
+// stop boundary before target-wide quarantine. Real target drivers deliberately
+// reject StopRun after Quarantine, so this order is part of the containment
+// contract rather than an implementation detail.
+func (s *Service) finalizeTargetRunsForQuarantine(ctx context.Context, kind domain.TargetKind, reservation operationReservation) (application.TargetRecord, error) {
+	target, _, err := s.requireTargetQuarantineScope(ctx, reservation)
+	if err != nil {
+		return application.TargetRecord{}, err
+	}
+	if target.Kind != kind {
+		return application.TargetRecord{}, status.Error(codes.DataLoss, "quarantine intent identifies a different target kind")
+	}
+	driver := s.targets[kind]
+	if driver == nil {
+		return application.TargetRecord{}, status.Errorf(codes.FailedPrecondition, "no production target driver is configured for kind %q", kind)
+	}
+	_, contained := s.targetQuarantineContainment(reservation)
+	runs := currentGenerationRuns(target)
+	for _, run := range runs {
+		if run.State.Terminal() {
+			if err := s.completeTerminalRunFinalization(ctx, run); err != nil {
+				return application.TargetRecord{}, err
+			}
+			continue
+		}
+		if contained {
+			return application.TargetRecord{}, domain.NewError(domain.CodeIntegrityViolation, "orchestration.finalize_target_runs_for_quarantine", "target_run", "durable target containment predates evidence-bearing run finalization", nil)
+		}
+		if err := s.requireRunFinalization(); err != nil {
+			return application.TargetRecord{}, err
+		}
+		meta := childMeta(reservation.Quarantine.CommitMeta, "finalize-run/"+run.ID, deadline(ctx))
+		signature, err := targetQuarantineRunFinalizationSignature(reservation, run)
+		if err != nil {
+			return application.TargetRecord{}, err
+		}
+		if _, err := s.stopAndFinalizeRun(
+			ctx, target, run, driver, ports.StopForce, meta,
+			"quarantine_target_run", meta.IdempotencyKey, signature,
+			fmt.Errorf("target quarantine requested: %s", reservation.Quarantine.Plan.Reason),
+		); err != nil {
+			return application.TargetRecord{}, fmt.Errorf("finalize run %s before target quarantine: %w", run.ID, err)
+		}
+		target, _, err = s.requireTargetQuarantineScope(ctx, reservation)
+		if err != nil {
+			return application.TargetRecord{}, err
+		}
+	}
+	return s.requireTargetQuarantineRunsFinalized(ctx, reservation)
+}
+
+// requireTargetQuarantineRunsFinalized is the last gate before physical
+// containment. It catches incomplete/unbound startup records that could not be
+// reconstructed and also proves every terminal run has a public bundle and a
+// committed observer marker.
+func (s *Service) requireTargetQuarantineRunsFinalized(ctx context.Context, reservation operationReservation) (application.TargetRecord, error) {
+	target, _, err := s.requireTargetQuarantineScope(ctx, reservation)
+	if err != nil {
+		return application.TargetRecord{}, err
+	}
+	for _, run := range currentGenerationRuns(target) {
+		if !run.State.Terminal() {
+			return application.TargetRecord{}, domain.NewError(
+				domain.CodeIntegrityViolation,
+				"orchestration.require_target_quarantine_runs_finalized",
+				"target_run",
+				"target quarantine cannot contain a nonterminal run without evidence-bearing finalization: "+run.ID,
+				nil,
+			)
+		}
+		if err := s.completeTerminalRunFinalization(ctx, run); err != nil {
+			return application.TargetRecord{}, err
+		}
+	}
+	return target, nil
+}
+
+func (s *Service) completeTerminalRunFinalization(ctx context.Context, run application.TargetRunRecord) error {
+	if err := s.resumeTerminalBundle(ctx, run.ID); err != nil {
+		return fmt.Errorf("verify terminal run %s before target quarantine: %w", run.ID, err)
+	}
+	if err := s.completeStoppedBundle(ctx, run.ID); err != nil {
+		return fmt.Errorf("complete terminal run %s before target quarantine: %w", run.ID, err)
+	}
+	return nil
+}
+
+func currentGenerationRuns(target application.TargetRecord) []application.TargetRunRecord {
+	runs := make([]application.TargetRunRecord, 0, len(target.Runs))
+	for _, run := range target.Runs {
+		if run.Generation == target.CurrentGeneration {
+			runs = append(runs, run)
+		}
+	}
+	sort.Slice(runs, func(i, j int) bool { return runs[i].ID < runs[j].ID })
+	return runs
+}
+
+func nonterminalTargetRun(target application.TargetRecord, generation uint64) (application.TargetRunRecord, bool) {
+	for _, run := range target.Runs {
+		if run.Generation == generation && !run.State.Terminal() {
+			return run, true
+		}
+	}
+	return application.TargetRunRecord{}, false
+}
+
+func targetQuarantineRunFinalizationSignature(reservation operationReservation, run application.TargetRunRecord) (string, error) {
+	return requestSignature(struct {
+		TargetID            string `json:"target_id"`
+		TargetGeneration    uint64 `json:"target_generation"`
+		RunID               string `json:"run_id"`
+		ProvisioningDigest  string `json:"provisioning_digest"`
+		QuarantineSignature string `json:"quarantine_signature"`
+	}{reservation.ResourceID, reservation.TargetGeneration, run.ID, run.ProvisioningPlanDigest, reservation.Signature})
+}
+
+func (s *Service) requireTargetQuarantineScope(ctx context.Context, reservation operationReservation) (application.TargetRecord, application.TargetGenerationRecord, error) {
+	if err := validateOperationReservation(reservation); err != nil {
+		return application.TargetRecord{}, application.TargetGenerationRecord{}, status.Errorf(codes.DataLoss, "invalid durable target quarantine intent: %v", err)
+	}
+	if reservation.Namespace != "quarantine_target" || reservation.Quarantine == nil {
+		return application.TargetRecord{}, application.TargetGenerationRecord{}, status.Error(codes.DataLoss, "durable operation is not a target quarantine intent")
+	}
+	target, err := s.core.GetTarget(ctx, reservation.ResourceID)
+	if err != nil {
+		return application.TargetRecord{}, application.TargetGenerationRecord{}, err
+	}
+	if target.CurrentGeneration != reservation.TargetGeneration {
+		return application.TargetRecord{}, application.TargetGenerationRecord{}, status.Error(codes.DataLoss, "quarantine intent no longer identifies the current target generation")
+	}
+	generation, err := targetGeneration(target)
+	if err != nil {
+		return application.TargetRecord{}, application.TargetGenerationRecord{}, err
+	}
+	return target, generation, nil
+}
+
+func (s *Service) ensureTargetQuarantineContained(ctx context.Context, kind domain.TargetKind, reservation operationReservation) (application.TargetRecord, targetQuarantineContainment, error) {
+	driver := s.targets[kind]
+	if driver == nil {
+		return application.TargetRecord{}, targetQuarantineContainment{}, status.Errorf(codes.FailedPrecondition, "no production target driver is configured for kind %q", kind)
+	}
+	target, generation, err := s.requireTargetQuarantineScope(ctx, reservation)
+	if err != nil {
+		return application.TargetRecord{}, targetQuarantineContainment{}, err
+	}
+	if target.Kind != kind {
+		return application.TargetRecord{}, targetQuarantineContainment{}, status.Error(codes.DataLoss, "quarantine intent identifies a different target kind")
+	}
+	if generation.State == domain.TargetGenerationQuarantined {
+		containment, found := s.targetQuarantineContainment(reservation)
+		if !found {
+			return application.TargetRecord{}, targetQuarantineContainment{}, status.Error(codes.DataLoss, "quarantined generation lacks durable containment evidence")
+		}
+		return target, containment, nil
+	}
+	if generation.State.Terminal() {
+		return application.TargetRecord{}, targetQuarantineContainment{}, status.Errorf(codes.FailedPrecondition, "target generation in %s cannot complete quarantine", generation.State)
+	}
+	containment, contained := s.targetQuarantineContainment(reservation)
+	if !contained {
+		evidence, quarantineErr := driver.Quarantine(ctx, reservation.Quarantine.Plan)
+		if quarantineErr != nil {
+			return application.TargetRecord{}, targetQuarantineContainment{}, quarantineErr
+		}
+		if err := evidence.Validate(reservation.Quarantine.Plan.Target); err != nil {
+			return application.TargetRecord{}, targetQuarantineContainment{}, status.Errorf(codes.DataLoss, "target driver returned invalid quarantine evidence: %v", err)
+		}
+		containment, err = s.persistTargetQuarantineContainment(ctx, reservation, evidence, ledger.Identity{
+			ResearchSessionID: target.SessionID, LeaseID: target.LeaseID, TargetID: target.ID,
+			TargetGeneration: target.CurrentGeneration,
+		})
+		if err != nil {
+			return application.TargetRecord{}, targetQuarantineContainment{}, err
+		}
+	}
+	return target, containment, nil
+}
+
+func (s *Service) commitTargetQuarantine(ctx context.Context, reservation operationReservation, containment targetQuarantineContainment) (application.TargetRecord, error) {
+	if err := validateTargetQuarantineContainment(reservation, containment); err != nil {
+		return application.TargetRecord{}, status.Errorf(codes.DataLoss, "invalid durable target quarantine containment: %v", err)
+	}
+	// Reload after physical containment. Admission is already closed and every
+	// current-generation run has an evidence-bearing terminal boundary, so this
+	// commit cannot manufacture a terminal run without a bundle.
+	target, err := s.core.GetTarget(ctx, reservation.ResourceID)
+	if err != nil {
+		return application.TargetRecord{}, err
+	}
+	if target.CurrentGeneration != reservation.TargetGeneration {
+		return application.TargetRecord{}, status.Error(codes.DataLoss, "quarantine intent no longer identifies the current target generation")
+	}
+	generation, err := targetGeneration(target)
+	if err != nil {
+		return application.TargetRecord{}, err
+	}
+	if generation.State == domain.TargetGenerationQuarantined {
+		return target, nil
+	}
+	if generation.State.Terminal() {
+		return application.TargetRecord{}, status.Errorf(codes.FailedPrecondition, "target generation in %s cannot complete quarantine", generation.State)
+	}
+	commitMeta := reservation.Quarantine.CommitMeta
+	commitMeta.Deadline = deadline(ctx)
+	return s.core.QuarantineTarget(ctx, application.QuarantineTargetRequest{
+		Meta: commitMeta, TargetID: target.ID, ExpectedRevision: target.Revision,
+		Reason: reservation.Quarantine.Plan.Reason, Evidence: containment.Evidence,
+	})
+}
+
+func requireNoNonterminalTargetRuns(target application.TargetRecord, generation uint64) error {
+	if run, found := nonterminalTargetRun(target, generation); found {
+		return status.Errorf(codes.FailedPrecondition, "target run %s must be stopped and authoritatively finalized before destruction", run.ID)
+	}
+	return nil
 }
 
 func (s *Service) reserveBundle(ctx context.Context, target application.TargetRecord, run application.TargetRunRecord, namespace, key, signature string) (bundleReservation, error) {

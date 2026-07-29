@@ -21,7 +21,7 @@ state and control state disagree.
    the reservation, mutation metadata, initial run state/revision, target and
    agent generations, run creation time, required coverage, complete persisted
    run result, compact failure-incident intent, and result digest.
-5. Update the version-5 stopped observer marker with both the result digest and
+5. Update the version-6 stopped observer marker with both the result digest and
    the complete preparation-file digest. Only after that marker is durable,
    append `bundle.stop_prepared` with the file identity, size, both digests,
    lease/target/run, and bundle ID to the hash-chained control ledger. A restart
@@ -47,7 +47,7 @@ state and control state disagree.
    digest, outcome, and incident IDs from that exact stage.
 11. Atomically publish `bundles/<target-run-id>.json`, verify it byte-for-byte
    against the canonical stage, and append its `bundle.indexed` identity.
-12. Commit the stopped version-5 observer marker only after the indexed bundle
+12. Commit the stopped version-6 observer marker only after the indexed bundle
    is durable.
 13. Append `bundle.completed` only after the bundle index and committed
     observer marker agree. `GetObservationBundle` remains closed until this
@@ -84,21 +84,21 @@ state and control state disagree.
 ## Interrupted-run branch
 
 An interrupted run is never resumed. During the pre-RPC startup gate, the
-daemon first requires the version-5 observer marker filename/run ID, immutable
+daemon first requires the version-6 observer marker filename/run ID, immutable
 persisted run-plan digest, full observer start signature, exact external
 `CollectorPlan` bindings, and start-commit flags to match the durable run. When
 `target.lifecycle` is required, the marker must also carry the exact intrinsic
 collector ID/start time. The daemon then adopts the exact persisted
 target identity, force-stops any surviving execution, proves it stopped, and
-proves that the directly spawned collector process did not survive. Linux
-parent-death `SIGKILL` does not cover daemonized or surviving helper processes;
-such adapters are unsupported unless an external cgroup/process-tree supervisor
-provides an equivalent authoritative proof. Missing ownership evidence in a
-phase that requires it, an ambiguous physical binding, or an unsupported
-collector-cleanup guarantee fails startup; the daemon does not guess at
-continuity.
+requires the platform's collector-cleanup authority to have removed everything
+it owns. Windows uses a preflighted private kill-on-close Job for the whole
+collector tree. Linux parent-death `SIGKILL` covers only the directly spawned
+process; daemonized or surviving helpers require an external cgroup/process-tree
+authority. Missing ownership evidence in a phase that requires it, an ambiguous
+physical binding, or an unsupported collector-cleanup guarantee fails startup;
+the daemon does not guess at continuity.
 
-After Linux parent-death proof, local output reconciliation verifies each exact
+After the platform cleanup proof, local output reconciliation verifies each exact
 collector transaction and its object reachability. Valid finalized artifacts
 are retained, but the collector still receives lost coverage and a continuity
 gap. Incomplete output is durably marked `aborted` and its partial files are

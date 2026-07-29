@@ -16,7 +16,7 @@ func TestAgentPhysicalPolicyReporterAppliesCompositionToConfigAndPlan(t *testing
 	rawPlan.Resources.CaptureBytes.Value = 8192
 	rawPlan.Resources.Inodes.Value = 16
 	delegate := &physicalReporterStub{config: rawConfig, plan: rawPlan}
-	enforcement := AgentPhysicalEnforcement{DirectoryWorkspace: true, BoundedLedgerCapture: true}
+	enforcement := AgentPhysicalEnforcement{BoundedLedgerCapture: true}
 	reporter, err := NewAgentPhysicalPolicyReporter(delegate, enforcement)
 	if err != nil {
 		t.Fatal(err)
@@ -39,6 +39,9 @@ func TestAgentPhysicalPolicyReporterAppliesCompositionToConfigAndPlan(t *testing
 	if planned.Resources.WorkspaceBytes.Value != 4096 || planned.Resources.CaptureBytes.Value != 8192 || planned.Resources.Inodes.Value != 16 {
 		t.Fatal("composition enforcement changed exact plan resource values")
 	}
+	if planned.Resources.WorkspaceBytes.Support != ports.PhysicalSupportUnsupported || planned.Resources.Inodes.Support != ports.PhysicalSupportUnsupported {
+		t.Fatal("directory workspace overstated live byte or inode enforcement")
+	}
 }
 
 func TestAgentPhysicalPolicyReporterRejectsNilAndPreservesErrors(t *testing.T) {
@@ -46,7 +49,7 @@ func TestAgentPhysicalPolicyReporterRejectsNilAndPreservesErrors(t *testing.T) {
 		t.Fatal("nil delegate was accepted")
 	}
 	want := errors.New("report failed")
-	reporter, err := NewAgentPhysicalPolicyReporter(&physicalReporterStub{err: want}, AgentPhysicalEnforcement{DirectoryWorkspace: true})
+	reporter, err := NewAgentPhysicalPolicyReporter(&physicalReporterStub{err: want}, AgentPhysicalEnforcement{})
 	if err != nil {
 		t.Fatal(err)
 	}

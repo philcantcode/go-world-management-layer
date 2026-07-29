@@ -3,8 +3,6 @@ package cuttlefish
 import (
 	"context"
 	"fmt"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/philcantcode/go-world-management-layer/internal/drivers/command"
@@ -37,7 +35,7 @@ type AttachedEmulatorBackend struct {
 }
 
 func NewAttachedEmulatorBackend(config AttachedEmulatorBackendConfig) (*AttachedEmulatorBackend, error) {
-	if !safeExactADBSerial(config.Serial) {
+	if err := ports.ValidateExactADBSerial(config.Serial); err != nil {
 		return nil, fmt.Errorf("attached emulator requires a safe exact ADB serial")
 	}
 	if config.Runner == nil {
@@ -79,6 +77,8 @@ func (b *AttachedEmulatorBackend) Probe(ctx context.Context, _ ports.TargetTempl
 		return BackendCapabilities{}, fmt.Errorf("attached emulator %q is not fully ready", b.serial)
 	}
 	evidence := map[string]string{
+		"os":                "android",
+		"managed":           "false",
 		"adb_serial":        b.serial,
 		"build_fingerprint": properties["ro.build.fingerprint"],
 		"sdk":               properties["ro.build.version.sdk"],
@@ -90,7 +90,9 @@ func (b *AttachedEmulatorBackend) Probe(ctx context.Context, _ ports.TargetTempl
 	return BackendCapabilities{
 		BackendKind: "android-sdk-emulator", BackendVersion: b.backendVersion,
 		RuntimeVersion: properties["ro.build.fingerprint"], KVMKnown: false,
-		ResetModes: nil, Evidence: evidence,
+		ResetModes: nil, Evidence: evidence, Managed: false,
+		Rooted: state.Identity.Rooted, RootedKnown: true,
+		Debuggable: state.Identity.Debuggable, DebuggableKnown: true,
 	}, nil
 }
 
@@ -98,11 +100,7 @@ func (b *AttachedEmulatorBackend) Create(_ context.Context, plan VirtualDevicePl
 	if err := b.requirePlanAllocation(plan.Allocation); err != nil {
 		return Instance{}, err
 	}
-	return Instance{
-		RuntimeID: plan.Allocation.InstanceName, StateDirectory: plan.StateDirectory,
-		SystemImageDirectory: plan.SystemImageDirectory, Allocation: plan.Allocation,
-		Fingerprint: plan.Fingerprint,
-	}, nil
+	return instanceFromPlan(plan), nil
 }
 
 func (b *AttachedEmulatorBackend) Start(ctx context.Context, instance Instance) error {
@@ -160,52 +158,22 @@ func (b *AttachedEmulatorBackend) inspectProperties(ctx context.Context, instanc
 	if err := b.requireInstance(instance); err != nil {
 		return ReadinessState{}, nil, err
 	}
-	state := ReadinessState{ObservedAt: b.now().UTC()}
-	result, err := b.runADB(ctx, "get-state")
-	if err != nil {
-		return state, nil, err
-	}
-	if strings.TrimSpace(string(result.Stdout)) != "device" {
-		return state, nil, fmt.Errorf("attached emulator %q did not report device state", b.serial)
-	}
-	state.ProcessRunning, state.ADBReady = true, true
-
-	names := map[string]struct{}{
-		"ro.kernel.qemu": {}, "sys.boot_completed": {}, "init.svc.bootanim": {},
-	}
+	names := make([]string, 0, len(b.expectedProperties))
 	if includeIdentity {
-		names["ro.build.fingerprint"] = struct{}{}
-		names["ro.build.version.sdk"] = struct{}{}
-		names["ro.product.cpu.abi"] = struct{}{}
-		names["ro.boot.qemu.avd_name"] = struct{}{}
 		for name := range b.expectedProperties {
-			names[name] = struct{}{}
+			names = append(names, name)
 		}
 	}
-	ordered := make([]string, 0, len(names))
-	for name := range names {
-		ordered = append(ordered, name)
+	state, properties, err := observeExactAndroid(ctx, exactAndroidObservationConfig{
+		Runner: b.runner, ADBBinary: b.adbBinary, ADBServer: defaultADBServer, Serial: b.serial, Now: b.now, Properties: names,
+		ProcessProbe: func(probeContext context.Context) (bool, error) {
+			return observeSDKEmulatorProcess(probeContext, b.runner, b.adbBinary, defaultADBServer, b.serial, "")
+		},
+	})
+	if err != nil {
+		return state, properties, err
 	}
-	sort.Strings(ordered)
-	properties := make(map[string]string, len(ordered))
-	for _, name := range ordered {
-		value, propertyErr := b.getProperty(ctx, name)
-		if propertyErr != nil {
-			return state, nil, propertyErr
-		}
-		properties[name] = value
-	}
-	if properties["ro.kernel.qemu"] != "1" {
-		return state, nil, fmt.Errorf("ADB serial %q is not an Android emulator", b.serial)
-	}
-	state.BootCompleted = properties["sys.boot_completed"] == "1"
-	state.FrameworkReady = properties["init.svc.bootanim"] == "stopped"
 	if includeIdentity {
-		for _, name := range []string{"ro.build.fingerprint", "ro.build.version.sdk", "ro.product.cpu.abi"} {
-			if properties[name] == "" {
-				return state, nil, fmt.Errorf("attached emulator property %q is empty", name)
-			}
-		}
 		for name, expected := range b.expectedProperties {
 			if properties[name] != expected {
 				return state, nil, fmt.Errorf("attached emulator property %q does not match the configured value", name)
@@ -213,18 +181,6 @@ func (b *AttachedEmulatorBackend) inspectProperties(ctx context.Context, instanc
 		}
 	}
 	return state, properties, nil
-}
-
-func (b *AttachedEmulatorBackend) getProperty(ctx context.Context, name string) (string, error) {
-	result, err := b.runADB(ctx, "shell", "getprop", name)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(result.Stdout)), nil
-}
-
-func (b *AttachedEmulatorBackend) runADB(ctx context.Context, args ...string) (command.Result, error) {
-	return runExactSerialADB(ctx, b.runner, b.adbBinary, b.serial, command.DefaultOutputLimit, args...)
 }
 
 func (b *AttachedEmulatorBackend) requirePlanAllocation(allocation Allocation) error {

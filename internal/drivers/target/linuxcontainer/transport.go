@@ -26,11 +26,16 @@ type targetTransport struct {
 	gid              int
 	enforceOwnership bool
 
-	mu      sync.Mutex
-	closed  bool
-	drained bool
-	execs   []ports.ExecTransport
-	pulls   map[*verifiedPull]struct{}
+	mu         sync.Mutex
+	closed     bool
+	drained    bool
+	closing    bool
+	active     int
+	activeDone chan struct{}
+	closeDone  chan struct{}
+	closeErr   error
+	execs      []ports.ExecTransport
+	pulls      map[*verifiedPull]struct{}
 }
 
 func (t *targetTransport) OpenExec(ctx context.Context, plan ports.TargetExecPlan) (ports.ExecTransport, error) {
@@ -43,9 +48,10 @@ func (t *targetTransport) OpenExec(ctx context.Context, plan ports.TargetExecPla
 	if err := t.authorize(plan.Operation); err != nil {
 		return nil, err
 	}
-	if err := t.requireOpen(); err != nil {
+	if err := t.beginOperation(); err != nil {
 		return nil, err
 	}
+	defer t.endOperation()
 	exec, err := t.runtime.OpenExec(ctx, t.runtimeID, plan)
 	if err != nil {
 		return nil, domain.NewError(domain.CodeUnavailable, "linux_target.transport.exec", "runtime", "target exec could not be opened", err)
@@ -77,9 +83,10 @@ func (t *targetTransport) PushFile(ctx context.Context, plan ports.TargetTransfe
 	if err := t.authorize(plan.Operation); err != nil {
 		return ports.TransferResult{}, err
 	}
-	if err := t.requireOpen(); err != nil {
+	if err := t.beginOperation(); err != nil {
 		return ports.TransferResult{}, err
 	}
+	defer t.endOperation()
 	if reader == nil {
 		return ports.TransferResult{}, domain.NewError(domain.CodeInvalidArgument, "linux_target.transport.push", "reader", "is required", nil)
 	}
@@ -156,9 +163,10 @@ func (t *targetTransport) PullFile(ctx context.Context, plan ports.TargetTransfe
 	if err := t.authorize(plan.Operation); err != nil {
 		return nil, err
 	}
-	if err := t.requireOpen(); err != nil {
+	if err := t.beginOperation(); err != nil {
 		return nil, err
 	}
+	defer t.endOperation()
 	normalized, err := safepath.Normalize(plan.RelativePath)
 	if err != nil {
 		return nil, domain.NewError(domain.CodeInvalidArgument, "linux_target.transport.pull", "relative_path", "is not a safe target-relative path", err)
@@ -232,33 +240,116 @@ func (t *targetTransport) OpenADB(ctx context.Context) (ports.ScopedADBEndpoint,
 }
 
 func (t *targetTransport) Close() error {
-	t.mu.Lock()
-	if t.drained {
+	ctx, cancel := context.WithTimeout(context.Background(), targetCleanupGrace)
+	defer cancel()
+	return t.closeContext(ctx)
+}
+
+// closeContext revokes new operations immediately and waits only within the
+// caller's cleanup budget for an operation already blocked in an arbitrary
+// reader. Container containment is established by the driver before this is
+// called, so a timed-out drain cannot preserve guest execution authority.
+func (t *targetTransport) closeContext(ctx context.Context) error {
+	if ctx == nil {
+		return context.Canceled
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		t.mu.Lock()
+		if t.drained {
+			t.mu.Unlock()
+			return nil
+		}
+		t.closed = true
+		if t.closing {
+			done := t.closeDone
+			t.mu.Unlock()
+			select {
+			case <-done:
+				t.mu.Lock()
+				err := t.closeErr
+				drained := t.drained
+				t.mu.Unlock()
+				if drained || err != nil {
+					return err
+				}
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		t.closing = true
+		t.closeDone = make(chan struct{})
+		done := t.closeDone
+		idle := t.activeDone
+		active := t.active
 		t.mu.Unlock()
-		return nil
-	}
-	t.closed = true
-	t.drained = true
-	execs := append([]ports.ExecTransport(nil), t.execs...)
-	t.execs = nil
-	pulls := make([]*verifiedPull, 0, len(t.pulls))
-	for reader := range t.pulls {
-		pulls = append(pulls, reader)
-	}
-	t.pulls = nil
-	t.mu.Unlock()
-	var first error
-	for _, exec := range execs {
-		if err := exec.Close(); err != nil && first == nil {
-			first = err
+
+		if active > 0 {
+			select {
+			case <-idle:
+			case <-ctx.Done():
+				t.finishCloseAttempt(done, ctx.Err(), false)
+				return ctx.Err()
+			}
+		}
+
+		t.mu.Lock()
+		execs := append([]ports.ExecTransport(nil), t.execs...)
+		pulls := make([]*verifiedPull, 0, len(t.pulls))
+		for reader := range t.pulls {
+			pulls = append(pulls, reader)
+		}
+		t.mu.Unlock()
+
+		// Exec implementations are external process transports and their Close
+		// methods are not context-aware. Complete them asynchronously so the
+		// lifecycle caller still observes its deadline if one misbehaves.
+		go func() {
+			errs := make([]error, 0)
+			for _, exec := range execs {
+				if err := exec.Close(); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			for _, reader := range pulls {
+				if err := reader.Close(); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			t.finishCloseAttempt(done, errors.Join(errs...), true)
+		}()
+		select {
+		case <-done:
+			t.mu.Lock()
+			err := t.closeErr
+			t.mu.Unlock()
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
-	for _, reader := range pulls {
-		if err := reader.Close(); err != nil && first == nil {
-			first = err
-		}
+}
+
+func (t *targetTransport) finishCloseAttempt(done chan struct{}, err error, completed bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.closing || t.closeDone != done {
+		return
 	}
-	return first
+	t.closing = false
+	t.closeErr = err
+	if completed && err == nil {
+		t.drained = true
+		t.execs = nil
+		t.pulls = nil
+	}
+	close(done)
+	if completed {
+		t.closeDone = nil
+	}
 }
 
 func (t *targetTransport) revoke() {
@@ -282,6 +373,29 @@ func (t *targetTransport) requireOpen() error {
 		return io.ErrClosedPipe
 	}
 	return nil
+}
+
+func (t *targetTransport) beginOperation() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return io.ErrClosedPipe
+	}
+	if t.active == 0 {
+		t.activeDone = make(chan struct{})
+	}
+	t.active++
+	return nil
+}
+
+func (t *targetTransport) endOperation() {
+	t.mu.Lock()
+	t.active--
+	if t.active == 0 {
+		close(t.activeDone)
+		t.activeDone = nil
+	}
+	t.mu.Unlock()
 }
 
 func (t *targetTransport) recordLifecycle(kind string, operationID domain.TargetOperationID, payload any) error {

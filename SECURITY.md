@@ -21,8 +21,9 @@ and the programs or Android apps they investigate. It:
 It does **not**:
 
 - claim that ordinary Docker containers resist an unknown host-kernel exploit
-- accept Android or physical-device target composition in either daemon by
-  default (those drivers remain qualification packages)
+- enable physical drivers by default; managed `android-emulator` composition is
+  opt-in and deployment-profile gated, while daemon-selected Cuttlefish and
+  physical-device backends are not shipped
 - ship a production collector suite, remote forensic backend, or supported
   host/version matrix
 
