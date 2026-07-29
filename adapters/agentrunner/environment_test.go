@@ -22,18 +22,26 @@ import (
 )
 
 type scriptedExecTransport struct {
-	mu      sync.Mutex
-	sent    []transport.Frame
-	frames  chan transport.Frame
-	script  []transport.Frame
-	start   sync.Once
-	closed  chan struct{}
-	close   sync.Once
-	trigger transport.Kind
+	mu          sync.Mutex
+	sent        []transport.Frame
+	frames      chan transport.Frame
+	script      []transport.Frame
+	start       sync.Once
+	closed      chan struct{}
+	close       sync.Once
+	trigger     transport.Kind
+	receiving   chan struct{}
+	receiveOnce sync.Once
 }
 
 func newScriptedExecTransport(script ...transport.Frame) *scriptedExecTransport {
-	return &scriptedExecTransport{frames: make(chan transport.Frame, len(script)), script: script, closed: make(chan struct{}), trigger: transport.KindCloseInput}
+	return &scriptedExecTransport{
+		frames:    make(chan transport.Frame, len(script)),
+		script:    script,
+		closed:    make(chan struct{}),
+		trigger:   transport.KindCloseInput,
+		receiving: make(chan struct{}),
+	}
 }
 
 func (s *scriptedExecTransport) Send(ctx context.Context, kind transport.Kind, data []byte) (transport.Frame, error) {
@@ -59,6 +67,7 @@ func (s *scriptedExecTransport) Receive(ctx context.Context) (transport.Frame, e
 	if err := ports.RequireDeadline(ctx, "test_transport.receive"); err != nil {
 		return transport.Frame{}, err
 	}
+	s.receiveOnce.Do(func() { close(s.receiving) })
 	select {
 	case <-ctx.Done():
 		return transport.Frame{}, ctx.Err()
@@ -223,10 +232,29 @@ func TestExecutePreservesOrderedSeparateStreamsAndInput(t *testing.T) {
 }
 
 func TestExecuteCancellationFinalizesExec(t *testing.T) {
-	fixture := newEnvironmentFixture(t, newScriptedExecTransport())
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	stream := newScriptedExecTransport()
+	fixture := newEnvironmentFixture(t, stream)
+	// Keep a generous deadline for control-plane setup; cancel only after the
+	// scripted transport is blocked in Receive so cancellation hits exchange.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_, err := fixture.environment.Execute(ctx, Request{IdempotencyKey: "cancelled-run", CorrelationID: requestCorrelation(t), Kind: domain.ExecTool, Executable: "bin/tool", CleanupGrace: 10 * time.Millisecond})
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := fixture.environment.Execute(ctx, Request{
+			IdempotencyKey: "cancelled-run", CorrelationID: requestCorrelation(t),
+			Kind: domain.ExecTool, Executable: "bin/tool", CleanupGrace: 10 * time.Millisecond,
+		})
+		errCh <- err
+	}()
+	select {
+	case <-stream.receiving:
+	case err := <-errCh:
+		t.Fatalf("execution finished before Receive: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for guest Receive before cancellation")
+	}
+	cancel()
+	err := <-errCh
 	var executionError *ExecutionError
 	if !errors.As(err, &executionError) || executionError.ExecID == "" {
 		t.Fatalf("execution error = %T %v", err, err)

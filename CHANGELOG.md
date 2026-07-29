@@ -84,6 +84,9 @@ schema, or on-disk format changes. Prefer the newest 0.x tag for consumers.
   with the quarantine saga, which could expire under slow Windows CI runners.
 - Interrupted-run recovery reconcile now expects the preserved generation to
   report adopted after finalization so a second startup inventory is clean.
+- `TestExecuteCancellationFinalizesExec` cancels only after the scripted guest
+  transport is blocked in Receive, so slow Windows CI no longer races a 100ms
+  setup deadline.
 
 ### Notes
 
