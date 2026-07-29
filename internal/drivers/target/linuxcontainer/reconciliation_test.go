@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -504,10 +505,21 @@ func TestRestartActiveMissingTargetRetainsOnlyDirectoryCleanupAuthority(t *testi
 	}
 }
 
+// testTargetUser returns an identity the current process can already own.
+// Production defaults to 65532:65532 and requires root handoff on Linux; unit
+// tests on non-root CI runners use the current uid/gid so ownership is a no-op.
+func testTargetUser(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "linux" && os.Geteuid() != 0 {
+		return fmt.Sprintf("%d:%d", os.Geteuid(), os.Getegid())
+	}
+	return defaultTargetUser
+}
+
 func restartTargetDrivers(t *testing.T, runtime *inventoryRuntime, input ports.TargetPlan) (*Driver, *Driver, ContainerPlan) {
 	t.Helper()
 	config := Config{
-		Build: BuildConfig{TargetRoot: t.TempDir(), ImageRepository: "example.invalid/target"}, Runtime: runtime,
+		Build: BuildConfig{TargetRoot: t.TempDir(), ImageRepository: "example.invalid/target", ContainerUser: testTargetUser(t)}, Runtime: runtime,
 		Collectors: CollectorReadinessFunc(func(context.Context, domain.TargetRunID, []ports.ObservationRequirement) error { return nil }),
 	}
 	first, err := New(config)

@@ -867,15 +867,24 @@ func TestControllerReconcilePhysicalResourcesFinalizesInterruptedRunAndLosesActi
 	}
 	freshTarget := testkit.NewFakeTargetDriver(domain.CapabilityFingerprint{}, fixture.clock, nil, testkit.NewOwnershipTracker())
 	targetDriver := &reconciliationTargetDriver{FakeTargetDriver: freshTarget}
+	// Before crash recovery the exact stopped runtime is preserved-but-uncertain.
+	// After recovery has finalized the interrupted run, inventory must report
+	// the still-owned generation as adopted so a second reconcile is clean.
 	targetDriver.reconcile = func(expected []ports.TargetPlan) ports.TargetReconciliationReport {
 		report := ports.TargetReconciliationReport{ObservedAt: fixture.clock.Now()}
+		classification := ports.PhysicalResourceUncertain
+		diagnostic := "exact plan-owned runtime is stopped and preserved"
+		if targetDriver.recoverCalls > 0 {
+			classification = ports.PhysicalResourceAdopted
+			diagnostic = "exact plan-owned runtime is stopped after interrupted-run recovery"
+		}
 		for _, plan := range expected {
 			spec := plan.Generation.Spec()
 			ref := ports.TargetRef{ID: spec.TargetID, Generation: spec.Generation}
 			report.Expected = append(report.Expected, ports.TargetReconciliation{
 				Ref: ref, RuntimeID: "stopped-runtime-" + spec.TargetID.String(),
-				Classification: ports.PhysicalResourceUncertain, PlanMatched: true,
-				Diagnostic: "exact plan-owned runtime is stopped and preserved",
+				Classification: classification, PlanMatched: true,
+				Diagnostic: diagnostic,
 			})
 		}
 		return report

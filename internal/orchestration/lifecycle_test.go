@@ -34,10 +34,12 @@ func TestQuarantineTargetRequiresPhysicalProofBeforeAtomicControlTransition(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+	// Keep transport checks on a separate, longer deadline so quarantine work
+	// itself cannot expire the proof context under slow CI runners.
+	transportCtx, transportCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer transportCancel()
 	runID, _ := domain.ParseTargetRunID(run.ID)
-	transport, err := driver.OpenTransport(ctx, runID)
+	transport, err := driver.OpenTransport(transportCtx, runID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,12 +66,12 @@ func TestQuarantineTargetRequiresPhysicalProofBeforeAtomicControlTransition(t *t
 	if got := driver.callOrder(); len(got) != 2 || got[0] != "stop" || got[1] != "quarantine" {
 		t.Fatalf("physical call order = %v, want [stop quarantine]", got)
 	}
-	if _, err := transport.OpenADB(ctx); !domain.IsCode(err, domain.CodeCapabilityUnavailable) && err != io.ErrClosedPipe {
+	if _, err := transport.OpenADB(transportCtx); !domain.IsCode(err, domain.CodeCapabilityUnavailable) && err != io.ErrClosedPipe {
 		// The fake transport normally reports closed-pipe after revocation. Keep
 		// the capability result acceptable for transports that check kind first.
 		t.Fatalf("quarantine left transport usable: %v", err)
 	}
-	if _, err := driver.OpenTransport(ctx, runID); err == nil {
+	if _, err := driver.OpenTransport(transportCtx, runID); err == nil {
 		t.Fatal("quarantined physical run opened a new transport")
 	}
 	replayed, err := harness.capabilities.QuarantineTarget(context.Background(), request)

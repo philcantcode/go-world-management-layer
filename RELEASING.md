@@ -45,8 +45,8 @@ Shipped commands live under `cmd/` (`worldd`, `world-node`, `worldctl`,
 5. Create and push an annotated tag:
 
    ```sh
-   git tag -a v0.1.0 -m "v0.1.0"
-   git push origin v0.1.0
+   git tag -a v0.2.0 -m "v0.2.0"
+   git push origin v0.2.0
    ```
 
 The release workflow reruns tests and creates the GitHub release with generated
@@ -55,5 +55,5 @@ workflow; do not move a published tag.
 
 ## Consumers
 
-Document the exact tag consumers should pin (`@v0.1.0`). Prefer immutable
+Document the exact tag consumers should pin (`@v0.2.0`). Prefer immutable
 digests for deployment profiles, images, and policies over floating `latest`.

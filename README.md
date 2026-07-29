@@ -10,7 +10,7 @@ It keeps a persistent agent workspace separate from disposable target
 sandboxes, scopes every operation to a lease and generation, and preserves
 failures and observation gaps as evidence.
 
-**Status:** v0.1.0 — active pre-v1 implementation. Minor 0.x releases may break
+**Status:** v0.2.0 — active pre-v1 implementation. Minor 0.x releases may break
 APIs, CLIs, policies, schemas, or on-disk formats; pin consumers to an exact
 tag. `worldd` and `world-node` both ship an authenticated logical control plane
 and opt-in physical Linux and Android composition: digest-pinned Docker agent
@@ -175,7 +175,7 @@ Requires [Go 1.23](https://go.dev/dl/) or newer.
 Library client:
 
 ```console
-go get github.com/philcantcode/go-world-management-layer/world@v0.1.0
+go get github.com/philcantcode/go-world-management-layer/world@v0.2.0
 ```
 
 ```go
@@ -185,8 +185,8 @@ import "github.com/philcantcode/go-world-management-layer/world"
 Daemons and operator tools:
 
 ```console
-go install github.com/philcantcode/go-world-management-layer/cmd/worldd@v0.1.0
-go install github.com/philcantcode/go-world-management-layer/cmd/worldctl@v0.1.0
+go install github.com/philcantcode/go-world-management-layer/cmd/worldd@v0.2.0
+go install github.com/philcantcode/go-world-management-layer/cmd/worldctl@v0.2.0
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes and [RELEASING.md](RELEASING.md)

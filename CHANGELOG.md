@@ -10,6 +10,8 @@ schema, or on-disk format changes. Prefer the newest 0.x tag for consumers.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-29
+
 ### Added
 
 - Opt-in managed Android SDK Emulator daemon composition with exact full-tree
@@ -33,7 +35,6 @@ schema, or on-disk format changes. Prefer the newest 0.x tag for consumers.
   commits their stop afterward, so target-owned stream closure is an explicit
   boundary rather than a false collector crash; failed target stops cancel the
   preparation.
-
 - Docker Linux target generations now grant mutable authority to exactly one
   run. Stop/finalization proves the exact container stopped, including detached
   or session-escaped processes, and another run requires replacement reset.
@@ -73,6 +74,24 @@ schema, or on-disk format changes. Prefer the newest 0.x tag for consumers.
 - The deployment-profile schema is now version 3 and the durable run-observer
   marker is now version 6. Older profile/marker formats are rejected rather
   than interpreted without the typed runtime-binding authority.
+
+### Fixed
+
+- Non-root Linux CI ownership for Docker agent and Linux-target unit fixtures:
+  crash-recovery and restart helpers now use the current process identity
+  instead of requiring a root handoff to `65532:65532`.
+- Quarantine transport-revocation proof no longer shares a one-second deadline
+  with the quarantine saga, which could expire under slow Windows CI runners.
+- Interrupted-run recovery reconcile now expects the preserved generation to
+  report adopted after finalization so a second startup inventory is clean.
+
+### Notes
+
+- Status remains pre-v1. Managed Cuttlefish daemon composition, production
+  collector suites, remote forensic repository integration, packaging, and a
+  supported host/version matrix remain follow-on release work.
+- Ordinary `go test ./...` does not start Docker, an emulator, OverlayFS, eBPF,
+  or a remote artifact service. Real-node qualification is separate evidence.
 
 ## [0.1.0] - 2026-07-28
 

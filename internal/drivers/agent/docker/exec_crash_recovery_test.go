@@ -223,7 +223,10 @@ func newExecCrashDriver(t *testing.T, engine Engine, input ports.AgentWorkspaceP
 	if err := os.MkdirAll(filepath.Join(root, input.Workspace.ID().String(), "merged"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	driver, err := New(Config{Build: BuildConfig{WorkspaceRoot: root, ImageRepository: "example.invalid/agent"}, Engine: engine})
+	driver, err := New(Config{
+		Build:  BuildConfig{WorkspaceRoot: root, ImageRepository: "example.invalid/agent", ContainerUser: testGuestUser(t)},
+		Engine: engine,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
