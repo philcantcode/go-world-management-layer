@@ -6,7 +6,7 @@ plan and its phase exit gates.
 
 | ADR | Status | Decision |
 | --- | --- | --- |
-| [0001](0001-linux-node-control-and-execution-split.md) | Accepted | Target Linux nodes and split logical control from privileged node execution |
+| [0001](0001-linux-node-control-and-execution-split.md) | Superseded | Dual-daemon split superseded by in-process library Manager; Linux physical-driver isolation intent retained |
 | [0002](0002-host-default-runner-execution-environment.md) | Accepted | Run provider CLIs through a lease-bound, host-default runner execution environment |
 | [0003](0003-dedicated-overlay-workspaces.md) | Accepted | Use shared immutable input views and dedicated OverlayFS workspaces |
 | [0004](0004-causal-ledger-and-live-streams.md) | Accepted | Keep a durable causal ledger behind resumable live streams |

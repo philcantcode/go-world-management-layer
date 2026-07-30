@@ -19,7 +19,7 @@ func TestParseOpenExecKeepsArgumentOnlyIndexContract(t *testing.T) {
 	options, err := parseOpenExec([]string{
 		"-lease", "lease_1", "-executable", "/workspace/provider", "-policy", "sha256:policy",
 		"-temporary-input", "1:payload.bin=" + source, "--", "-input", "placeholder", "-output", "result.json",
-	}, &bytes.Buffer{}, worldcli.ConnectionConfig{Timeout: time.Second})
+	}, &bytes.Buffer{}, worldcli.OpenConfig{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -17,15 +17,15 @@ type targetExecOptions struct {
 	outcomeJSON bool
 }
 
-func targetExec(ctx context.Context, client *world.Client, arguments []string, stdin io.Reader, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
-	return runTargetExec(ctx, client, arguments, stdin, stdout, stderr, configuration, false)
+func targetExec(ctx context.Context, manager *world.Manager, arguments []string, stdin io.Reader, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
+	return runTargetExec(ctx, manager, arguments, stdin, stdout, stderr, configuration, false)
 }
 
-func targetShell(ctx context.Context, client *world.Client, arguments []string, stdin io.Reader, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
-	return runTargetExec(ctx, client, arguments, stdin, stdout, stderr, configuration, true)
+func targetShell(ctx context.Context, manager *world.Manager, arguments []string, stdin io.Reader, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
+	return runTargetExec(ctx, manager, arguments, stdin, stdout, stderr, configuration, true)
 }
 
-func runTargetExec(ctx context.Context, client *world.Client, arguments []string, stdin io.Reader, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig, shell bool) error {
+func runTargetExec(ctx context.Context, manager *world.Manager, arguments []string, stdin io.Reader, stdout, stderr io.Writer, configuration worldcli.OpenConfig, shell bool) error {
 	options, err := parseTargetExec(arguments, stderr, configuration, shell)
 	if err != nil {
 		return err
@@ -35,10 +35,11 @@ func runTargetExec(ctx context.Context, client *world.Client, arguments []string
 		return err
 	}
 	defer closeInput()
-	stream, err := client.OpenTargetExec(ctx)
+	stream, err := manager.OpenTargetExec(ctx)
 	if err != nil {
 		return err
 	}
+	defer stream.Close()
 	var output worldcli.ExecOutput
 	err = worldcli.PumpBidi(stream, &worldv1.TargetExecFrame{Start: options.start}, input,
 		func(data []byte) *worldv1.TargetExecFrame { return &worldv1.TargetExecFrame{Stdin: data} },
@@ -52,7 +53,7 @@ func runTargetExec(ctx context.Context, client *world.Client, arguments []string
 	return output.Finish(stderr, options.outcomeJSON)
 }
 
-func parseTargetExec(arguments []string, stderr io.Writer, configuration worldcli.ConnectionConfig, shell bool) (*targetExecOptions, error) {
+func parseTargetExec(arguments []string, stderr io.Writer, configuration worldcli.OpenConfig, shell bool) (*targetExecOptions, error) {
 	name := "exec"
 	if shell {
 		name = "shell"

@@ -12,7 +12,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/world"
 )
 
-type observeHandler func(context.Context, *world.Client, []string, io.Writer, io.Writer) error
+type observeHandler func(context.Context, *world.Manager, []string, io.Writer, io.Writer) error
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
@@ -30,34 +30,34 @@ func run(arguments []string, stdout, stderr io.Writer) error {
 	if !ok {
 		return worldcli.UsageError(fmt.Sprintf("unknown command %q (available: %s)", command, observeCommandList()))
 	}
-	client, err := worldcli.Dial(configuration)
+	manager, err := worldcli.Open(configuration)
 	if err != nil {
 		return err
 	}
-	defer client.Close()
+	defer manager.Close()
 	ctx, cancel := worldcli.Context(configuration)
 	defer cancel()
-	return handler(ctx, client, commandArguments, stdout, stderr)
+	return handler(ctx, manager, commandArguments, stdout, stderr)
 }
 
 func observeCommands() map[string]observeHandler {
 	lease := worldcli.Env("WORLD_LEASE_ID")
 	run := worldcli.Env("WORLD_TARGET_RUN_ID")
 	return map[string]observeHandler{
-		"snapshot": func(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer) error {
-			return worldcli.RunSnapshot(ctx, client, arguments, stdout, stderr, lease, false)
+		"snapshot": func(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer) error {
+			return worldcli.RunSnapshot(ctx, manager, arguments, stdout, stderr, lease, false)
 		},
-		"top": func(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer) error {
-			return worldcli.RunSnapshot(ctx, client, arguments, stdout, stderr, lease, true)
+		"top": func(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer) error {
+			return worldcli.RunSnapshot(ctx, manager, arguments, stdout, stderr, lease, true)
 		},
-		"watch": func(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer) error {
-			return worldcli.RunObservationWatch(ctx, client, arguments, stdout, stderr, lease)
+		"watch": func(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer) error {
+			return worldcli.RunObservationWatch(ctx, manager, arguments, stdout, stderr, lease)
 		},
-		"metrics": func(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer) error {
-			return worldcli.RunMetricWatch(ctx, client, arguments, stdout, stderr, lease)
+		"metrics": func(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer) error {
+			return worldcli.RunMetricWatch(ctx, manager, arguments, stdout, stderr, lease)
 		},
-		"bundle": func(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer) error {
-			return worldcli.RunBundle(ctx, client, arguments, stdout, stderr, run)
+		"bundle": func(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer) error {
+			return worldcli.RunBundle(ctx, manager, arguments, stdout, stderr, run)
 		},
 	}
 }

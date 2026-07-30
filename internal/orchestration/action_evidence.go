@@ -8,6 +8,7 @@ import (
 
 	worldv1 "github.com/philcantcode/go-world-management-layer/api/world/v1"
 	"github.com/philcantcode/go-world-management-layer/internal/application"
+	"github.com/philcantcode/go-world-management-layer/internal/ports"
 	"github.com/philcantcode/go-world-management-layer/internal/research"
 	"github.com/philcantcode/go-world-management-layer/internal/transport"
 )
@@ -18,6 +19,14 @@ func (s *Service) ActionEvidence() *research.Store {
 		return nil
 	}
 	return s.actionEvidence
+}
+
+// Material returns the composed material authority, if any.
+func (s *Service) Material() ports.MaterialAuthority {
+	if s == nil {
+		return nil
+	}
+	return s.material
 }
 
 func (s *Service) beginAgentAction(ctx context.Context, record application.ExecRecord, meta application.MutationMeta) (*research.Session, error) {

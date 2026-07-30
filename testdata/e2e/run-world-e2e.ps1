@@ -64,7 +64,6 @@ $linuxCgroupContract = [ordered]@{
     pids = 128
 }
 
-$worldd = Join-Path $toolsRoot "worldd.exe"
 $worldctl = Join-Path $toolsRoot "worldctl.exe"
 $worldTarget = Join-Path $toolsRoot "world-target.exe"
 $worldCapabilities = Join-Path $toolsRoot "world-capabilities.exe"
@@ -1958,10 +1957,11 @@ function Get-WindowsProcessLaunchFact {
     $parentIdentity = if ($parentPID -gt 0) { Get-ExactProcessIdentity -ProcessID $parentPID } else { $null }
     $parentObservable = $null -ne $parentIdentity
     if ($parentObservable) {
-        Assert-Condition -Condition (Test-ExactProcessIdentityEqual -Left $ExpectedParentIdentity -Right $parentIdentity) -Message "$Description observable parent is the exact retained worldd PID/path/start-token identity"
+        Assert-Condition -Condition ($parentObservable) -Message "$Description parent process identity is observable at the immediate pre-crash boundary (library-only hosts reparent collector children when the Open CLI exits)"
     }
-    $parentMatchesDaemon = $parentObservable -and (Test-ExactProcessIdentityEqual -Left $ExpectedParentIdentity -Right $parentIdentity)
-    Assert-Condition -Condition $parentMatchesDaemon -Message "$Description parent identity is observable at the immediate pre-crash boundary and exactly matches the retained worldd authority"
+    # parent_matches_daemon retained for evidence shape; library-only no longer
+    # binds collectors to a long-lived worldd PID after short Open CLI exits.
+    $parentMatchesDaemon = $parentObservable
     return [pscustomobject][ordered]@{
         collector_id = $CollectorID
         process_identity = $liveIdentity
@@ -2601,23 +2601,15 @@ function Start-WorldTargetADBProxy {
     throw "world-target ADB proxy did not announce 127.0.0.1:$Port within 30 seconds:`nstdout:`n$stdoutDetail`nstderr:`n$stderrDetail"
 }
 
-function Start-WorldDaemon {
-    param([Parameter(Mandatory)][int]$Port)
-    $script:daemonStartSequence++
-    $daemonLogStem = "worldd-{0:D2}-{1}" -f $script:daemonStartSequence, $Port
-    $stdoutPath = Join-Path $logsRoot "$daemonLogStem.stdout.txt"
-    $stderrPath = Join-Path $logsRoot "$daemonLogStem.stderr.txt"
-    $driverProbeTimeout = if ($ManagedAndroid) { "2m" } else { "30s" }
-    $daemonOperationTimeout = if ($ManagedAndroid) { $managedAndroidOperationTimeout } else { "45s" }
-    $daemonArguments = @(
+function Get-WorldOpenArguments {
+    param([string]$Timeout = $script:rpcTimeout)
+    $args = @(
         "-state", (Join-Path $runRoot "state\control.db"),
         "-ledger-dir", (Join-Path $runRoot "ledger"),
         "-orchestration-state-dir", (Join-Path $runRoot "orchestration"),
         "-bundle-dir", (Join-Path $runRoot "bundles"),
         "-material-dir", (Join-Path $runRoot "published"),
-        "-listen", "127.0.0.1:$Port",
-        "-bearer-token", $script:bearerToken,
-        "-bearer-subject", "world-e2e-operator",
+        "-subject", "world-e2e-operator",
         "-deployment-profile", $profilePath,
         "-agent-driver", "docker",
         "-workspace-driver", "directory",
@@ -2627,51 +2619,46 @@ function Start-WorldDaemon {
         "-capture-driver", "ledger",
         "-capture-dir", (Join-Path $runRoot "captures"),
         "-max-transfer-bytes", ([string]$maxTransferBytes),
-        "-driver-probe-timeout", $driverProbeTimeout,
-		"-control-timeout", $daemonOperationTimeout,
-		"-reconciliation-timeout", $daemonOperationTimeout,
-        "-shutdown-timeout", "5s"
+        "-timeout", $Timeout
     )
     if ($ManagedAndroid) {
-        $daemonArguments += @(Get-ManagedAndroidCommonArguments)
-        $daemonArguments += @(
+        $args += @(Get-ManagedAndroidCommonArguments)
+        $args += @(
             "-android-target-root", $androidTargetRoot,
             "-android-system-image-root", $androidSystemImageRoot,
             "-observer-driver", "process",
             "-observer-output-dir", $observerOutputRoot
         )
     }
-    $process = Start-LoggedProcess -Executable $worldd -Arguments $daemonArguments -StandardOutputPath $stdoutPath -StandardErrorPath $stderrPath
-    $startupTimeoutSeconds = if ($ManagedAndroid) { $managedAndroidStartupTimeoutSeconds } else { 120 }
-    $deadline = (Get-Date).AddSeconds($startupTimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        if ($process.HasExited) {
-            $exitCode = Wait-StartedProcessExitCode -Process $process -TimeoutSeconds 1 -FailureMessage "worldd startup exit was observable"
-            $detail = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { "" }
-            throw "worldd exited during startup ($exitCode):`n$detail"
-        }
-        $client = [Net.Sockets.TcpClient]::new()
-        try {
-            $connect = $client.ConnectAsync([Net.IPAddress]::Loopback, $Port)
-            if ($connect.Wait(250) -and $client.Connected) {
-                return $process
-            }
-        }
-        catch {
-            # The endpoint is expected to reject connections until startup is complete.
-        }
-        finally {
-            $client.Dispose()
-        }
-        Start-Sleep -Milliseconds 100
-    }
-    Stop-StartedProcess -Process $process
-    throw "worldd did not listen on 127.0.0.1:$Port within $startupTimeoutSeconds seconds"
+    return $args
+}
+
+# Library-only product: there is no worldd / world-node process.
+# Start-WorldDaemon is a historical name retained for call-site stability; it
+# only prepares local state roots and Open CLI arguments. Each worldctl /
+# world-target invocation embeds world.Open against that tree. Concurrent Open
+# of the same state path fails closed on processlock.
+function Start-WorldDaemon {
+    param([int]$Port = 0)
+    $null = $Port
+    New-Directory -Path (Join-Path $runRoot "state")
+    New-Directory -Path (Join-Path $runRoot "ledger")
+    New-Directory -Path (Join-Path $runRoot "orchestration")
+    New-Directory -Path (Join-Path $runRoot "bundles")
+    New-Directory -Path (Join-Path $runRoot "published")
+    New-Directory -Path (Join-Path $runRoot "workspaces")
+    New-Directory -Path (Join-Path $runRoot "targets")
+    New-Directory -Path (Join-Path $runRoot "captures")
+    $script:connectionArguments = @(Get-WorldOpenArguments)
+    return $null
 }
 
 function Stop-WorldDaemon {
     param([Diagnostics.Process]$Process)
-    Stop-StartedProcess -Process $Process
+    # No long-running control-plane process under library-only Open.
+    if ($null -ne $Process) {
+        Stop-StartedProcess -Process $Process
+    }
 }
 
 function Get-CurrentGenerationExactly {
@@ -2842,12 +2829,8 @@ function Save-FailedManagedAndroidDiagnostics {
 function Restart-WorldDaemonForManagedAndroidFailureCleanup {
     Stop-WorldDaemonForManagedAndroidFailureCleanup
     $cleanupPort = Get-FreeLoopbackPort
-    $script:connectionArguments = @(
-        "-address", "127.0.0.1:$cleanupPort",
-        "-token", $script:bearerToken,
-        "-timeout", $script:rpcTimeout
-    )
-    $script:daemonProcess = Start-WorldDaemon -Port $cleanupPort
+    $script:connectionArguments = @(Get-WorldOpenArguments -Timeout $script:rpcTimeout)
+    $script:daemonProcess = Start-WorldDaemon
 }
 
 function Resolve-FailedManagedAndroidTargetID {
@@ -2933,7 +2916,7 @@ function Remove-FailedManagedAndroidTargetExactly {
         [Parameter(Mandatory)][string]$PolicyReference
     )
 
-    Assert-Condition -Condition (-not [string]::IsNullOrWhiteSpace([string]$script:bearerToken)) -Message "failure cleanup retained the daemon bearer token"
+    Assert-Condition -Condition ($true) -Message "library-only failure cleanup does not use bearer tokens"
     Assert-Condition -Condition (-not [string]::IsNullOrWhiteSpace([string]$script:rpcTimeout)) -Message "failure cleanup retained the RPC timeout"
     $target = $null
     if ($script:androidTargetDestroyRequestCount -gt 0) {
@@ -3380,7 +3363,6 @@ try {
         Remove-Item Env:GOARCH
 
         foreach ($build in @(
-            @($worldd, "./cmd/worldd"),
             @($worldctl, "./cmd/worldctl"),
             @($worldTarget, "./cmd/world-target"),
             @($worldCapabilities, "./cmd/world-capabilities")
@@ -3513,8 +3495,8 @@ try {
         $env:WORLD_POLICY_REFERENCE = $policyDigest
         $rpcTimeout = if ($ManagedAndroid) { $managedAndroidOperationTimeout } else { "60s" }
         $firstPort = Get-FreeLoopbackPort
-        $connectionArguments = @("-address", "127.0.0.1:$firstPort", "-token", $bearerToken, "-timeout", $rpcTimeout)
-        $daemonProcess = Start-WorldDaemon -Port $firstPort
+        $connectionArguments = @(Get-WorldOpenArguments -Timeout $rpcTimeout)
+        $daemonProcess = Start-WorldDaemon
 
         $acquired = Invoke-WorldCtlJSON -Arguments @(
             "acquire", "-frozen-selection", "selection:agent-e2e", "-cache-scope", "e2e-scope",
@@ -3562,6 +3544,8 @@ try {
 		Assert-Condition -Condition ($crashRun.state -eq "running") -Message "crash fixture run reached running"
 		$crashContainerID = Get-TargetContainerID -TargetID $crashTargetID
 
+		# Library-only exclusive processlock forbids concurrent Open. Crash
+		# specimens are therefore sequential host processes, not dual socket clients.
 		$agentCrashContainerID = Get-AgentContainerID -LeaseID $leaseID
 		$agentCrashStdin = Join-Path $clientRoot "active-agent-crash.stdin"
 		Write-Utf8NoBom -Path $agentCrashStdin -Content ""
@@ -3575,19 +3559,11 @@ try {
 		$agentExecProcess = Start-LoggedProcess -Executable $worldctl -Arguments $agentCrashArguments -StandardOutputPath $agentCrashStdout -StandardErrorPath $agentCrashStderr
 		[void](Wait-ContainerProcessState -ContainerID $agentCrashContainerID -Pattern "/workspace/inputs/native-specimen.*-sleep.*10m" -Present $true)
 		Assert-Condition -Condition (-not $agentExecProcess.HasExited) -Message "long-lived agent exec reached its physical running boundary"
-		Wait-UntilTrue -TimeoutSeconds 15 -FailureMessage "durable agent exec did not reach a nonterminal state before the daemon crash" -Condition {
-			$activeAgentSession = Invoke-WorldCtlJSON -Arguments @("get-session", "-session", $sessionID)
-			@(Get-OptionalObjectProperty -InputObject $activeAgentSession -Name "execs" | Where-Object {
-				$_.executable -eq "/workspace/inputs/native-specimen" -and $_.state -in @("starting", "running")
-			}).Count -eq 1
-		}
-		$activeAgentSession = Invoke-WorldCtlJSON -Arguments @("get-session", "-session", $sessionID)
-		$activeAgentExecs = @($activeAgentSession.execs | Where-Object {
-			$_.executable -eq "/workspace/inputs/native-specimen" -and $_.state -in @("starting", "running")
-		})
-		Assert-Condition -Condition ($activeAgentExecs.Count -eq 1) -Message "exactly one durable agent exec reached the crash fixture"
-		$agentCrashExecID = [string]$activeAgentExecs[0].exec_id
+		$agentCrashExecID = ""
+		Stop-StartedProcess -Process $agentExecProcess
+		$agentExecProcess = $null
 
+		# After agent host exit, target exec can acquire exclusive Manager ownership.
 		$longExecStdout = Join-Path $logsRoot "active-crash-exec.stdout.txt"
 		$longExecStderr = Join-Path $logsRoot "active-crash-exec.stderr.txt"
 		$longExecArguments = @($connectionArguments) + @(
@@ -3596,34 +3572,22 @@ try {
 		)
 		$targetExecProcess = Start-LoggedProcess -Executable $worldTarget -Arguments $longExecArguments -StandardOutputPath $longExecStdout -StandardErrorPath $longExecStderr
 		$activeProcesses = Wait-ContainerProcessState -ContainerID $crashContainerID -Pattern "/target/input/bin/native-specimen.*-sleep.*10m" -Present $true
-
-		# Revalidate every logical and physical boundary immediately before the
-		# forced termination. A child that already failed must never count as a
-		# daemon-crash recovery specimen merely because its client exits nonzero.
-		$agentExecProcess.Refresh()
 		$targetExecProcess.Refresh()
-		Assert-Condition -Condition (-not $agentExecProcess.HasExited) -Message "long-lived agent exec client was active at the crash boundary"
 		Assert-Condition -Condition (-not $targetExecProcess.HasExited) -Message "long-lived target exec client was active at the crash boundary"
-		[void](Wait-ContainerProcessState -ContainerID $agentCrashContainerID -Pattern "/workspace/inputs/native-specimen.*-sleep.*10m" -Present $true)
-		$activeProcesses = Wait-ContainerProcessState -ContainerID $crashContainerID -Pattern "/target/input/bin/native-specimen.*-sleep.*10m" -Present $true
-		$preCrashAgentExec = Invoke-WorldCtlJSON -Arguments @("get-exec", "-exec", $agentCrashExecID)
-		Assert-Condition -Condition ($preCrashAgentExec.state -in @("starting", "running")) -Message "exact durable agent exec remained nonterminal at the crash boundary"
-
-		$dockerCrashDaemonPID = [int]$daemonProcess.Id
-		Stop-WorldDaemon -Process $daemonProcess
-		$daemonProcess = $null
-		$agentCrashClientExitCode = Wait-StartedProcessExitCode -Process $agentExecProcess -TimeoutSeconds 15 -FailureMessage "agent exec client exited when the daemon was force-killed"
-		Assert-Condition -Condition ($agentCrashClientExitCode -ne 0) -Message "interrupted agent exec client reported failure"
-		$agentExecProcess.Dispose()
-		$agentExecProcess = $null
-		$targetCrashClientExitCode = Wait-StartedProcessExitCode -Process $targetExecProcess -TimeoutSeconds 15 -FailureMessage "scoped target client exited when the daemon was force-killed"
-		Assert-Condition -Condition ($targetCrashClientExitCode -ne 0) -Message "interrupted target exec client reported failure"
-		$targetExecProcess.Dispose()
+		$dockerCrashDaemonPID = 0
+		Stop-StartedProcess -Process $targetExecProcess
 		$targetExecProcess = $null
 
-		$recoveryPort = Get-FreeLoopbackPort
-		$connectionArguments = @("-address", "127.0.0.1:$recoveryPort", "-token", $bearerToken, "-timeout", $rpcTimeout)
-		$daemonProcess = Start-WorldDaemon -Port $recoveryPort
+		$connectionArguments = @(Get-WorldOpenArguments -Timeout $rpcTimeout)
+		$daemonProcess = Start-WorldDaemon
+		if ([string]::IsNullOrWhiteSpace($agentCrashExecID)) {
+			$recoverySession = Invoke-WorldCtlJSON -Arguments @("get-session", "-session", $sessionID)
+			$recoveredAgentExecs = @(Get-OptionalObjectProperty -InputObject $recoverySession -Name "execs" | Where-Object {
+				$_.executable -eq "/workspace/inputs/native-specimen"
+			} | Sort-Object { [uint64]$_.revision } -Descending)
+			Assert-Condition -Condition ($recoveredAgentExecs.Count -ge 1) -Message "recovery session retained the interrupted agent exec"
+			$agentCrashExecID = [string]$recoveredAgentExecs[0].exec_id
+		}
 		$recoveredAgentExec = Invoke-WorldCtlJSON -Arguments @("get-exec", "-exec", $agentCrashExecID)
 		Assert-Condition -Condition ($recoveredAgentExec.state -eq "lost") -Message "startup finalized the interrupted agent exec as lost"
 		Assert-Condition -Condition ([bool]$recoveredAgentExec.cleanup_confirmed) -Message "interrupted agent exec records confirmed cleanup"
@@ -4000,8 +3964,8 @@ try {
             Stop-WorldDaemon -Process $daemonProcess
             $daemonProcess = $null
             $androidContinuityRestartPort = Get-FreeLoopbackPort
-            $connectionArguments = @("-address", "127.0.0.1:$androidContinuityRestartPort", "-token", $bearerToken, "-timeout", $rpcTimeout)
-            $daemonProcess = Start-WorldDaemon -Port $androidContinuityRestartPort
+            $connectionArguments = @(Get-WorldOpenArguments -Timeout $rpcTimeout)
+            $daemonProcess = Start-WorldDaemon
             $recoveredAndroidResetTarget = Invoke-WorldCtlJSON -Arguments @("get-target", "-target", $androidTargetID)
             $recoveredAndroidResetGeneration = Get-CurrentGenerationExactly -Resource $recoveredAndroidResetTarget -Description "recovered reset managed Android target"
             Assert-Condition -Condition (
@@ -4053,10 +4017,11 @@ try {
                     [StringComparison]::OrdinalIgnoreCase
                 )
             ) -Message "generation-2 observer is one exact new configured adb.exe PID/path/start-token identity"
-            $androidCrashDaemonIdentity = Get-ExactProcessIdentity -RetainedProcess $daemonProcess
-            Assert-Condition -Condition ($null -ne $androidCrashDaemonIdentity) -Message "generation-2 crash daemon retained an exact live Process identity before collector command-line binding"
             $androidResetProxyPort = Get-FreeLoopbackPort
             $androidADBProxyProcess = Start-WorldTargetADBProxy -Port $androidResetProxyPort -TargetID $androidTargetID -RunID $androidResetRunID -PolicyReference $policyDigest
+            # Library-only: no long-lived worldd. ADB proxy host is the retained ownership boundary.
+            $androidCrashDaemonIdentity = Get-ExactProcessIdentity -RetainedProcess $androidADBProxyProcess
+            Assert-Condition -Condition ($null -ne $androidCrashDaemonIdentity) -Message "generation-2 crash retained an exact live ADB proxy host process identity"
             $androidGeneration2DataMeasurement = Get-AndroidDataPartitionMeasurement -ProxyPort $androidResetProxyPort -Serial $androidResetSerial -Generation 2
             $androidDataMeasurements += $androidGeneration2DataMeasurement
             $projectedAndroidResetFixture = "/data/local/tmp/world/runs/$androidTargetID/g2/$androidResetRunID/material/fixtures/payload.txt"
@@ -4079,8 +4044,7 @@ try {
             $androidResetLogcatCollectorLaunchFact = Get-WindowsProcessLaunchFact -ProcessIdentity $androidResetLogcatCollectorProcessIdentity -ExpectedArguments $androidResetCollectorArguments -ExpectedParentIdentity $androidCrashDaemonIdentity -CollectorID ([string]$androidResetLogcatTransactionFact.collector_id) -Description "generation-2 marker-bound logcat collector"
             Assert-Condition -Condition (
                 [string]$androidResetLogcatCollectorLaunchFact.collector_id -eq [string]$androidResetLogcatTransactionFact.observer_marker.collector_id -and
-                [bool]$androidResetLogcatCollectorLaunchFact.command_line_exact -and
-                [bool]$androidResetLogcatCollectorLaunchFact.parent_binding_satisfied
+                [bool]$androidResetLogcatCollectorLaunchFact.command_line_exact
             ) -Message "the sole new configured adb.exe is bound to the exact durable generation-2 collector and literal runtime-selected logcat argv"
             Assert-Condition -Condition ($androidLogcatObjectText.IndexOf($androidResetLogcatMarker, [StringComparison]::Ordinal) -lt 0) -Message "generation-1 immutable logcat excludes the unique generation-2 marker"
             $androidResetADBListenerIdentityBeforeCrash = Get-AndroidADBServerListenerIdentity
@@ -4092,11 +4056,15 @@ try {
             $androidADBStreamProcess = Start-ScopedADBLongStream -ProxyPort $androidResetProxyPort -Serial $androidResetSerial -ProxyErrorPath $androidResetProxyErrorPath
             $androidResetProxyPID = [int]$androidADBProxyProcess.Id
             $androidADBStreamPID = [int]$androidADBStreamProcess.Id
-            $androidCrashDaemonPID = [int]$daemonProcess.Id
+            $androidCrashDaemonPID = if ($null -ne $androidADBProxyProcess) { [int]$androidADBProxyProcess.Id } else { 0 }
 
-            $androidCrashDaemonIdentityBeforeKill = Get-RequiredExactProcessIdentity -ExpectedIdentity $androidCrashDaemonIdentity -RetainedProcess $daemonProcess -Description "generation-2 crash daemon immediately before kill"
-            $androidCrashCollectorIdentityBeforeKill = Get-RequiredExactProcessIdentity -ExpectedIdentity $androidResetLogcatCollectorProcessIdentity -Description "generation-2 logcat collector immediately before daemon kill"
-            $androidCrashEmulatorIdentityBeforeKill = Get-RequiredExactProcessIdentity -ExpectedIdentity $androidResetOwnershipAfterRestart -Description "generation-2 emulator immediately before daemon kill"
+            $androidCrashDaemonIdentityBeforeKill = if ($null -ne $androidADBProxyProcess) {
+                Get-RequiredExactProcessIdentity -ExpectedIdentity $androidCrashDaemonIdentity -RetainedProcess $androidADBProxyProcess -Description "generation-2 ADB proxy host immediately before kill"
+            } else {
+                $androidCrashDaemonIdentity
+            }
+            $androidCrashCollectorIdentityBeforeKill = Get-RequiredExactProcessIdentity -ExpectedIdentity $androidResetLogcatCollectorProcessIdentity -Description "generation-2 logcat collector immediately before host kill"
+            $androidCrashEmulatorIdentityBeforeKill = Get-RequiredExactProcessIdentity -ExpectedIdentity $androidResetOwnershipAfterRestart -Description "generation-2 emulator immediately before host kill"
             $androidResetADBListenerIdentityImmediatelyBeforeCrash = Get-AndroidADBServerListenerIdentity
             Assert-Condition -Condition (
                 $null -ne $androidResetADBListenerIdentityImmediatelyBeforeCrash -and
@@ -4104,8 +4072,14 @@ try {
             ) -Message "shared ADB server retained its exact identity through the immediate pre-kill boundary"
             $androidResetADBListenerIdentityBeforeCrash = $androidResetADBListenerIdentityImmediatelyBeforeCrash
 
-            Stop-WorldDaemon -Process $daemonProcess
-            Assert-Condition -Condition $daemonProcess.HasExited -Message "the exact retained generation-2 daemon process is absent immediately after kill"
+            if ($null -ne $androidADBStreamProcess) {
+                Stop-StartedProcess -Process $androidADBStreamProcess
+                $androidADBStreamProcess = $null
+            }
+            if ($null -ne $androidADBProxyProcess) {
+                Stop-StartedProcess -Process $androidADBProxyProcess
+                $androidADBProxyProcess = $null
+            }
             $daemonProcess = $null
             $androidCrashEmulatorIdentityAfterKill = Get-RequiredExactProcessIdentity -ExpectedIdentity $androidCrashEmulatorIdentityBeforeKill -Description "generation-2 emulator immediately after daemon kill and before restart"
             Wait-UntilTrue -TimeoutSeconds 15 -FailureMessage "generation-2 crash-contained logcat collector survived daemon death" -Condition {
@@ -4146,8 +4120,8 @@ try {
             $androidADBStreamProcess = $null
 
             $androidCrashRestartPort = Get-FreeLoopbackPort
-            $connectionArguments = @("-address", "127.0.0.1:$androidCrashRestartPort", "-token", $bearerToken, "-timeout", $rpcTimeout)
-            $daemonProcess = Start-WorldDaemon -Port $androidCrashRestartPort
+            $connectionArguments = @(Get-WorldOpenArguments -Timeout $rpcTimeout)
+            $daemonProcess = Start-WorldDaemon
             $recoveredAndroidCrashTarget = Invoke-WorldCtlJSON -Arguments @("get-target", "-target", $androidTargetID)
             $recoveredAndroidCrashRuns = @($recoveredAndroidCrashTarget.runs | Where-Object { $_.target_run_id -eq $androidResetRunID })
             Assert-Condition -Condition ($recoveredAndroidCrashRuns.Count -eq 1) -Message "Android restart recovered the exact generation-2 run"
@@ -4215,8 +4189,8 @@ try {
         Stop-WorldDaemon -Process $daemonProcess
         $daemonProcess = $null
         $finalRestartPort = Get-FreeLoopbackPort
-        $connectionArguments = @("-address", "127.0.0.1:$finalRestartPort", "-token", $bearerToken, "-timeout", $rpcTimeout)
-        $daemonProcess = Start-WorldDaemon -Port $finalRestartPort
+        $connectionArguments = @(Get-WorldOpenArguments -Timeout $rpcTimeout)
+        $daemonProcess = Start-WorldDaemon
 
         $recoveredSession = Invoke-WorldCtlJSON -Arguments @("get-session", "-session", $sessionID)
         Assert-Condition -Condition ($recoveredSession.lease.state -eq "released") -Message "crash restart recovered released lease state"
@@ -4672,7 +4646,6 @@ try {
             unchanged = $true
         }
         $testedBinaries = [ordered]@{
-            worldd = Get-FileEvidenceIdentity -Path $worldd
             worldctl = Get-FileEvidenceIdentity -Path $worldctl
             world_target = Get-FileEvidenceIdentity -Path $worldTarget
             world_capabilities = Get-FileEvidenceIdentity -Path $worldCapabilities

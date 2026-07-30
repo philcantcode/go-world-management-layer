@@ -12,12 +12,12 @@ import (
 	"github.com/philcantcode/go-world-management-layer/world"
 )
 
-func createTarget(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func createTarget(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	request, err := parseCreateTarget(arguments, stderr, configuration.Timeout)
 	if err != nil {
 		return err
 	}
-	result, err := client.CreateTarget(ctx, request)
+	result, err := manager.CreateTarget(ctx, request)
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
@@ -49,7 +49,7 @@ func parseCreateTarget(arguments []string, stderr io.Writer, timeout time.Durati
 	}, nil
 }
 
-func getTarget(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, _ worldcli.ConnectionConfig) error {
+func getTarget(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, _ worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("get-target", stderr)
 	target := flags.String("target", defaultEnv("WORLD_TARGET_ID"), "target ID")
 	if err := flags.Parse(arguments); err != nil {
@@ -61,16 +61,16 @@ func getTarget(ctx context.Context, client *world.Client, arguments []string, st
 	if err := worldcli.Require("target", *target); err != nil {
 		return err
 	}
-	result, err := client.GetTarget(ctx, &worldv1.GetTargetRequest{TargetId: *target})
+	result, err := manager.GetTarget(ctx, &worldv1.GetTargetRequest{TargetId: *target})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func startRun(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func startRun(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	request, err := parseStartRun(arguments, stderr, configuration.Timeout)
 	if err != nil {
 		return err
 	}
-	result, err := client.StartTargetRun(ctx, request)
+	result, err := manager.StartTargetRun(ctx, request)
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
@@ -113,7 +113,7 @@ func parseStartRun(arguments []string, stderr io.Writer, timeout time.Duration) 
 	}, nil
 }
 
-func waitRun(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, _ worldcli.ConnectionConfig) error {
+func waitRun(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, _ worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("wait-run", stderr)
 	target := flags.String("target", defaultEnv("WORLD_TARGET_ID"), "target ID")
 	run := flags.String("run", defaultEnv("WORLD_TARGET_RUN_ID"), "target run ID")
@@ -127,11 +127,11 @@ func waitRun(ctx context.Context, client *world.Client, arguments []string, stdo
 	if err := worldcli.Require("target", *target, "run", *run, "state", *state); err != nil {
 		return err
 	}
-	result, err := client.WaitTargetRun(ctx, &worldv1.WaitTargetRunRequest{TargetId: *target, TargetRunId: *run, DesiredState: *state})
+	result, err := manager.WaitTargetRun(ctx, &worldv1.WaitTargetRunRequest{TargetId: *target, TargetRunId: *run, DesiredState: *state})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func stopRun(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func stopRun(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("stop-run", stderr)
 	target := flags.String("target", defaultEnv("WORLD_TARGET_ID"), "target ID")
 	run := flags.String("run", defaultEnv("WORLD_TARGET_RUN_ID"), "target run ID")
@@ -151,16 +151,16 @@ func stopRun(ctx context.Context, client *world.Client, arguments []string, stdo
 	if err != nil {
 		return err
 	}
-	result, err := client.StopTargetRun(ctx, &worldv1.StopTargetRunRequest{Mutation: meta, TargetId: *target, TargetRunId: *run, ExpectedRevision: *revision, Reason: *reason})
+	result, err := manager.StopTargetRun(ctx, &worldv1.StopTargetRunRequest{Mutation: meta, TargetId: *target, TargetRunId: *run, ExpectedRevision: *revision, Reason: *reason})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func resetTarget(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func resetTarget(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	request, err := parseResetTarget(arguments, stderr, configuration.Timeout)
 	if err != nil {
 		return err
 	}
-	result, err := client.ResetTarget(ctx, request)
+	result, err := manager.ResetTarget(ctx, request)
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
@@ -195,21 +195,21 @@ func parseResetTarget(arguments []string, stderr io.Writer, timeout time.Duratio
 	}, nil
 }
 
-func destroyTarget(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func destroyTarget(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	target, revision, reason, meta, err := parseTargetDisposition("destroy", arguments, stderr, configuration.Timeout)
 	if err != nil {
 		return err
 	}
-	result, err := client.DestroyTarget(ctx, &worldv1.DestroyTargetRequest{Mutation: meta, TargetId: target, ExpectedRevision: revision, Reason: reason})
+	result, err := manager.DestroyTarget(ctx, &worldv1.DestroyTargetRequest{Mutation: meta, TargetId: target, ExpectedRevision: revision, Reason: reason})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func quarantineTarget(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func quarantineTarget(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	target, revision, reason, meta, err := parseTargetDisposition("quarantine", arguments, stderr, configuration.Timeout)
 	if err != nil {
 		return err
 	}
-	result, err := client.QuarantineTarget(ctx, &worldv1.QuarantineTargetRequest{Mutation: meta, TargetId: target, ExpectedRevision: revision, Reason: reason})
+	result, err := manager.QuarantineTarget(ctx, &worldv1.QuarantineTargetRequest{Mutation: meta, TargetId: target, ExpectedRevision: revision, Reason: reason})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
@@ -235,7 +235,7 @@ func parseTargetDisposition(name string, arguments []string, stderr io.Writer, t
 	return *target, *revision, *reason, meta, nil
 }
 
-func requestRecovery(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func requestRecovery(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("recovery", stderr)
 	incident := flags.String("incident", "", "incident ID")
 	revision := flags.Uint64("revision", 0, "expected incident revision")
@@ -257,7 +257,7 @@ func requestRecovery(ctx context.Context, client *world.Client, arguments []stri
 	if err != nil {
 		return err
 	}
-	result, err := client.RequestRecovery(ctx, &worldv1.RequestRecoveryRequest{
+	result, err := manager.RequestRecovery(ctx, &worldv1.RequestRecoveryRequest{
 		Mutation:                  meta,
 		IncidentId:                *incident,
 		ExpectedRevision:          *revision,

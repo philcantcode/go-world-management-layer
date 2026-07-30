@@ -12,12 +12,12 @@ import (
 	"github.com/philcantcode/go-world-management-layer/world"
 )
 
-func acquire(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func acquire(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	request, err := parseAcquire(arguments, stderr, configuration.Timeout)
 	if err != nil {
 		return err
 	}
-	result, err := client.AcquireResearchSession(ctx, request)
+	result, err := manager.AcquireResearchSession(ctx, request)
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
@@ -99,7 +99,7 @@ func parsePathMappings(value string) ([]*worldv1.PathMapping, error) {
 	return result, nil
 }
 
-func getSession(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, _ worldcli.ConnectionConfig) error {
+func getSession(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, _ worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("get-session", stderr)
 	id := flags.String("session", defaultEnv("WORLD_SESSION_ID"), "research session ID")
 	if err := flags.Parse(arguments); err != nil {
@@ -111,16 +111,16 @@ func getSession(ctx context.Context, client *world.Client, arguments []string, s
 	if err := worldcli.Require("session", *id); err != nil {
 		return err
 	}
-	result, err := client.GetResearchSession(ctx, &worldv1.GetResearchSessionRequest{ResearchSessionId: *id})
+	result, err := manager.GetResearchSession(ctx, &worldv1.GetResearchSessionRequest{ResearchSessionId: *id})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func waitSession(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, _ worldcli.ConnectionConfig) error {
+func waitSession(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, _ worldcli.OpenConfig) error {
 	request, err := parseWaitSession(arguments, stderr)
 	if err != nil {
 		return err
 	}
-	result, err := client.WaitResearchSession(ctx, request)
+	result, err := manager.WaitResearchSession(ctx, request)
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
@@ -140,12 +140,12 @@ func parseWaitSession(arguments []string, stderr io.Writer) (*worldv1.WaitResear
 	return &worldv1.WaitResearchSessionRequest{ResearchSessionId: *id, DesiredState: *desired}, nil
 }
 
-func renewLease(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func renewLease(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	request, err := parseRenewLease(arguments, stderr, configuration.Timeout)
 	if err != nil {
 		return err
 	}
-	result, err := client.RenewLease(ctx, request)
+	result, err := manager.RenewLease(ctx, request)
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
@@ -178,7 +178,7 @@ func parseRenewLease(arguments []string, stderr io.Writer, timeout time.Duration
 	return &worldv1.RenewLeaseRequest{Mutation: meta, LeaseId: *lease, ExpectedRevision: *revision, Ttl: wireTTL}, nil
 }
 
-func releaseSession(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func releaseSession(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("release", stderr)
 	lease := flags.String("lease", defaultEnv("WORLD_LEASE_ID"), "lease ID")
 	revision := flags.Uint64("revision", 0, "expected lease revision")
@@ -197,6 +197,6 @@ func releaseSession(ctx context.Context, client *world.Client, arguments []strin
 	if err != nil {
 		return err
 	}
-	result, err := client.ReleaseResearchSession(ctx, &worldv1.ReleaseResearchSessionRequest{Mutation: meta, LeaseId: *lease, ExpectedRevision: *revision, Reason: *reason})
+	result, err := manager.ReleaseResearchSession(ctx, &worldv1.ReleaseResearchSessionRequest{Mutation: meta, LeaseId: *lease, ExpectedRevision: *revision, Reason: *reason})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }

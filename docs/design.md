@@ -2,7 +2,7 @@
 
 - Status: v1 target architecture with current implementation boundary
 - Date: 2026-07-24
-- Revised: 2026-07-27
+- Revised: 2026-07-30
 - Initial deployment: dedicated Linux hosts
 
 ## 1. Summary
@@ -23,27 +23,50 @@ The manager retains exclusive control over provisioning, containment, resource
 budgets, evidence movement, collectors, recovery, and teardown.
 
 The system is a single-host control plane first. A trusted host application
-acquires a research-session lease, gives `go-agent-runner` a lease-bound
-`ExecutionEnvironment`, and releases the lease when the investigation ends.
-That adapter resolves and runs all provider probes and attempts inside the
-agent workspace. From there the agent uses ordinary tools, a transparent
-`world-target` command channel, a one-device ADB endpoint, and an optional MCP
-facade to control its assigned targets, inspect live evidence, and consume
-sealed observation bundles.
+**imports** this module, calls `world.Open`, and holds a `*world.Manager` for
+one exclusive control-state tree. That host acquires a research-session lease,
+gives `go-agent-runner` a lease-bound `ExecutionEnvironment`, and releases the
+lease when the investigation ends. The adapter resolves and runs all provider
+probes and attempts inside the agent workspace. From there the agent uses
+ordinary tools, a transparent `world-target` command channel (in-process
+Manager sessions), a one-device ADB endpoint, and an optional MCP facade to
+control its assigned targets, inspect live evidence, and consume sealed
+observation bundles.
 
-Version 1 targets dedicated Linux nodes. OverlayFS, cgroup v2 pressure signals,
-Linux namespaces, eBPF, and KVM are part of the actual design, not portable
-implementation details. A Windows or macOS client may call a remote Linux node,
-but Docker Desktop is not the initial security or performance reference.
+There is **no** remote `world.Dial` / dual-daemon WorldService product. Remote
+orchestration across machines is host-owned (process placement, OS identity),
+not a shipped authenticated gRPC control plane. Version 1 still targets
+dedicated Linux nodes for physical isolation. OverlayFS, cgroup v2 pressure
+signals, Linux namespaces, eBPF, and KVM remain part of the design, not
+portable shims. Docker Desktop is not the initial security or performance
+reference.
+
+Product cutover detail: [docs/designs/library-only-manager.md](designs/library-only-manager.md).
 
 ### 1.1 Current implementation boundary
 
 The target architecture below intentionally reaches beyond the currently
-shipped executable topology. Today `worldd` and `world-node` are independent
-full daemons with different default state paths/endpoints; there is no
-controller-to-node protocol and `world-node` does not register with `worldd`.
-Either binary can run logical-only or activate the same fail-closed physical
-Linux and managed-Android composition from a trusted version-3 deployment profile:
+shipped code in places (OverlayFS, pressure actuation, eBPF, fleet
+scheduling). **Control-plane product surface** is a **single-process imported
+library** only:
+
+- Hosts call `world.Open(Config)` and receive `*world.Manager`.
+- Startup reconciliation completes inside Open before Manager is returned.
+- Processlock enforces exclusive ownership of one control DB / state tree.
+- A fixed local `Config.Subject` is the policy identity for every call.
+- Operator CLIs and adapters embed Manager; they do not Dial a control socket.
+
+The historical **controller / node dual-daemon split** (`worldd` logical control
+plane + `world-node` privileged execution authority over authenticated gRPC,
+plus `world.Dial` / `world.Client`) is **non-product**. It is retained only as
+design history and superseded ADR language (see
+[library-only-manager.md](designs/library-only-manager.md) and ADR 0001). Those
+binaries and remote Dial paths are deleted and must not ship alongside Manager.
+Where later sections still describe physical-driver duties, read them as
+in-process composition owned by the embedding host after `world.Open`, not as a
+second remote service.
+
+The library composition (logical-only or fail-closed physical) still supports:
 
 - a directory-copy workspace and digest-pinned Docker agent container;
 - digest-pinned Docker Linux targets with scoped exec/file transports, exact
@@ -55,22 +78,22 @@ Linux and managed-Android composition from a trusted version-3 deployment profil
 - startup policy compilation, plan preflight, exact physical-plan binding,
   resource admission, inventory/adoption, lease drain, and crash recovery.
 
-`directory-copy-non-production` is the only daemon-composed workspace mode;
-the OverlayFS, cgroup/pressure actuation, eBPF suites, split controller/node
-topology, and fleet scheduler described later remain target architecture.
-Directory copy bounds bytes and inodes during prepare/scan/seal/export, but it
-does not enforce either as a live filesystem quota while the agent runs. Those
-two physical support facts are reported as `unsupported` and are the only
+`directory-copy-non-production` is the only composed workspace mode in the
+current drivers; the OverlayFS, cgroup/pressure actuation, eBPF suites, and
+fleet scheduler described later remain target architecture. Directory copy
+bounds bytes and inodes during prepare/scan/seal/export, but it does not
+enforce either as a live filesystem quota while the agent runs. Those two
+physical support facts are reported as `unsupported` and are the only
 resource-support checks omitted for this explicit non-production mode. Runtime
 identity/isolation and CPU, memory, swap, PID, and capture enforcement remain
 mandatory; an OverlayFS policy fails closed without live byte and inode support.
 
-Android SDK Emulator targets are daemon-composed with durable AVD/port
-allocation, exact installed-image and runtime identity, headless accelerated
-clean boot, exact-serial ADB authorization, one mutable run per generation,
-replacement reset, quarantine, destruction, and startup reconciliation. The
+Android SDK Emulator targets are composed with durable AVD/port allocation,
+exact installed-image and runtime identity, headless accelerated clean boot,
+exact-serial ADB authorization, one mutable run per generation, replacement
+reset, quarantine, destruction, and startup reconciliation. The
 AttachedEmulator backend remains an opt-in boundary test that never assumes
-ownership of its externally started emulator. A daemon-selected Cuttlefish or
+ownership of its externally started emulator. A host-selected Cuttlefish or
 physical-device backend is not shipped.
 
 ## 2. Ecosystem boundaries
@@ -205,10 +228,11 @@ world-owned `MaterialAuthority` interface.
 ### 6.1 Current executable topology
 
 ```text
-trusted operator / client
-  | world.v1 gRPC (bearer or mTLS)
+trusted host process (campaign manager, go-agent-runner, operator CLI)
+  | import world; world.Open(ctx, Config) -> *Manager
+  | exclusive processlock; fixed local Subject; no remote Dial
   v
-worldd OR world-node
+world.Manager (in-process)
   |-- logical lifecycle core + SQLite control journal
   |-- durable observation ledger/live projections
   |-- local bundle finalizer/material publication
@@ -221,71 +245,62 @@ worldd OR world-node
         `-- optional ledger capture
 ```
 
-Both binaries use this same composition. They are independent services; there
-is no RPC, registration, or scheduling relationship between them. The default
-driver selection is logical-only. Physical mode requires the Docker agent and
-directory workspace together, an absolute immutable deployment profile, exact
-locally present image/system-image digests, and non-overlapping managed roots.
-Docker Linux targets, managed Android SDK Emulator targets, process observers,
-and ledger capture are explicit selections constrained by that profile.
-Daemon-selected Cuttlefish and physical-device selections are not shipped.
+The default driver selection is logical-only. Physical mode requires the Docker
+agent and directory workspace together, an absolute immutable deployment
+profile, exact locally present image/system-image digests, and non-overlapping
+managed roots. Docker Linux targets, managed Android SDK Emulator targets,
+process observers, and ledger capture are explicit selections constrained by
+that profile. Host-selected Cuttlefish and physical-device selections are not
+shipped. Multi-tenant isolation is separate host processes and state trees.
 
-### 6.2 Target controller/node split
+### 6.2 Host process and physical drivers
 
-The following is the intended dedicated-host/fleet topology, not a claim about
-the currently shipped relationship between the two binaries:
+Fleet placement and OS identity remain host-owned. Inside one Opened Manager,
+physical drivers stay under typed plans and configured roots:
 
 ```text
 trusted host application
   | acquire / release / incidents / observations / exports
   v
-worldd (unprivileged control plane)
-  |-- scheduler and admission controller
+world.Manager
   |-- session/workspace/target/run state machines
   |-- durable state database and causal ledger
-  |-- live subscription fan-out
-  |-- policy compiler and capability negotiation
-  `-- artifact and ecosystem adapters
-             |
-             | authenticated local node protocol
-             v
-world-node (trusted node authority)
-  |-- Docker Engine adapter
-  |-- cgroup and pressure controller
-  |-- scoped immutable content and input-view cache
-  |-- OverlayFS/openat2 workspace helper
-  |-- target drivers and scoped target gateways
-  |-- observer supervisor and observation-bundle builder
-  `-- network namespace and traffic-capture controller
-             |
-             +-- agent workspace: world-guest -> provider CLI -> research tools
-             +-- Linux target: disposable OCI container -> investigated program
-             `-- Android target: Cuttlefish/emulator -> investigated APK
+  |-- live subscription sessions
+  |-- policy compile and capability negotiation
+  `-- optional physical drivers in-process
+        |-- Docker Engine adapter
+        |-- scoped content and input-view material
+        |-- target drivers and scoped target transports
+        |-- observer supervision and observation-bundle builder
+        +-- agent workspace: world-guest -> provider CLI -> research tools
+        +-- Linux target: disposable OCI container -> investigated program
+        `-- Android target: managed emulator -> investigated APK
 
-go-agent-runner -> lease-bound ExecutionEnvironment -> worldd -> world-guest
-agent tools -> world-target / scoped ADB / optional MCP -> target gateways
-agent tools -> world-observe -> worldd -> observer projections and bundles
+go-agent-runner -> lease-bound ExecutionEnvironment -> Manager / Core
+agent tools -> world-target / scoped ADB / optional MCP -> target transports
+agent tools -> world-observe -> Manager -> observer projections and bundles
 ```
 
-### 6.3 Target `worldd` responsibility
+### 6.3 Manager logical responsibility
 
-`worldd` owns logical truth: research sessions, leases, agent workspace and
-target generations, target runs, effective policies, idempotency, transitions,
-incidents, export intents, observation bundles, cursors, and admission
-decisions. It has no host command-execution API and does not accept arbitrary
-host paths from clients.
+`world.Manager` owns logical truth: research sessions, leases, agent workspace
+and target generations, target runs, effective policies, idempotency,
+transitions, incidents, export intents, observation bundles, cursors, and
+admission decisions. Hosts do not pass arbitrary host-path command authority
+through Manager APIs; physical drivers consume only typed plans under configured
+roots.
 
-### 6.4 Target `world-node` responsibility
+### 6.4 Physical driver responsibility
 
-In the target split, `world-node` is the only component that can access Docker Engine, create agent
-or target containers, mount workspaces, place processes in cgroups, allocate
-virtual-device ports, talk to raw ADB, and attach privileged observers. Its
-local API accepts resolved workspace, target, and collector plans plus
-target-scoped direct-exec and ADB-service envelopes. Those envelopes may contain
-arbitrary guest commands; they can never select a host executable, Docker
-operation, host ADB service, mount, namespace, or unassigned target. The node
-independently validates image allowlists, mount roots, target assignments,
-cgroup roots, observer permissions, and lease ownership.
+Physical drivers are the only components that can access Docker Engine, create
+agent or target containers, mount workspaces, place processes in cgroups,
+allocate virtual-device ports, talk to raw ADB, and attach privileged observers.
+They accept resolved workspace, target, and collector plans plus target-scoped
+direct-exec and ADB-service envelopes. Those envelopes may contain arbitrary
+guest commands; they can never select a host executable, Docker operation, host
+ADB service, mount, namespace, or unassigned target. Drivers independently
+validate image allowlists, mount roots, target assignments, cgroup roots,
+observer permissions, and lease ownership.
 
 Access to the Docker socket is root-equivalent and must never be delegated to
 the agent workspace or a target. The v1 Linux target uses a hardened standard
@@ -337,8 +352,8 @@ fingerprint, and environment-protocol version. It changes whenever cached CLI
 capabilities may no longer be reused. A management failure closes streams,
 cancels the remote process group, waits for bounded cleanup, and returns an
 execution error linked to an out-of-band world incident. If cleanup cannot be
-confirmed, `world-node` destroys the agent container, which is the provider's
-final kill domain.
+confirmed, the Manager's agent driver destroys the agent container, which is
+the provider's final kill domain.
 
 ### 6.5 Agent workspace
 
@@ -368,8 +383,8 @@ window within that realization. Both physical drivers grant mutable authority
 to only one run per generation; finalization proves the runtime stopped, and
 another run requires a replacement generation.
 
-Before a run, `world-node` stages the declared specimen and fixtures, starts
-required collectors, verifies their coverage, and opens the scoped target
+Before a run, physical composition stages the declared specimen and fixtures,
+starts required collectors, verifies their coverage, and opens the scoped target
 transports. During the run the agent may make arbitrary in-target changes and
 push additional workspace-produced bytes subject only to transport/resource
 bounds and target scope, not command semantics. Every intervention is assigned
@@ -706,11 +721,11 @@ does not itself copy or trust a file.
    containing only selected logical paths, qualified occurrence refs, hashes,
    sizes, modes, and permitted sidecars. Path conflicts fail; there is no
    last-writer-wins projection behavior.
-3. `world-node` checks its scoped local content cache. Missing content is
-   streamed through the adapter's public object-reader boundary, written to a
+3. The host composition checks its scoped local content cache. Missing content
+   is streamed through the adapter's public object-reader boundary, written to a
    private staging file, hashed, atomically published by digest, and never
    opened through an artifact-store filesystem path.
-4. The node constructs or reuses a read-only input-view tree keyed by the
+4. Composition constructs or reuses a read-only input-view tree keyed by the
    canonical manifest digest. View files use extent-sharing clones on a
    capability-probed reflink filesystem so each path has independent inode and
    metadata semantics without initially duplicating data blocks.
@@ -808,8 +823,8 @@ tree. Writable state is never reused across generations.
 ### 9.4 Target materialization
 
 A `TargetRunSpec` references immutable occurrences already authorized to the
-session. `world-node` builds an exact, target-specific materialization manifest
-and transfers only those files through driver-defined paths. Linux targets
+session. Physical composition builds an exact, target-specific materialization
+manifest and transfers only those files through driver-defined paths. Linux targets
 receive regular files in a private mount or image layer. Android targets receive
 the APK and named fixtures through the scoped ADB gateway. This initial manifest
 is the reproducible baseline, not a command allowlist.

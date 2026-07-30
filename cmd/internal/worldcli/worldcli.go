@@ -1,12 +1,10 @@
 // Package worldcli contains the narrow, shared mechanics used by the world
-// command-line clients. It intentionally owns connection and presentation
-// plumbing, not command authority or application policy.
+// command-line clients. It intentionally owns local Open/Manager plumbing and
+// presentation helpers, not command authority or application policy.
 package worldcli
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,7 +12,7 @@ import (
 	"io"
 	"math"
 	"os"
-	"runtime"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,106 +26,242 @@ import (
 
 const defaultTimeout = 30 * time.Second
 
-// ConnectionConfig is the common authenticated worldd connection surface.
-type ConnectionConfig struct {
-	UnixSocket    string
-	TCPAddress    string
-	BearerToken   string
-	Timeout       time.Duration
-	TLSCA         string
-	TLSCert       string
-	TLSKey        string
-	TLSServerName string
-	MaxMessage    int
+// OpenConfig is the common in-process world.Open surface for operator CLIs.
+// Remote dial flags (unix-socket, address, token, mTLS) are not supported.
+type OpenConfig struct {
+	StatePath              string
+	LedgerDirectory        string
+	OrchestrationStateRoot string
+	BundleRoot             string
+	MaterialRoot           string
+	DeploymentProfile      string
+	Subject                string
+	SubjectRole            string
+	Timeout                time.Duration
+	MaxTransferBytes       int64
+	MaxExecBytes           int64
+	MaxADBBytes            int64
+	MaxBundleBytes         int64
+	MaxCaptureRecords      int
+
+	// Driver selection mirrors WORLD_* host composition env (logical-only by default).
+	AgentDriver     string
+	LinuxTarget     string
+	AndroidTarget   string
+	WorkspaceDriver string
+	MaterialDriver  string
+	ObserverDriver  string
+	CaptureDriver   string
+
+	DockerBinary            string
+	AgentWorkspaceRoot      string
+	AgentImageRepository    string
+	AgentGuestBinary        string
+	AgentContainerUser      string
+	TargetRoot              string
+	TargetImageRepository   string
+	TargetAllowPtrace       bool
+	AndroidTargetRoot       string
+	AndroidSystemImageRoot  string
+	AndroidADBBinary        string
+	AndroidADBServer        string
+	AndroidEmulatorBinary   string
+	AndroidSDKRoot          string
+	AndroidSDKManagerBinary string
+	AndroidAVDManagerBinary string
+	AndroidADBBasePort      int
+	AndroidBackendVersion   string
+	AndroidRuntimeVersion   string
+	ObserverOutputRoot      string
+	CaptureRoot             string
 }
 
-// ParseGlobal parses common flags before the command name. Command-specific
-// flags remain untouched in the returned argument slice.
-func ParseGlobal(program string, arguments []string, stderr io.Writer) (ConnectionConfig, string, []string, error) {
-	defaultSocket, defaultAddress := "/tmp/worldd.sock", ""
-	if runtime.GOOS == "windows" {
-		defaultSocket, defaultAddress = "", "127.0.0.1:7777"
-	}
+// ParseGlobal parses common local-Open flags before the command name.
+// Command-specific flags remain untouched in the returned argument slice.
+func ParseGlobal(program string, arguments []string, stderr io.Writer) (OpenConfig, string, []string, error) {
+	defaultRoot := envOr("WORLD_ROOT", "world")
 	flags := NewFlagSet(program, stderr)
-	var result ConnectionConfig
-	flags.StringVar(&result.UnixSocket, "unix-socket", envOr("WORLD_UNIX_SOCKET", defaultSocket), "worldd Unix socket")
-	flags.StringVar(&result.TCPAddress, "address", envOr("WORLD_ADDRESS", defaultAddress), "worldd TCP address")
-	flags.StringVar(&result.BearerToken, "token", os.Getenv("WORLD_BEARER_TOKEN"), "local bearer token")
-	flags.DurationVar(&result.Timeout, "timeout", defaultTimeout, "command/RPC timeout")
-	flags.StringVar(&result.TLSCA, "tls-ca", os.Getenv("WORLD_TLS_CA"), "server CA PEM")
-	flags.StringVar(&result.TLSCert, "tls-cert", os.Getenv("WORLD_TLS_CERT"), "optional mTLS client certificate PEM")
-	flags.StringVar(&result.TLSKey, "tls-key", os.Getenv("WORLD_TLS_KEY"), "optional mTLS client private key PEM")
-	flags.StringVar(&result.TLSServerName, "tls-server-name", os.Getenv("WORLD_TLS_SERVER_NAME"), "expected TLS server name")
-	flags.IntVar(&result.MaxMessage, "max-message-bytes", worldv1.DefaultMaxMessageSize, "maximum RPC message bytes")
+	var result OpenConfig
+	flags.StringVar(&result.StatePath, "state", envOr("WORLD_STATE", defaultRoot+"-control.db"), "SQLite control state path")
+	flags.StringVar(&result.LedgerDirectory, "ledger-dir", envOr("WORLD_LEDGER_DIR", defaultRoot+"-ledger"), "durable ledger directory")
+	flags.StringVar(&result.OrchestrationStateRoot, "orchestration-state-dir", envOr("WORLD_ORCHESTRATION_STATE_DIR", defaultRoot+"-orchestration"), "orchestration durable state root")
+	flags.StringVar(&result.BundleRoot, "bundle-dir", envOr("WORLD_BUNDLE_DIR", defaultRoot+"-bundles"), "observation bundle root")
+	flags.StringVar(&result.MaterialRoot, "material-dir", envOr("WORLD_MATERIAL_DIR", defaultRoot+"-material"), "material authority root")
+	flags.StringVar(&result.DeploymentProfile, "deployment-profile", os.Getenv("WORLD_DEPLOYMENT_PROFILE"), "absolute path to version-3 deployment profile")
+	flags.StringVar(&result.Subject, "subject", envOr("WORLD_SUBJECT", envOr("WORLD_BEARER_SUBJECT", "local-operator")), "fixed local policy subject")
+	flags.StringVar(&result.SubjectRole, "subject-role", envOr("WORLD_SUBJECT_ROLE", string(world.RoleOperator)), "subject role (operator|internal)")
+	flags.DurationVar(&result.Timeout, "timeout", defaultTimeout, "command timeout")
+	flags.Int64Var(&result.MaxTransferBytes, "max-transfer-bytes", envInt64("WORLD_MAX_TRANSFER_BYTES", 64<<20), "maximum file transfer bytes")
+	flags.Int64Var(&result.MaxExecBytes, "max-exec-bytes", envInt64("WORLD_MAX_EXEC_BYTES", 64<<20), "maximum exec stream bytes")
+	flags.Int64Var(&result.MaxADBBytes, "max-adb-bytes", envInt64("WORLD_MAX_ADB_BYTES", 64<<20), "maximum ADB stream bytes")
+	flags.Int64Var(&result.MaxBundleBytes, "max-bundle-bytes", envInt64("WORLD_MAX_BUNDLE_BYTES", 64<<20), "maximum observation bundle bytes")
+	flags.IntVar(&result.MaxCaptureRecords, "max-capture-records", envInt("WORLD_MAX_CAPTURE_RECORDS", 10000), "maximum capture records")
+
+	flags.StringVar(&result.AgentDriver, "agent-driver", envOr("WORLD_AGENT_DRIVER", "none"), "agent driver (none|docker)")
+	flags.StringVar(&result.LinuxTarget, "linux-target-driver", envOr("WORLD_LINUX_TARGET_DRIVER", "none"), "linux target driver (none|docker)")
+	flags.StringVar(&result.AndroidTarget, "android-target-driver", envOr("WORLD_ANDROID_TARGET_DRIVER", "none"), "android target driver (none|android-emulator)")
+	flags.StringVar(&result.WorkspaceDriver, "workspace-driver", envOr("WORLD_WORKSPACE_DRIVER", "none"), "workspace driver (none|directory)")
+	flags.StringVar(&result.MaterialDriver, "material-driver", envOr("WORLD_MATERIAL_DRIVER", "local"), "material driver (local)")
+	flags.StringVar(&result.ObserverDriver, "observer-driver", envOr("WORLD_OBSERVER_DRIVER", "none"), "observer driver (none|process)")
+	flags.StringVar(&result.CaptureDriver, "capture-driver", envOr("WORLD_CAPTURE_DRIVER", "none"), "capture driver (none|ledger)")
+
+	flags.StringVar(&result.DockerBinary, "docker-binary", envOr("WORLD_DOCKER_BINARY", "docker"), "docker CLI binary")
+	flags.StringVar(&result.AgentWorkspaceRoot, "agent-workspace-root", os.Getenv("WORLD_AGENT_WORKSPACE_ROOT"), "agent workspace root")
+	flags.StringVar(&result.AgentImageRepository, "agent-image-repository", os.Getenv("WORLD_AGENT_IMAGE_REPOSITORY"), "agent image repository")
+	flags.StringVar(&result.AgentGuestBinary, "agent-guest-binary", envOr("WORLD_AGENT_GUEST_BINARY", "/usr/local/bin/world-guest"), "agent guest binary path inside containers")
+	flags.StringVar(&result.AgentContainerUser, "agent-container-user", envOr("WORLD_AGENT_CONTAINER_USER", "65532:65532"), "agent container user")
+	flags.StringVar(&result.TargetRoot, "target-root", os.Getenv("WORLD_TARGET_ROOT"), "linux target root")
+	flags.StringVar(&result.TargetImageRepository, "target-image-repository", os.Getenv("WORLD_TARGET_IMAGE_REPOSITORY"), "linux target image repository")
+	flags.BoolVar(&result.TargetAllowPtrace, "target-allow-ptrace", envBool("WORLD_TARGET_ALLOW_PTRACE", false), "allow ptrace on linux targets")
+	flags.StringVar(&result.AndroidTargetRoot, "android-target-root", os.Getenv("WORLD_ANDROID_TARGET_ROOT"), "android target root")
+	flags.StringVar(&result.AndroidSystemImageRoot, "android-system-image-root", os.Getenv("WORLD_ANDROID_SYSTEM_IMAGE_ROOT"), "android system image root")
+	flags.StringVar(&result.AndroidADBBinary, "android-adb-binary", envOr("WORLD_ANDROID_ADB_BINARY", "adb"), "android adb binary")
+	flags.StringVar(&result.AndroidADBServer, "android-adb-server", envOr("WORLD_ANDROID_ADB_SERVER", "127.0.0.1:5037"), "android adb server address")
+	flags.StringVar(&result.AndroidEmulatorBinary, "android-emulator-binary", envOr("WORLD_ANDROID_EMULATOR_BINARY", "emulator"), "android emulator binary")
+	flags.StringVar(&result.AndroidSDKRoot, "android-sdk-root", os.Getenv("WORLD_ANDROID_SDK_ROOT"), "android SDK root")
+	flags.StringVar(&result.AndroidSDKManagerBinary, "android-sdkmanager-binary", envOr("WORLD_ANDROID_SDKMANAGER_BINARY", "sdkmanager"), "android sdkmanager binary")
+	flags.StringVar(&result.AndroidAVDManagerBinary, "android-avdmanager-binary", envOr("WORLD_ANDROID_AVDMANAGER_BINARY", "avdmanager"), "android avdmanager binary")
+	flags.IntVar(&result.AndroidADBBasePort, "android-adb-base-port", envInt("WORLD_ANDROID_ADB_BASE_PORT", 5554), "android ADB base port")
+	flags.StringVar(&result.AndroidBackendVersion, "android-backend-version", os.Getenv("WORLD_ANDROID_BACKEND_VERSION"), "android backend version pin")
+	flags.StringVar(&result.AndroidRuntimeVersion, "android-runtime-version", os.Getenv("WORLD_ANDROID_RUNTIME_VERSION"), "android runtime version pin")
+	flags.StringVar(&result.ObserverOutputRoot, "observer-output-dir", os.Getenv("WORLD_OBSERVER_OUTPUT_DIR"), "observer output root")
+	flags.StringVar(&result.CaptureRoot, "capture-dir", os.Getenv("WORLD_CAPTURE_DIR"), "capture root")
+
 	if err := flags.Parse(arguments); err != nil {
-		return ConnectionConfig{}, "", nil, err
+		return OpenConfig{}, "", nil, err
 	}
 	remaining := flags.Args()
 	if len(remaining) == 0 {
-		return ConnectionConfig{}, "", nil, UsageError("command is required")
+		return OpenConfig{}, "", nil, UsageError("command is required")
 	}
 	if result.Timeout <= 0 {
-		return ConnectionConfig{}, "", nil, UsageError("timeout must be positive")
+		return OpenConfig{}, "", nil, UsageError("timeout must be positive")
 	}
-	if result.MaxMessage <= 0 {
-		return ConnectionConfig{}, "", nil, UsageError("max-message-bytes must be positive")
-	}
-	if strings.TrimSpace(result.UnixSocket) == "" && strings.TrimSpace(result.TCPAddress) == "" {
-		return ConnectionConfig{}, "", nil, UsageError("unix-socket or address is required")
+	if err := result.validatePaths(); err != nil {
+		return OpenConfig{}, "", nil, err
 	}
 	return result, remaining[0], remaining[1:], nil
 }
 
-// Dial constructs the public client using authenticated transport settings.
-func Dial(configuration ConnectionConfig) (*world.Client, error) {
-	tlsConfig, err := LoadClientTLS(configuration)
-	if err != nil {
-		return nil, err
+func (c OpenConfig) validatePaths() error {
+	for name, value := range map[string]string{
+		"state":                   c.StatePath,
+		"ledger-dir":              c.LedgerDirectory,
+		"orchestration-state-dir": c.OrchestrationStateRoot,
+		"bundle-dir":              c.BundleRoot,
+		"material-dir":            c.MaterialRoot,
+		"subject":                 c.Subject,
+	} {
+		if strings.TrimSpace(value) == "" {
+			return UsageError(name + " is required")
+		}
 	}
-	return world.Dial(world.DialOptions{
-		UnixSocket:      configuration.UnixSocket,
-		TCPAddress:      configuration.TCPAddress,
-		BearerToken:     configuration.BearerToken,
-		TLSConfig:       tlsConfig,
-		MaxMessageBytes: configuration.MaxMessage,
-		DefaultTimeout:  configuration.Timeout,
-	})
+	switch world.SubjectRole(strings.TrimSpace(c.SubjectRole)) {
+	case "", world.RoleOperator, world.RoleInternal:
+	default:
+		return UsageError("subject-role must be operator or internal")
+	}
+	return nil
 }
 
-// LoadClientTLS accepts either server-authenticated TLS or mTLS. A client
-// certificate and key must always be supplied together.
-func LoadClientTLS(configuration ConnectionConfig) (*tls.Config, error) {
-	anyTLS := configuration.TLSCA != "" || configuration.TLSCert != "" || configuration.TLSKey != "" || configuration.TLSServerName != ""
-	if !anyTLS {
-		return nil, nil
+// WorldConfig maps CLI OpenConfig into world.Config.
+func (c OpenConfig) WorldConfig() world.Config {
+	role := world.SubjectRole(strings.TrimSpace(c.SubjectRole))
+	if role == "" {
+		role = world.RoleOperator
 	}
-	if configuration.TLSCA == "" || configuration.TLSServerName == "" {
-		return nil, fmt.Errorf("tls-ca and tls-server-name must be configured together")
+	return world.Config{
+		Paths: world.LocalPaths{
+			StatePath:              c.StatePath,
+			LedgerDirectory:        c.LedgerDirectory,
+			OrchestrationStateRoot: c.OrchestrationStateRoot,
+			BundleRoot:             c.BundleRoot,
+			MaterialRoot:           c.MaterialRoot,
+		},
+		Subject: world.Subject{
+			Name: strings.TrimSpace(c.Subject),
+			Role: role,
+		},
+		DeploymentProfile: strings.TrimSpace(c.DeploymentProfile),
+		DefaultTimeout:    c.Timeout,
+		MaxTransferBytes:  c.MaxTransferBytes,
+		MaxExecBytes:      c.MaxExecBytes,
+		MaxADBBytes:       c.MaxADBBytes,
+		MaxBundleBytes:    c.MaxBundleBytes,
+		MaxCaptureRecords: c.MaxCaptureRecords,
+		Drivers: world.DriverConfig{
+			AgentDriver:             c.AgentDriver,
+			LinuxTarget:             c.LinuxTarget,
+			AndroidTarget:           c.AndroidTarget,
+			WorkspaceDriver:         c.WorkspaceDriver,
+			MaterialDriver:          c.MaterialDriver,
+			ObserverDriver:          c.ObserverDriver,
+			CaptureDriver:           c.CaptureDriver,
+			DockerBinary:            c.DockerBinary,
+			AgentWorkspaceRoot:      c.AgentWorkspaceRoot,
+			AgentImageRepository:    c.AgentImageRepository,
+			AgentGuestBinary:        c.AgentGuestBinary,
+			AgentContainerUser:      c.AgentContainerUser,
+			TargetRoot:              c.TargetRoot,
+			TargetImageRepository:   c.TargetImageRepository,
+			TargetAllowPtrace:       c.TargetAllowPtrace,
+			AndroidTargetRoot:       c.AndroidTargetRoot,
+			AndroidSystemImageRoot:  c.AndroidSystemImageRoot,
+			AndroidADBBinary:        c.AndroidADBBinary,
+			AndroidADBServer:        c.AndroidADBServer,
+			AndroidEmulatorBinary:   c.AndroidEmulatorBinary,
+			AndroidSDKRoot:          c.AndroidSDKRoot,
+			AndroidSDKManagerBinary: c.AndroidSDKManagerBinary,
+			AndroidAVDManagerBinary: c.AndroidAVDManagerBinary,
+			AndroidADBBasePort:      c.AndroidADBBasePort,
+			AndroidBackendVersion:   c.AndroidBackendVersion,
+			AndroidRuntimeVersion:   c.AndroidRuntimeVersion,
+			ObserverOutputRoot:      c.ObserverOutputRoot,
+			CaptureRoot:             c.CaptureRoot,
+		},
 	}
-	if (configuration.TLSCert == "") != (configuration.TLSKey == "") {
-		return nil, fmt.Errorf("tls-cert and tls-key must be configured together")
+}
+
+// Open constructs an in-process Manager for the configured local state tree.
+func Open(configuration OpenConfig) (*world.Manager, error) {
+	return OpenContext(context.Background(), configuration)
+}
+
+// OpenContext is Open with an explicit parent context (used for cancellation
+// during composition/startup reconciliation).
+func OpenContext(ctx context.Context, configuration OpenConfig) (*world.Manager, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	rootPEM, err := os.ReadFile(configuration.TLSCA)
-	if err != nil {
-		return nil, fmt.Errorf("read TLS CA: %w", err)
+	if err := EnsureParentDirs(configuration); err != nil {
+		return nil, err
 	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(rootPEM) {
-		return nil, fmt.Errorf("TLS CA contains no certificates")
-	}
-	result := &tls.Config{RootCAs: roots, ServerName: configuration.TLSServerName, MinVersion: tls.VersionTLS13}
-	if configuration.TLSCert != "" {
-		certificate, err := tls.LoadX509KeyPair(configuration.TLSCert, configuration.TLSKey)
-		if err != nil {
-			return nil, fmt.Errorf("load mTLS client certificate: %w", err)
+	return world.Open(ctx, configuration.WorldConfig())
+}
+
+// EnsureParentDirs creates parent directories for Open paths when missing.
+// Control state itself is created by the store on Open.
+func EnsureParentDirs(configuration OpenConfig) error {
+	for _, path := range []string{
+		configuration.StatePath,
+		filepath.Join(configuration.LedgerDirectory, ".keep"),
+		filepath.Join(configuration.OrchestrationStateRoot, ".keep"),
+		filepath.Join(configuration.BundleRoot, ".keep"),
+		filepath.Join(configuration.MaterialRoot, ".keep"),
+	} {
+		dir := filepath.Dir(path)
+		if dir == "" || dir == "." {
+			continue
 		}
-		result.Certificates = []tls.Certificate{certificate}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create open path parent %q: %w", dir, err)
+		}
 	}
-	return result, nil
+	return nil
 }
 
 // Context bounds a non-streaming command by the configured timeout.
-func Context(configuration ConnectionConfig) (context.Context, context.CancelFunc) {
+func Context(configuration OpenConfig) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), configuration.Timeout)
 }
 
@@ -364,6 +498,45 @@ func envOr(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envBool(name string, fallback bool) bool {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	switch strings.ToLower(value) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func envInt(name string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	var parsed int
+	if _, err := fmt.Sscanf(value, "%d", &parsed); err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envInt64(name string, fallback int64) int64 {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	var parsed int64
+	if _, err := fmt.Sscanf(value, "%d", &parsed); err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 // Env returns a trimmed environment value used as a scoped-helper default.

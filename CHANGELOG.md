@@ -10,6 +10,36 @@ schema, or on-disk format changes. Prefer the newest 0.x tag for consumers.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-30
+
+### Added
+
+- In-process library control plane: `world.Open(Config)` → `*world.Manager` as
+  the only supported host integration. Fixed local Subject, exclusive
+  processlock on control state, startup reconciliation before Open returns, and
+  the same logical/physical composition previously owned by the daemon.
+- `daemon.OpenHost` composition path used by the library (no network listener).
+- Design document for the cutover:
+  `docs/designs/library-only-manager.md`.
+
+### Removed
+
+- Remote dual-daemon control plane: `cmd/worldd`, `cmd/world-node`,
+  `daemon.Main`/`Run` listen path, `ModeController`/`ModeNode`, `world.Dial` /
+  `world.Client`, and `rpc.NewServer`/`rpc.Listen` / bearer-mTLS host auth as a
+  product surface.
+- Public gRPC WorldService host integration. The control plane is in-process
+  only.
+
+### Changed
+
+- Operator CLIs and adapters embed `world.Manager` only (local paths, drivers,
+  and Subject). There is no Dial / unix-socket / bearer-token client mode.
+- ADR 0001 dual-daemon decision is superseded by the library-only Manager
+  product (see `docs/designs/library-only-manager.md`).
+- Breaking 0.x cutover: consumers must import and embed the library; remote
+  socket clients and daemon packages are gone.
+
 ## [0.2.0] - 2026-07-29
 
 ### Added

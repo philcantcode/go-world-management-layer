@@ -1,42 +1,41 @@
 # Startup and reconciliation
 
-Use this after a normal restart, daemon crash, or host reboot.
+Use this after a normal host-process restart, crash, or host reboot.
 
 ## Automated today
 
-Before loading credentials or opening SQLite, a ledger, an orchestration root,
-any physical driver, the startup reconciler, or a listener, `worldd` and
-`world-node` acquire a nonblocking process-ownership lock at
-`<canonical-control-path>.worldd.lock`. The lock is held until RPC shutdown and
-all local cleanup complete, then released last. A second daemon using the same
-state fails immediately, whether it selects the same listener or another
-listener. Existing control and lock files must be regular, non-symlink files,
-still match their opened handles, and have exactly one filesystem link;
-hard-linked, reparse, and special-file aliases fail closed.
+Before opening SQLite, a ledger, an orchestration root, any physical driver, or
+the startup reconciler, `world.Open` / `OpenHost` acquire a nonblocking
+process-ownership lock at `<canonical-control-path>.worldd.lock`. The lock is
+held until `Manager.Close` / `Host.Close` and all local cleanup complete, then
+released last. A second Open using the same state fails immediately. Existing
+control and lock files must be regular, non-symlink files, still match their
+opened handles, and have exactly one filesystem link; hard-linked, reparse, and
+special-file aliases fail closed.
 
 On Linux, Darwin, BSD, and Solaris, the owner locks the canonical parent
 directory before its sibling `.worldd.lock` file and releases the file before
-the directory. This deliberately prevents a conforming second daemon from
+the directory. This deliberately prevents a conforming second Open from
 following an unlinked/replaced lock pathname; it also means independent control
 databases in the same directory cannot run concurrently. Windows instead uses
 `LockFileEx` and holds the lock file without delete sharing, then verifies path
 identity and the single-link invariant. AIX fails closed as unsupported because
 its available sibling-file lock cannot provide replacement-resistant namespace
-ownership. These advisory controls constrain conforming daemon acquisition;
-they are not protection against arbitrary same-user mutation that bypasses the
-daemon or ignores advisory locks. Give each daemon a dedicated,
+ownership. These advisory controls constrain conforming Open acquisition; they
+are not protection against arbitrary same-user mutation that bypasses the host
+or ignores advisory locks. Give each control-state tree a dedicated,
 access-controlled state directory.
 
 After ownership is established, the control store creates forward
 migrations, verifies the complete SQLite control-record hash chain, and
 replays accepted records into application state. Startup fails on a newer
 database schema, hash-chain damage, an unknown aggregate kind, or invalid
-replay data. The daemon also opens the configured observation ledger,
-reconstructs its segment index, and may truncate only an incomplete tail in
-the single open segment. Every such repair is written to the daemon log. The
-orchestration service replays its durable state before accepting RPCs.
+replay data. Open also opens the configured observation ledger, reconstructs
+its segment index, and may truncate only an incomplete tail in the single open
+segment. Every such repair is written to the host log. The orchestration
+service replays its durable state before Open returns a Manager.
 
-Physical composition is loaded before reconciliation: the daemon probes the
+Physical composition is loaded before reconciliation: Open probes the
 selected drivers, compiles strict policy against the complete capability
 fingerprint, preflights every configured physical plan, and publishes the exact
 effective-policy pairs. Orchestration replay loads reservations, canonical

@@ -38,7 +38,7 @@ func (options *transitionOptions) metadata(timeout time.Duration) (*worldv1.Muta
 	return options.mutation.Metadata(timeout)
 }
 
-func getExec(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, _ worldcli.ConnectionConfig) error {
+func getExec(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, _ worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("get-exec", stderr)
 	execID := flags.String("exec", "", "exec ID")
 	if err := flags.Parse(arguments); err != nil {
@@ -50,16 +50,16 @@ func getExec(ctx context.Context, client *world.Client, arguments []string, stdo
 	if err := worldcli.Require("exec", *execID); err != nil {
 		return err
 	}
-	result, err := client.GetExec(ctx, &worldv1.GetExecRequest{ExecId: *execID})
+	result, err := manager.GetExec(ctx, &worldv1.GetExecRequest{ExecId: *execID})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func createExec(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func createExec(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	request, err := parseCreateExec(arguments, stderr, configuration.Timeout)
 	if err != nil {
 		return err
 	}
-	result, err := client.CreateExec(ctx, request)
+	result, err := manager.CreateExec(ctx, request)
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
@@ -97,7 +97,7 @@ func parseCreateExec(arguments []string, stderr io.Writer, timeout time.Duration
 	}, nil
 }
 
-func transitionExec(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func transitionExec(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("transition-exec", stderr)
 	execID := flags.String("exec", "", "exec ID")
 	transition := addTransitionFlags(flags)
@@ -114,11 +114,11 @@ func transitionExec(ctx context.Context, client *world.Client, arguments []strin
 	if err != nil {
 		return err
 	}
-	result, err := client.TransitionExec(ctx, &worldv1.TransitionExecRequest{Mutation: meta, ExecId: *execID, ExpectedRevision: transition.revision, State: transition.state})
+	result, err := manager.TransitionExec(ctx, &worldv1.TransitionExecRequest{Mutation: meta, ExecId: *execID, ExpectedRevision: transition.revision, State: transition.state})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func finalizeExec(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func finalizeExec(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("finalize-exec", stderr)
 	execID := flags.String("exec", "", "exec ID")
 	revision := flags.Uint64("revision", 0, "expected exec revision")
@@ -143,7 +143,7 @@ func finalizeExec(ctx context.Context, client *world.Client, arguments []string,
 	if err != nil {
 		return err
 	}
-	result, err := client.FinalizeExec(ctx, &worldv1.FinalizeExecRequest{
+	result, err := manager.FinalizeExec(ctx, &worldv1.FinalizeExecRequest{
 		Mutation:         meta,
 		ExecId:           *execID,
 		ExpectedRevision: *revision,
@@ -157,7 +157,7 @@ func finalizeExec(ctx context.Context, client *world.Client, arguments []string,
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func transitionAgentGeneration(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func transitionAgentGeneration(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("transition-agent-generation", stderr)
 	workspace := flags.String("workspace", "", "agent workspace ID")
 	generation := flags.Uint64("generation", 0, "agent generation")
@@ -175,11 +175,11 @@ func transitionAgentGeneration(ctx context.Context, client *world.Client, argume
 	if err != nil {
 		return err
 	}
-	result, err := client.TransitionAgentGeneration(ctx, &worldv1.TransitionAgentGenerationRequest{Mutation: meta, AgentWorkspaceId: *workspace, Generation: *generation, ExpectedRevision: transition.revision, State: transition.state})
+	result, err := manager.TransitionAgentGeneration(ctx, &worldv1.TransitionAgentGenerationRequest{Mutation: meta, AgentWorkspaceId: *workspace, Generation: *generation, ExpectedRevision: transition.revision, State: transition.state})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func transitionTargetGeneration(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func transitionTargetGeneration(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("transition-target-generation", stderr)
 	target := flags.String("target", defaultEnv("WORLD_TARGET_ID"), "target ID")
 	generation := flags.Uint64("generation", 0, "target generation")
@@ -197,11 +197,11 @@ func transitionTargetGeneration(ctx context.Context, client *world.Client, argum
 	if err != nil {
 		return err
 	}
-	result, err := client.TransitionTargetGeneration(ctx, &worldv1.TransitionTargetGenerationRequest{Mutation: meta, TargetId: *target, Generation: *generation, ExpectedRevision: transition.revision, State: transition.state})
+	result, err := manager.TransitionTargetGeneration(ctx, &worldv1.TransitionTargetGenerationRequest{Mutation: meta, TargetId: *target, Generation: *generation, ExpectedRevision: transition.revision, State: transition.state})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func transitionTargetRun(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func transitionTargetRun(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("transition-run", stderr)
 	target := flags.String("target", defaultEnv("WORLD_TARGET_ID"), "target ID")
 	run := flags.String("run", defaultEnv("WORLD_TARGET_RUN_ID"), "target run ID")
@@ -219,11 +219,11 @@ func transitionTargetRun(ctx context.Context, client *world.Client, arguments []
 	if err != nil {
 		return err
 	}
-	result, err := client.TransitionTargetRun(ctx, &worldv1.TransitionTargetRunRequest{Mutation: meta, TargetId: *target, TargetRunId: *run, ExpectedRevision: transition.revision, State: transition.state})
+	result, err := manager.TransitionTargetRun(ctx, &worldv1.TransitionTargetRunRequest{Mutation: meta, TargetId: *target, TargetRunId: *run, ExpectedRevision: transition.revision, State: transition.state})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func createTargetOperation(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func createTargetOperation(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("create-operation", stderr)
 	target := flags.String("target", defaultEnv("WORLD_TARGET_ID"), "target ID")
 	run := flags.String("run", defaultEnv("WORLD_TARGET_RUN_ID"), "target run ID")
@@ -244,11 +244,11 @@ func createTargetOperation(ctx context.Context, client *world.Client, arguments 
 	if err != nil {
 		return err
 	}
-	result, err := client.CreateTargetOperation(ctx, &worldv1.CreateTargetOperationRequest{Mutation: meta, TargetId: *target, TargetRunId: *run, Kind: *kind, CommandDisplay: *display, ContentDigest: *digest})
+	result, err := manager.CreateTargetOperation(ctx, &worldv1.CreateTargetOperationRequest{Mutation: meta, TargetId: *target, TargetRunId: *run, Kind: *kind, CommandDisplay: *display, ContentDigest: *digest})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func transitionTargetOperation(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func transitionTargetOperation(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("transition-operation", stderr)
 	target := flags.String("target", defaultEnv("WORLD_TARGET_ID"), "target ID")
 	operation := flags.String("operation", "", "target operation ID")
@@ -266,11 +266,11 @@ func transitionTargetOperation(ctx context.Context, client *world.Client, argume
 	if err != nil {
 		return err
 	}
-	result, err := client.TransitionTargetOperation(ctx, &worldv1.TransitionTargetOperationRequest{Mutation: meta, TargetId: *target, TargetOperationId: *operation, ExpectedRevision: transition.revision, State: transition.state})
+	result, err := manager.TransitionTargetOperation(ctx, &worldv1.TransitionTargetOperationRequest{Mutation: meta, TargetId: *target, TargetOperationId: *operation, ExpectedRevision: transition.revision, State: transition.state})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func getIncident(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, _ worldcli.ConnectionConfig) error {
+func getIncident(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, _ worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("get-incident", stderr)
 	incident := flags.String("incident", "", "incident ID")
 	if err := flags.Parse(arguments); err != nil {
@@ -282,16 +282,16 @@ func getIncident(ctx context.Context, client *world.Client, arguments []string, 
 	if err := worldcli.Require("incident", *incident); err != nil {
 		return err
 	}
-	result, err := client.GetIncident(ctx, &worldv1.GetIncidentRequest{IncidentId: *incident})
+	result, err := manager.GetIncident(ctx, &worldv1.GetIncidentRequest{IncidentId: *incident})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func createIncident(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func createIncident(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	request, err := parseCreateIncident(arguments, stderr, configuration.Timeout)
 	if err != nil {
 		return err
 	}
-	result, err := client.CreateIncident(ctx, request)
+	result, err := manager.CreateIncident(ctx, request)
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
@@ -435,7 +435,7 @@ func decodeProtoJSON[Message proto.Message](payload []byte, message Message) (Me
 	return message, nil
 }
 
-func transitionIncident(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func transitionIncident(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("transition-incident", stderr)
 	incident := flags.String("incident", "", "incident ID")
 	recoveryActions := flags.String("recovery-actions", "", "comma-separated recovery actions")
@@ -454,7 +454,7 @@ func transitionIncident(ctx context.Context, client *world.Client, arguments []s
 	if err != nil {
 		return err
 	}
-	result, err := client.TransitionIncident(ctx, &worldv1.TransitionIncidentRequest{
+	result, err := manager.TransitionIncident(ctx, &worldv1.TransitionIncidentRequest{
 		Mutation: meta, IncidentId: *incident, ExpectedRevision: transition.revision, State: transition.state,
 		RecoveryActions: worldcli.CSV(*recoveryActions), VisibilityAcknowledgements: worldcli.CSV(*acknowledgements),
 	})

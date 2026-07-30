@@ -19,7 +19,7 @@ type pushOptions struct {
 	mode              uint32
 }
 
-func pushTargetFile(ctx context.Context, client *world.Client, arguments []string, _ io.Reader, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func pushTargetFile(ctx context.Context, manager *world.Manager, arguments []string, _ io.Reader, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	options, err := parsePush(arguments, stderr)
 	if err != nil {
 		return err
@@ -28,10 +28,11 @@ func pushTargetFile(ctx context.Context, client *world.Client, arguments []strin
 	if err != nil {
 		return err
 	}
-	stream, err := client.PushTargetFile(ctx)
+	stream, err := manager.PushTargetFile(ctx)
 	if err != nil {
 		return err
 	}
+	defer stream.Close()
 	if err := stream.Send(options.start(meta)); err != nil {
 		return err
 	}
@@ -92,7 +93,7 @@ type pullOptions struct {
 	workspaceDestination string
 }
 
-func pullTargetFile(ctx context.Context, client *world.Client, arguments []string, _ io.Reader, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func pullTargetFile(ctx context.Context, manager *world.Manager, arguments []string, _ io.Reader, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	options, err := parsePull(arguments, stderr)
 	if err != nil {
 		return err
@@ -101,10 +102,11 @@ func pullTargetFile(ctx context.Context, client *world.Client, arguments []strin
 	if err != nil {
 		return err
 	}
-	stream, err := client.PullTargetFile(ctx, options.request(meta))
+	stream, err := manager.PullTargetFile(ctx, options.request(meta))
 	if err != nil {
 		return err
 	}
+	defer stream.Close()
 	operation, err := receiveWorkspaceTransfer(stream.Recv, "pull")
 	if err != nil {
 		return err

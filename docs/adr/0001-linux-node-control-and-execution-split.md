@@ -1,7 +1,9 @@
 # ADR 0001: Target Linux nodes and split control from node execution
 
-- Status: Accepted
+- Status: **Superseded** (as product surface)
 - Date: 2026-07-24
+- Superseded-by: [library-only Manager](../designs/library-only-manager.md)
+  (2026-07 cutover)
 
 ## Context
 
@@ -12,12 +14,9 @@ observers are high-authority operations. Combining them with public scheduling
 and subscription APIs would make the control-plane attack surface unnecessarily
 powerful.
 
-## Decision
+## Original decision (historical)
 
-Version 1 runs on dedicated Linux nodes. Remote clients may be cross-platform,
-but Docker Desktop is not the reference isolation or performance environment.
-
-Split the implementation into:
+Version 1 was planned as two cooperating daemons on dedicated Linux nodes:
 
 - `worldd`, an unprivileged logical control plane that owns policy, admission,
   leases, agent/target generations, target runs, durable state, incidents,
@@ -26,31 +25,36 @@ Split the implementation into:
   cgroups, sibling agent/target containers, Android virtual devices, scoped ADB
   access, and privileged observers.
 
-The node accepts only typed, resolved plans under configured roots and
-allowlists. It does not expose shell, Docker passthrough, arbitrary host paths,
-or raw USB operations. It independently validates lease identity and policy
-constraints so a confused control-plane request cannot become arbitrary host
-execution.
+Remote clients would Dial an authenticated WorldService endpoint.
 
-ADR 0010 permits arbitrary shell and ADB commands only after a typed envelope
-has bound them to one active target run. This does not add a node or host shell:
-the node selects the already-assigned target transport before forwarding opaque
-guest command bytes.
+## Current product decision
+
+The dual-daemon and remote Dial product is **deleted**. The control plane is an
+imported library:
+
+- Hosts call `world.Open(Config)` and receive `*world.Manager`.
+- Exclusive process ownership of one control-state tree is enforced by
+  processlock (same fail-closed rules as the former daemons).
+- A fixed local `Config.Subject` replaces bearer tokens and mTLS client identity.
+- Physical composition (Docker agent/target, managed Android, observers,
+  capture) remains opt-in and deployment-profile gated inside the host process.
+- Multi-tenant isolation is separate host processes and state trees, not
+  multi-subject network sessions on one Manager.
+
+Logical vs privileged boundary intent from this ADR remains: policy and
+lifecycle authority stay explicit; physical drivers stay under typed plans and
+configured roots. They are no longer separate remote services.
 
 ## Consequences
 
-- Linux behavior can be tested honestly instead of hidden behind weak portable
-  abstractions.
-- Privileged code and API surface are narrow and separately fuzzable.
-- Deployment has two cooperating daemons and an authenticated local protocol.
-- Windows/macOS native node support is a separate future design, not a v1
-  compatibility shim.
+- No `worldd` / `world-node` binaries, no `world.Dial`, no host-facing gRPC
+  Serve path.
+- Operator CLIs and adapters embed Manager only.
+- Linux node qualification and physical-driver fail-closed rules still apply
+  inside the embedding host process.
 
-## Rejected alternatives
+## Rejected alternatives (still rejected)
 
-- One privileged daemon: simpler initially, but greatly enlarges the exposed
-  authority and makes least-privilege testing harder.
-- A platform-neutral v1: would either omit required facilities or falsely claim
-  equivalent guarantees.
-- Run Docker/ADB inside the agent workspace: exposes management authority to an
-  untrusted workload and prevents sibling isolation between agent and target.
+- One privileged daemon with a large remote API surface.
+- A platform-neutral claim of equivalent isolation without Linux facilities.
+- Reintroducing a “compatible remote mode” alongside the library.

@@ -24,7 +24,7 @@ var (
 
 // Normalize validates an untrusted, slash-separated logical path. Backslashes
 // and drive/UNC-like forms are rejected on every host so client behavior does
-// not vary with the world-node operating system.
+// not vary with the host operating system.
 func Normalize(value string) (string, error) {
 	if value == "" {
 		return "", ErrEmpty

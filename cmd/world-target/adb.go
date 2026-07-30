@@ -20,7 +20,7 @@ type adbProxyOptions struct {
 	connections int
 }
 
-func targetADBProxy(ctx context.Context, client *world.Client, arguments []string, _ io.Reader, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func targetADBProxy(ctx context.Context, manager *world.Manager, arguments []string, _ io.Reader, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	options, err := parseADBProxy(arguments, stderr)
 	if err != nil {
 		return err
@@ -45,7 +45,7 @@ func targetADBProxy(ctx context.Context, client *world.Client, arguments []strin
 			}
 			return fmt.Errorf("accept scoped ADB client: %w", err)
 		}
-		err = proxyADBConnection(ctx, client, connection, options.scope, stderr, configuration)
+		err = proxyADBConnection(ctx, manager, connection, options.scope, stderr, configuration)
 		_ = connection.Close()
 		if err != nil {
 			return err
@@ -54,15 +54,16 @@ func targetADBProxy(ctx context.Context, client *world.Client, arguments []strin
 	return nil
 }
 
-func proxyADBConnection(ctx context.Context, client *world.Client, connection net.Conn, scope *targetScope, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func proxyADBConnection(ctx context.Context, manager *world.Manager, connection net.Conn, scope *targetScope, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	meta, err := scope.mutation(configuration.Timeout)
 	if err != nil {
 		return err
 	}
-	stream, err := client.OpenTargetADB(ctx)
+	stream, err := manager.OpenTargetADB(ctx)
 	if err != nil {
 		return err
 	}
+	defer stream.Close()
 	response := adbResponse{connection: connection, stderr: stderr}
 	err = worldcli.PumpBidi(stream, &worldv1.ADBFrame{Start: &worldv1.ADBStart{Mutation: meta, TargetId: scope.target, TargetRunId: scope.run}}, connection,
 		func(data []byte) *worldv1.ADBFrame { return &worldv1.ADBFrame{ClientBytes: data} },

@@ -27,13 +27,13 @@ func run(arguments []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	client, err := worldcli.Dial(configuration)
+	manager, err := worldcli.Open(configuration)
 	if err != nil {
 		return err
 	}
-	defer client.Close()
+	defer manager.Close()
 	ctx, cancel := worldcli.Context(configuration)
 	defer cancel()
-	result, err := client.DeclareExport(ctx, request)
+	result, err := manager.DeclareExport(ctx, request)
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }

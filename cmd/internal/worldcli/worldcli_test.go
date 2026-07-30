@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -92,8 +91,8 @@ func TestParseGlobalLeavesCommandArguments(t *testing.T) {
 	if len(arguments) != 2 || arguments[0] != "-lease" || arguments[1] != "lease_1" {
 		t.Fatalf("unexpected command arguments: %#v", arguments)
 	}
-	if runtime.GOOS == "windows" && config.TCPAddress == "" {
-		t.Fatal("expected the Windows loopback default")
+	if strings.TrimSpace(config.StatePath) == "" || strings.TrimSpace(config.Subject) == "" {
+		t.Fatalf("expected local Open defaults: %#v", config)
 	}
 }
 
@@ -101,7 +100,7 @@ func TestParseGlobalRejectsMissingCommandAndInvalidBounds(t *testing.T) {
 	tests := [][]string{
 		{},
 		{"-timeout", "0s", "snapshot"},
-		{"-max-message-bytes", "0", "snapshot"},
+		{"-state", "", "snapshot"},
 	}
 	for _, arguments := range tests {
 		if _, _, _, err := ParseGlobal("test", arguments, &bytes.Buffer{}); err == nil {
@@ -258,12 +257,15 @@ func TestRequireNoArgsAndTerminalValidation(t *testing.T) {
 	}
 }
 
-func TestLoadClientTLSRequiresPairedSettings(t *testing.T) {
-	if _, err := LoadClientTLS(ConnectionConfig{TLSCA: "ca.pem"}); err == nil {
-		t.Fatal("expected server-name validation")
+func TestOpenConfigWorldConfigMapsLocalSubject(t *testing.T) {
+	cfg := OpenConfig{
+		StatePath: "control.db", LedgerDirectory: "ledger", OrchestrationStateRoot: "orch",
+		BundleRoot: "bundles", MaterialRoot: "material", Subject: "operator-a", SubjectRole: "operator",
+		Timeout: time.Second, AgentDriver: "none", MaterialDriver: "local",
 	}
-	if _, err := LoadClientTLS(ConnectionConfig{TLSCA: "ca.pem", TLSServerName: "worldd", TLSCert: "client.pem"}); err == nil {
-		t.Fatal("expected certificate-key validation")
+	worldCfg := cfg.WorldConfig()
+	if worldCfg.Paths.StatePath != "control.db" || worldCfg.Subject.Name != "operator-a" {
+		t.Fatalf("unexpected world config: %#v", worldCfg)
 	}
 }
 

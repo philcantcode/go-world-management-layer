@@ -10,7 +10,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/world"
 )
 
-func startCapture(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func startCapture(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("start-capture", stderr)
 	lease := flags.String("lease", defaultEnv("WORLD_LEASE_ID"), "lease ID")
 	profile := flags.String("profile", "", "capture profile")
@@ -38,23 +38,23 @@ func startCapture(ctx context.Context, client *world.Client, arguments []string,
 	if err != nil {
 		return err
 	}
-	result, err := client.StartCapture(ctx, &worldv1.StartCaptureRequest{
+	result, err := manager.StartCapture(ctx, &worldv1.StartCaptureRequest{
 		Mutation: meta, LeaseId: *lease,
 		CaptureSpec: &worldv1.CaptureSpec{Profile: *profile, SignalFamilies: worldcli.CSV(*signals), Duration: wireDuration, ByteLimit: *byteLimit},
 	})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func requestCapture(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func requestCapture(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	request, err := worldcli.ParseRequestCapture(arguments, stderr, configuration.Timeout, defaultEnv("WORLD_LEASE_ID"), defaultEnv("WORLD_POLICY_REFERENCE"))
 	if err != nil {
 		return err
 	}
-	result, err := client.RequestCapture(ctx, request)
+	result, err := manager.RequestCapture(ctx, request)
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func stopCapture(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func stopCapture(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("stop-capture", stderr)
 	lease := flags.String("lease", defaultEnv("WORLD_LEASE_ID"), "lease ID")
 	capture := flags.String("capture", "", "capture ID")
@@ -73,16 +73,16 @@ func stopCapture(ctx context.Context, client *world.Client, arguments []string, 
 	if err != nil {
 		return err
 	}
-	result, err := client.StopCapture(ctx, &worldv1.StopCaptureRequest{Mutation: meta, LeaseId: *lease, CaptureId: *capture, ExpectedRevision: *revision})
+	result, err := manager.StopCapture(ctx, &worldv1.StopCaptureRequest{Mutation: meta, LeaseId: *lease, CaptureId: *capture, ExpectedRevision: *revision})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func declareExport(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func declareExport(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	request, err := parseDeclareExport(arguments, stderr, configuration.Timeout)
 	if err != nil {
 		return err
 	}
-	result, err := client.DeclareExport(ctx, request)
+	result, err := manager.DeclareExport(ctx, request)
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
@@ -90,7 +90,7 @@ func parseDeclareExport(arguments []string, stderr io.Writer, timeout time.Durat
 	return worldcli.ParseDeclareExport(arguments, stderr, timeout, defaultEnv("WORLD_LEASE_ID"), defaultEnv("WORLD_POLICY_REFERENCE"))
 }
 
-func previewExport(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, _ worldcli.ConnectionConfig) error {
+func previewExport(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, _ worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("preview-export", stderr)
 	lease := flags.String("lease", defaultEnv("WORLD_LEASE_ID"), "lease ID")
 	if err := flags.Parse(arguments); err != nil {
@@ -102,11 +102,11 @@ func previewExport(ctx context.Context, client *world.Client, arguments []string
 	if err := worldcli.Require("lease", *lease); err != nil {
 		return err
 	}
-	result, err := client.PreviewChangeSet(ctx, &worldv1.PreviewChangeSetRequest{LeaseId: *lease})
+	result, err := manager.PreviewChangeSet(ctx, &worldv1.PreviewChangeSetRequest{LeaseId: *lease})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }
 
-func commitExport(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func commitExport(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	flags := worldcli.NewFlagSet("commit-export", stderr)
 	lease := flags.String("lease", defaultEnv("WORLD_LEASE_ID"), "lease ID")
 	exportID := flags.String("export", "", "export ID")
@@ -125,6 +125,6 @@ func commitExport(ctx context.Context, client *world.Client, arguments []string,
 	if err != nil {
 		return err
 	}
-	result, err := client.CommitExport(ctx, &worldv1.CommitExportRequest{Mutation: meta, LeaseId: *lease, ExportId: *exportID, ExpectedWorkspaceRevision: *revision})
+	result, err := manager.CommitExport(ctx, &worldv1.CommitExportRequest{Mutation: meta, LeaseId: *lease, ExportId: *exportID, ExpectedWorkspaceRevision: *revision})
 	return worldcli.EncodeResult(worldcli.Encoder(stdout), result, err)
 }

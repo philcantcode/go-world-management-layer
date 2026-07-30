@@ -204,7 +204,7 @@ func TestParseQuarantinePreservesDispositionAndMutation(t *testing.T) {
 func TestMutatingParsersPopulateUniqueBoundedMetadata(t *testing.T) {
 	const policy = "sha256:policy"
 	timeout := 2 * time.Second
-	config := worldcli.ConnectionConfig{Timeout: timeout}
+	config := worldcli.OpenConfig{Timeout: timeout}
 	tests := []struct {
 		name  string
 		parse func() (*worldv1.MutationMetadata, error)

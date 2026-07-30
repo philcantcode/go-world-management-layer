@@ -10,9 +10,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/application"
 	"github.com/philcantcode/go-world-management-layer/internal/domain"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
@@ -59,15 +57,17 @@ func (s *WorldServer) authorize(ctx context.Context, scope application.Authoriza
 	return nil
 }
 
+// ServerOptions configures the in-process WorldServer facade used by Manager.
+// There is no gRPC Serve / Listen product entrypoint.
 type ServerOptions struct {
-	Authenticator        Authenticator
-	Capabilities         worldv1.WorldServiceServer
-	TrustedNodeSubjects  map[string]bool
-	MaxMessageBytes      int
-	PollInterval         time.Duration
-	TransportCredentials credentials.TransportCredentials
+	Capabilities        worldv1.WorldServiceServer
+	TrustedNodeSubjects map[string]bool
+	PollInterval        time.Duration
 }
 
+// WorldServer maps world.v1 DTOs onto application Core and orchestration
+// capabilities. It is invoked in-process by world.Manager; it is not a host
+// network control plane.
 type WorldServer struct {
 	worldv1.UnimplementedWorldServiceServer
 	core         Core
@@ -102,30 +102,6 @@ func (s *WorldServer) authorizeNode(ctx context.Context) error {
 		return status.Error(codes.PermissionDenied, "operation requires a configured trusted node identity")
 	}
 	return nil
-}
-
-// NewServer constructs and registers a bounded, authenticated gRPC server.
-func NewServer(core Core, options ServerOptions) (*grpc.Server, error) {
-	service, err := NewWorldServer(core, options)
-	if err != nil {
-		return nil, err
-	}
-	maxBytes := options.MaxMessageBytes
-	if maxBytes <= 0 {
-		maxBytes = worldv1.DefaultMaxMessageSize
-	}
-	serverOptions := []grpc.ServerOption{
-		grpc.MaxRecvMsgSize(maxBytes),
-		grpc.MaxSendMsgSize(maxBytes),
-		grpc.UnaryInterceptor(unaryAuthInterceptor(options.Authenticator)),
-		grpc.StreamInterceptor(streamAuthInterceptor(options.Authenticator)),
-	}
-	if options.TransportCredentials != nil {
-		serverOptions = append(serverOptions, grpc.Creds(options.TransportCredentials))
-	}
-	server := grpc.NewServer(serverOptions...)
-	worldv1.RegisterWorldServiceServer(server, service)
-	return server, nil
 }
 
 func mutation(value *worldv1.MutationMetadata) (application.MutationMeta, error) {

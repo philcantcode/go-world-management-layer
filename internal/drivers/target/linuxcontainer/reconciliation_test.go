@@ -26,7 +26,7 @@ func TestRuntimeAuthorityRejectsNonCanonicalDockerIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := validLifecycleContainerPlan(t, t.TempDir(), lease, target, 1)
+	plan := validLifecycleContainerPlan(t, writableTempDir(t), lease, target, 1)
 	state := targetStateForPlan("short-id", plan)
 	if err := validateRuntimeIdentity(state, plan); err == nil {
 		t.Fatal("non-canonical inspected runtime identity was accepted")
@@ -519,7 +519,7 @@ func testTargetUser(t *testing.T) string {
 func restartTargetDrivers(t *testing.T, runtime *inventoryRuntime, input ports.TargetPlan) (*Driver, *Driver, ContainerPlan) {
 	t.Helper()
 	config := Config{
-		Build: BuildConfig{TargetRoot: t.TempDir(), ImageRepository: "example.invalid/target", ContainerUser: testTargetUser(t)}, Runtime: runtime,
+		Build: BuildConfig{TargetRoot: writableTempDir(t), ImageRepository: "example.invalid/target", ContainerUser: testTargetUser(t)}, Runtime: runtime,
 		Collectors: CollectorReadinessFunc(func(context.Context, domain.TargetRunID, []ports.ObservationRequirement) error { return nil }),
 	}
 	first, err := New(config)

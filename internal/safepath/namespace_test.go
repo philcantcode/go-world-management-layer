@@ -9,7 +9,21 @@ import (
 	"testing"
 )
 
+func requireSupportedNamespace(t *testing.T) {
+	t.Helper()
+	root := t.TempDir()
+	namespace, err := OpenNamespace(root, "probe")
+	if errors.Is(err, ErrUnsupported) {
+		t.Skip("safe namespace is unsupported on this platform")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = namespace.Close()
+}
+
 func TestNamespacePublishesReadsReplacesListsAndRemoves(t *testing.T) {
+	requireSupportedNamespace(t)
 	root := t.TempDir()
 	namespace, err := OpenNamespace(root, "evidence")
 	if err != nil {
@@ -54,6 +68,7 @@ func TestNamespacePublishesReadsReplacesListsAndRemoves(t *testing.T) {
 }
 
 func TestNamespaceRejectsHardLinkedFiles(t *testing.T) {
+	requireSupportedNamespace(t)
 	root := t.TempDir()
 	namespace, err := OpenNamespace(root, "evidence")
 	if err != nil {
@@ -81,6 +96,7 @@ func TestNamespaceRejectsHardLinkedFiles(t *testing.T) {
 }
 
 func TestNamespaceRejectsReparseOrSymlinkDirectory(t *testing.T) {
+	requireSupportedNamespace(t)
 	root := t.TempDir()
 	outside := t.TempDir()
 	if err := os.Symlink(outside, filepath.Join(root, "evidence")); err != nil {
@@ -92,6 +108,7 @@ func TestNamespaceRejectsReparseOrSymlinkDirectory(t *testing.T) {
 }
 
 func TestNamespaceCleanupPrefixRejectsNonRegularEntry(t *testing.T) {
+	requireSupportedNamespace(t)
 	root := t.TempDir()
 	namespace, err := OpenNamespace(root, "evidence")
 	if err != nil {

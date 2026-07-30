@@ -1,20 +1,20 @@
 # Operations runbooks
 
-These runbooks describe the recovery invariants for a world-management node.
-They deliberately separate repository behavior from deployment-owned host
-operations.
+These runbooks describe the recovery invariants for a world-management host
+process that embeds `world.Open` / `*world.Manager`. They deliberately separate
+repository behavior from deployment-owned host operations.
 
-The shipped daemons execute crash-consistent logical control transitions,
-ledger recovery/live projection, local observation-bundle finalization, and an
-opt-in physical Linux and Android composition. A trusted version-3 deployment
-profile can activate directory-copy workspaces, Docker-backed agent and
-Linux-target drivers, managed Android SDK Emulator targets,
+There is **no** remote dual-daemon product (`worldd` / `world-node`). Open
+executes crash-consistent logical control transitions, ledger recovery/live
+projection, local observation-bundle finalization, and an opt-in physical Linux
+and Android composition inside the embedding process. A trusted version-3
+deployment profile can activate directory-copy workspaces, Docker-backed agent
+and Linux-target drivers, managed Android SDK Emulator targets,
 deployment-authorized local material, process observers, and ledger capture.
-Startup compiles strict policy against probed capabilities, preflights
-every physical plan, and reconciles durable ownership before opening the
-listener. The deployment must still supply and qualify the host, pinned images
-and observer programs, service management, monitoring, and any remote artifact
-backend.
+Open compiles strict policy against probed capabilities, preflights every
+physical plan, and reconciles durable ownership before returning Manager. The
+deployment must still supply and qualify the host, pinned images and observer
+programs, process supervision, monitoring, and any remote artifact backend.
 
 `android-target-driver=android-emulator` owns headless AVD creation, clean boot,
 exact-serial scoped ADB/file transport, quarantine, replacement-generation
@@ -33,9 +33,10 @@ devices; do not treat it as proof of managed lifecycle behavior.
 
 - Stop admission before changing host resources. Keep read-only control access
   available when it is safe to do so.
-- Never bypass a held `<canonical-control-path>.worldd.lock` or start two
-  daemons against one control history. Keep each daemon's state in a dedicated
-  directory on platforms whose namespace lock intentionally excludes siblings.
+- Never bypass a held `<canonical-control-path>.worldd.lock` or Open two
+  processes against one control history. Keep each Manager's state tree in a
+  dedicated directory on platforms whose namespace lock intentionally excludes
+  siblings.
 - Preserve IDs, revisions, policy and capability digests, timestamps, and
   command output in the incident record.
 - Never present a restarted process, restored device, or recreated container

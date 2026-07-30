@@ -20,7 +20,7 @@ type execStreamOptions struct {
 	outcomeJSON bool
 }
 
-func openExec(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, configuration worldcli.ConnectionConfig) error {
+func openExec(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, configuration worldcli.OpenConfig) error {
 	options, err := parseOpenExec(arguments, stderr, configuration)
 	if err != nil {
 		return err
@@ -30,10 +30,11 @@ func openExec(ctx context.Context, client *world.Client, arguments []string, std
 		return err
 	}
 	defer closeInput()
-	stream, err := client.OpenExec(ctx)
+	stream, err := manager.OpenExec(ctx)
 	if err != nil {
 		return err
 	}
+	defer stream.Close()
 	var output worldcli.ExecOutput
 	err = worldcli.PumpBidi(stream, &worldv1.ExecFrame{Start: options.start}, input,
 		func(data []byte) *worldv1.ExecFrame { return &worldv1.ExecFrame{Stdin: data} },
@@ -47,7 +48,7 @@ func openExec(ctx context.Context, client *world.Client, arguments []string, std
 	return output.Finish(stderr, options.outcomeJSON)
 }
 
-func parseOpenExec(arguments []string, stderr io.Writer, configuration worldcli.ConnectionConfig) (*execStreamOptions, error) {
+func parseOpenExec(arguments []string, stderr io.Writer, configuration worldcli.OpenConfig) (*execStreamOptions, error) {
 	flags := worldcli.NewFlagSet("open-exec", stderr)
 	lease := flags.String("lease", defaultEnv("WORLD_LEASE_ID"), "lease ID")
 	executable := flags.String("executable", "", "policy-approved provider executable")

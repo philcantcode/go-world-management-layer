@@ -15,7 +15,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/world"
 )
 
-type targetHandler func(context.Context, *world.Client, []string, io.Reader, io.Writer, io.Writer, worldcli.ConnectionConfig) error
+type targetHandler func(context.Context, *world.Manager, []string, io.Reader, io.Writer, io.Writer, worldcli.OpenConfig) error
 
 var targetCommands = map[string]targetHandler{
 	"exec":      targetExec,
@@ -69,14 +69,14 @@ func run(arguments []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if !ok {
 		return worldcli.UsageError(fmt.Sprintf("unknown command %q (available: %s)", command, targetCommandList()))
 	}
-	client, err := worldcli.Dial(configuration)
+	manager, err := worldcli.Open(configuration)
 	if err != nil {
 		return err
 	}
-	defer client.Close()
+	defer manager.Close()
 	ctx, cancel := worldcli.Context(configuration)
 	defer cancel()
-	return handler(ctx, client, commandArguments, stdin, stdout, stderr, configuration)
+	return handler(ctx, manager, commandArguments, stdin, stdout, stderr, configuration)
 }
 
 func targetCommandList() string {

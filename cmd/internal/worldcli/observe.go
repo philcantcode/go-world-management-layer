@@ -25,7 +25,7 @@ func ParseObservationFilter(name string, arguments []string, stderr io.Writer, d
 	return observation.Filter(), nil
 }
 
-func RunSnapshot(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, defaultLease string, table bool) error {
+func RunSnapshot(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, defaultLease string, table bool) error {
 	name := "snapshot"
 	if table {
 		name = "top"
@@ -34,7 +34,7 @@ func RunSnapshot(ctx context.Context, client *world.Client, arguments []string, 
 	if err != nil {
 		return err
 	}
-	result, err := client.GetLiveSnapshot(ctx, &worldv1.GetLiveSnapshotRequest{Filter: filter})
+	result, err := manager.GetLiveSnapshot(ctx, &worldv1.GetLiveSnapshotRequest{Filter: filter})
 	if err != nil {
 		return err
 	}
@@ -44,7 +44,7 @@ func RunSnapshot(ctx context.Context, client *world.Client, arguments []string, 
 	return Encoder(stdout).Encode(result)
 }
 
-func RunObservationWatch(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, defaultLease string) error {
+func RunObservationWatch(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, defaultLease string) error {
 	flags := NewFlagSet("watch", stderr)
 	var observation ObservationFlags
 	AddObservationFlags(flags, &observation, defaultLease)
@@ -58,14 +58,15 @@ func RunObservationWatch(ctx context.Context, client *world.Client, arguments []
 	if err := Require("lease", observation.Lease); err != nil {
 		return err
 	}
-	stream, err := client.SubscribeObservations(ctx, &worldv1.SubscribeObservationsRequest{Filter: observation.Filter(), AfterCursor: *after})
+	stream, err := manager.SubscribeObservations(ctx, &worldv1.SubscribeObservationsRequest{Filter: observation.Filter(), AfterCursor: *after})
 	if err != nil {
 		return err
 	}
+	defer stream.Close()
 	return EncodeStream(Encoder(stdout), stream.Recv)
 }
 
-func RunMetricWatch(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, defaultLease string) error {
+func RunMetricWatch(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, defaultLease string) error {
 	flags := NewFlagSet("metrics", stderr)
 	var observation ObservationFlags
 	AddObservationFlags(flags, &observation, defaultLease)
@@ -87,14 +88,15 @@ func RunMetricWatch(ctx context.Context, client *world.Client, arguments []strin
 	if err != nil {
 		return err
 	}
-	stream, err := client.SubscribeMetrics(ctx, &worldv1.SubscribeMetricsRequest{Filter: observation.Filter(), Resolution: wireResolution, AfterCursor: *after})
+	stream, err := manager.SubscribeMetrics(ctx, &worldv1.SubscribeMetricsRequest{Filter: observation.Filter(), Resolution: wireResolution, AfterCursor: *after})
 	if err != nil {
 		return err
 	}
+	defer stream.Close()
 	return EncodeStream(Encoder(stdout), stream.Recv)
 }
 
-func RunBundle(ctx context.Context, client *world.Client, arguments []string, stdout, stderr io.Writer, defaultRun string) error {
+func RunBundle(ctx context.Context, manager *world.Manager, arguments []string, stdout, stderr io.Writer, defaultRun string) error {
 	flags := NewFlagSet("bundle", stderr)
 	run := flags.String("run", defaultRun, "target run ID")
 	if err := flags.Parse(arguments); err != nil {
@@ -106,6 +108,6 @@ func RunBundle(ctx context.Context, client *world.Client, arguments []string, st
 	if err := Require("run", *run); err != nil {
 		return err
 	}
-	result, err := client.GetObservationBundle(ctx, &worldv1.GetObservationBundleRequest{TargetRunId: *run})
+	result, err := manager.GetObservationBundle(ctx, &worldv1.GetObservationBundleRequest{TargetRunId: *run})
 	return EncodeResult(Encoder(stdout), result, err)
 }

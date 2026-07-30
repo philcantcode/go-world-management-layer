@@ -151,7 +151,7 @@ func TestDefaultConfigReadsControlAndReconciliationDurations(t *testing.T) {
 	t.Setenv("WORLD_CONTROL_TIMEOUT", "12s")
 	t.Setenv("WORLD_RECONCILIATION_INTERVAL", "45s")
 	t.Setenv("WORLD_RECONCILIATION_TIMEOUT", "4s")
-	configuration, err := defaultConfig(ModeController)
+	configuration, err := defaultConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,13 +160,13 @@ func TestDefaultConfigReadsControlAndReconciliationDurations(t *testing.T) {
 	}
 
 	t.Setenv("WORLD_CONTROL_TIMEOUT", "not-a-duration")
-	if _, err := defaultConfig(ModeController); err == nil || !strings.Contains(err.Error(), "WORLD_CONTROL_TIMEOUT") {
+	if _, err := defaultConfig(); err == nil || !strings.Contains(err.Error(), "WORLD_CONTROL_TIMEOUT") {
 		t.Fatalf("invalid control duration error = %v", err)
 	}
 	t.Setenv("WORLD_CONTROL_TIMEOUT", "12s")
 
 	t.Setenv("WORLD_RECONCILIATION_TIMEOUT", "not-a-duration")
-	if _, err := defaultConfig(ModeController); err == nil || !strings.Contains(err.Error(), "WORLD_RECONCILIATION_TIMEOUT") {
+	if _, err := defaultConfig(); err == nil || !strings.Contains(err.Error(), "WORLD_RECONCILIATION_TIMEOUT") {
 		t.Fatalf("invalid duration error = %v", err)
 	}
 }

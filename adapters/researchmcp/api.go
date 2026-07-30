@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/philcantcode/go-world-management-layer/internal/research"
+	"github.com/philcantcode/go-world-management-layer/world"
 )
 
 // Scope is the caller authorization context for the MCP facade.
@@ -48,6 +49,19 @@ type Options struct {
 // New constructs an API over an existing research store with a required scope.
 func New(store *research.Store, scope Scope) (*API, error) {
 	return NewWithOptions(Options{Store: store, Scope: scope})
+}
+
+// NewFromManager binds the MCP facade to Manager.ActionEvidence(). The Manager
+// must remain open for the lifetime of the returned API.
+func NewFromManager(manager *world.Manager, scope Scope) (*API, error) {
+	if manager == nil {
+		return nil, fmt.Errorf("manager is required")
+	}
+	store := manager.ActionEvidence()
+	if store == nil {
+		return nil, fmt.Errorf("manager action evidence store is not composed")
+	}
+	return New(store, scope)
 }
 
 // NewWithOptions constructs an API with optional escalate hook.

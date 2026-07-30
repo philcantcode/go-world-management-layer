@@ -14,8 +14,8 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-func targetTestConfig() worldcli.ConnectionConfig {
-	return worldcli.ConnectionConfig{Timeout: time.Second}
+func targetTestConfig() worldcli.OpenConfig {
+	return worldcli.OpenConfig{Timeout: time.Second}
 }
 
 func scopedArguments(arguments ...string) []string {

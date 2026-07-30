@@ -1,6 +1,6 @@
-// Command world-capabilities probes the same physical drivers used by worldd
-// and prints profile-ready capability fingerprints. It never provisions a
-// target and never weakens worldd's requirement for trusted image digests.
+// Command world-capabilities probes the same physical drivers used by
+// world.Open and prints profile-ready capability fingerprints. It never
+// provisions a target and never weakens Open's requirement for trusted image digests.
 package main
 
 import (
@@ -105,19 +105,19 @@ func run(arguments []string) error {
 	flags := flag.NewFlagSet("world-capabilities", flag.ContinueOnError)
 	dockerBinary := flags.String("docker-binary", "docker", "Docker CLI path")
 	timeout := flags.Duration("timeout", 30*time.Second, "overall probe deadline")
-	allowPtrace := flags.Bool("target-allow-ptrace", false, "match worldd target ptrace setting")
-	agentContainerUser := flags.String("agent-container-user", "65532:65532", "match worldd unprivileged agent container user")
+	allowPtrace := flags.Bool("target-allow-ptrace", false, "match Open target ptrace setting")
+	agentContainerUser := flags.String("agent-container-user", "65532:65532", "match Open unprivileged agent container user")
 	linuxTargetDriver := flags.String("linux-target-driver", "docker", "Linux target driver: docker or none")
 	androidTargetDriver := flags.String("android-target-driver", "none", "Android target driver: android-emulator or none")
-	androidSDKRoot := flags.String("android-sdk-root", "", "absolute Android SDK root used by worldd")
-	androidADBBinary := flags.String("android-adb-binary", "adb", "ADB binary path used by worldd")
-	androidADBServer := flags.String("android-adb-server", "127.0.0.1:5037", "literal loopback ADB server endpoint used by worldd")
-	androidEmulatorBinary := flags.String("android-emulator-binary", "emulator", "Android emulator binary path used by worldd")
-	androidSDKManagerBinary := flags.String("android-sdkmanager-binary", "sdkmanager", "sdkmanager binary path used by worldd")
-	androidAVDManagerBinary := flags.String("android-avdmanager-binary", "avdmanager", "avdmanager binary path used by worldd")
-	androidBackendVersion := flags.String("android-backend-version", "", "exact observed emulator version expected by worldd")
-	androidRuntimeVersion := flags.String("android-runtime-version", "", "exact ro.system.build.fingerprint expected by worldd")
-	androidBaseConsolePort := flags.Int("android-adb-base-port", cuttlefish.ManagedEmulatorMinConsolePort, "first even managed-emulator console port used by worldd")
+	androidSDKRoot := flags.String("android-sdk-root", "", "absolute Android SDK root used by world.Open")
+	androidADBBinary := flags.String("android-adb-binary", "adb", "ADB binary path used by world.Open")
+	androidADBServer := flags.String("android-adb-server", "127.0.0.1:5037", "literal loopback ADB server endpoint used by world.Open")
+	androidEmulatorBinary := flags.String("android-emulator-binary", "emulator", "Android emulator binary path used by world.Open")
+	androidSDKManagerBinary := flags.String("android-sdkmanager-binary", "sdkmanager", "sdkmanager binary path used by world.Open")
+	androidAVDManagerBinary := flags.String("android-avdmanager-binary", "avdmanager", "avdmanager binary path used by world.Open")
+	androidBackendVersion := flags.String("android-backend-version", "", "exact observed emulator version expected by world.Open")
+	androidRuntimeVersion := flags.String("android-runtime-version", "", "exact ro.system.build.fingerprint expected by world.Open")
+	androidBaseConsolePort := flags.Int("android-adb-base-port", cuttlefish.ManagedEmulatorMinConsolePort, "first even managed-emulator console port used by world.Open")
 	androidSystemImageDigest := flags.String("android-system-image-digest", "", "exact installed Android system-image tree digest")
 	androidSystemImagePackage := flags.String("android-system-image-package", "", "exact SDK system-image package identifier")
 	androidIsolationProfile := flags.String("android-isolation-profile", "instrumented-android", "Android target isolation profile")

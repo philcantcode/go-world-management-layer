@@ -727,12 +727,6 @@ func validatePhysicalRootSeparation(configuration config, sourceRoot string) err
 			path string
 		}{"capture-dir", configuration.captureRoot})
 	}
-	if configuration.unixSocket != "" {
-		roots = append(roots, struct {
-			name string
-			path string
-		}{"unix-socket", configuration.unixSocket})
-	}
 	for _, root := range roots {
 		if err := requireAbsoluteManagedRoot(root.name, root.path); err != nil {
 			return err

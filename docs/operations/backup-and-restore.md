@@ -7,7 +7,8 @@ file is not a valid backup while WAL writes may be active.
 ## Backup
 
 1. Drain admission and quiesce mutations. Gracefully stop the applicable
-   daemon for the safest portable procedure. `worldd` and `world-node` are
+   host process for the safest portable procedure. Independent control-state
+   trees are
    independent services; back up each separately and never merge their state.
 2. Record the world binaries, Go/module build identity, configuration and policy
    digests, SQLite `user_version`, external runtime versions, and filesystem

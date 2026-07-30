@@ -10,8 +10,9 @@ version 1.0, users should upgrade to the newest release to receive fixes.
 `go-world-management-layer` is an operational boundary between research agents
 and the programs or Android apps they investigate. It:
 
-- authenticates control-plane clients (bearer token or mTLS) and scopes work to
-  leases, generations, and owner subjects
+- is imported in-process (`world.Open` → `*world.Manager`) with a fixed local
+  Subject; multi-tenant isolation is separate host processes and state trees
+- scopes work to leases, generations, and owner subjects via policy authorization
 - can provision hardened Docker agent workspaces and disposable Linux targets
   from a trusted deployment profile
 - treats target command and ADB service bytes as intentionally arbitrary within
@@ -22,10 +23,10 @@ It does **not**:
 
 - claim that ordinary Docker containers resist an unknown host-kernel exploit
 - enable physical drivers by default; managed `android-emulator` composition is
-  opt-in and deployment-profile gated, while daemon-selected Cuttlefish and
+  opt-in and deployment-profile gated, while host-selected Cuttlefish and
   physical-device backends are not shipped
-- ship a production collector suite, remote forensic backend, or supported
-  host/version matrix
+- ship a production collector suite, remote forensic backend, remote gRPC
+  control plane, or supported host/version matrix
 
 Hostile production workloads require dedicated nodes and completed real-host
 escape/security qualification. See the README security boundaries and the
@@ -43,7 +44,7 @@ triage and a coordinated fix before disclosing the issue publicly.
 
 ## Sensitive data in issues and PRs
 
-Do not attach real bearer tokens, mTLS private keys, production deployment
-profiles, host paths that identify private infrastructure, live session or
-lease IDs from shared systems, or raw observation bundles that may contain
-sensitive target output. Use synthetic fixtures only.
+Do not attach production deployment profiles, host paths that identify private
+infrastructure, live session or lease IDs from shared systems, or raw
+observation bundles that may contain sensitive target output. Use synthetic
+fixtures only.

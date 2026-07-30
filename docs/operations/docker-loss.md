@@ -2,14 +2,14 @@
 
 Use when the Docker daemon is unavailable, its API becomes inconsistent, or
 Docker restarts while resources exist in the shipped physical Linux
-composition. Both `worldd` and `world-node` can activate the Docker agent and
+composition. A host that Opened Docker agent and
 Linux-target drivers through a trusted deployment profile.
 
 ## Immediate containment
 
 1. Stop new lease, workspace, target, and run admission. Do not repeatedly
    retry mutating Docker calls.
-2. Keep `worldd` and local evidence services running if their health does not
+2. Keep the host process and local evidence services running if their health does not
    depend on Docker. Reject new exec and target transports.
 3. Open a `control_plane_failure` incident. Record the first failed operation,
    daemon/service state, Docker client/server versions, host pressure, and the

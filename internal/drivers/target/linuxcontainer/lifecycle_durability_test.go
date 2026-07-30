@@ -97,7 +97,7 @@ func TestRestartAdoptsExactDurablyQuarantinedTargetAndRebuildsReplay(t *testing.
 	runtime := newInventoryRuntime()
 	input, _ := dockerTargetFixture(t, domain.NewDigest([]byte("quarantine-restart-image")))
 	config := Config{
-		Build: BuildConfig{TargetRoot: t.TempDir(), ImageRepository: "example.invalid/target", ContainerUser: testTargetUser(t)}, Runtime: runtime,
+		Build: BuildConfig{TargetRoot: writableTempDir(t), ImageRepository: "example.invalid/target", ContainerUser: testTargetUser(t)}, Runtime: runtime,
 		Collectors: CollectorReadinessFunc(func(context.Context, domain.TargetRunID, []ports.ObservationRequirement) error { return nil }),
 	}
 	first, err := New(config)
@@ -275,7 +275,7 @@ func newResetDurabilityFixture(t *testing.T, label string) resetDurabilityFixtur
 	runtime := newInventoryRuntime()
 	initial, _ := dockerTargetFixture(t, domain.NewDigest([]byte("durable-reset-image/"+label)))
 	config := Config{
-		Build: BuildConfig{TargetRoot: t.TempDir(), ImageRepository: "example.invalid/target", ContainerUser: testTargetUser(t)}, Runtime: runtime,
+		Build: BuildConfig{TargetRoot: writableTempDir(t), ImageRepository: "example.invalid/target", ContainerUser: testTargetUser(t)}, Runtime: runtime,
 		Collectors: CollectorReadinessFunc(func(context.Context, domain.TargetRunID, []ports.ObservationRequirement) error { return nil }),
 		Now:        func() time.Time { return time.Unix(90, 0).UTC() },
 	}

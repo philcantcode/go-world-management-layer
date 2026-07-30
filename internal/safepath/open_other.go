@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// Non-Linux clients are supported, but production world-node is Linux. This
+// Non-Linux clients are supported, but production physical hosts are Linux. This
 // conservative fallback rejects every symlink component and verifies that the
 // opened descriptor still identifies the inspected file.
 func openRegular(root, normalized string) (*File, error) {

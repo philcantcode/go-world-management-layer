@@ -420,63 +420,63 @@ func TestConfigValidatesPhysicalDriverMatrix(t *testing.T) {
 	}
 }
 
-func TestParseConfigActivatesPhysicalDriverFlags(t *testing.T) {
-	for name, value := range map[string]string{
-		"WORLD_ALLOW_REMOTE_ADB": "false", "WORLD_TARGET_ALLOW_PTRACE": "false",
-		"WORLD_ANDROID_TARGET_DRIVER": "none", "WORLD_PHYSICAL_TARGET_DRIVER": "none",
-		"WORLD_CAPTURE_DRIVER": "none", "WORLD_MATERIAL_DRIVER": "local",
-	} {
-		t.Setenv(name, value)
-	}
+func TestPhysicalConfigRetainsDriverSelections(t *testing.T) {
 	profilePath := filepath.Join(t.TempDir(), "deployment.json")
-	args := []string{
-		"-state", filepath.Join(t.TempDir(), "state.db"),
-		"-ledger-dir", t.TempDir(), "-orchestration-state-dir", t.TempDir(),
-		"-bundle-dir", t.TempDir(), "-material-dir", t.TempDir(),
-		"-listen", "127.0.0.1:0", "-unix-socket", "",
-		"-agent-driver", "docker", "-workspace-driver", "directory",
-		"-linux-target-driver", "docker", "-deployment-profile", profilePath,
-		"-agent-workspace-root", t.TempDir(), "-target-root", t.TempDir(),
-		"-control-timeout", "7s", "-reconciliation-interval", "17s", "-reconciliation-timeout", "3s",
-	}
-	configuration, err := parseConfig(args, ModeController)
-	if err != nil {
+	configuration := baseTestConfig()
+	configuration.statePath = filepath.Join(t.TempDir(), "state.db")
+	configuration.ledgerDirectory = t.TempDir()
+	configuration.orchestrationStateRoot = t.TempDir()
+	configuration.bundleRoot = t.TempDir()
+	configuration.materialRoot = t.TempDir()
+	configuration.agentDriver = "docker"
+	configuration.workspaceDriver = "directory"
+	configuration.linuxTargetDriver = "docker"
+	configuration.deploymentProfile = profilePath
+	configuration.agentWorkspaceRoot = t.TempDir()
+	configuration.targetRoot = t.TempDir()
+	configuration.controlTimeout = 7 * time.Second
+	configuration.reconciliationInterval = 17 * time.Second
+	configuration.reconciliationTimeout = 3 * time.Second
+	if err := configuration.validate(); err != nil {
 		t.Fatal(err)
 	}
 	if configuration.agentDriver != "docker" || configuration.workspaceDriver != "directory" ||
 		configuration.linuxTargetDriver != "docker" || configuration.deploymentProfile != profilePath ||
 		configuration.controlTimeout != 7*time.Second || configuration.reconciliationInterval != 17*time.Second || configuration.reconciliationTimeout != 3*time.Second {
-		t.Fatalf("physical flags were not retained: %#v", configuration)
+		t.Fatalf("physical selections were not retained: %#v", configuration)
 	}
 }
 
-func TestParseConfigActivatesManagedAndroidDriver(t *testing.T) {
-	for name, value := range map[string]string{
-		"WORLD_ALLOW_REMOTE_ADB": "false", "WORLD_TARGET_ALLOW_PTRACE": "false",
-		"WORLD_PHYSICAL_TARGET_DRIVER": "none", "WORLD_CAPTURE_DRIVER": "none", "WORLD_MATERIAL_DRIVER": "local",
-	} {
-		t.Setenv(name, value)
-	}
+func TestManagedAndroidConfigValidation(t *testing.T) {
 	profilePath := filepath.Join(t.TempDir(), "deployment.json")
 	androidRoot, imageRoot, sdkRoot := t.TempDir(), t.TempDir(), t.TempDir()
-	configuration, err := parseConfig([]string{
-		"-state", filepath.Join(t.TempDir(), "state.db"), "-ledger-dir", t.TempDir(),
-		"-orchestration-state-dir", t.TempDir(), "-bundle-dir", t.TempDir(), "-material-dir", t.TempDir(),
-		"-listen", "127.0.0.1:0", "-unix-socket", "", "-agent-driver", "docker", "-workspace-driver", "directory",
-		"-deployment-profile", profilePath, "-agent-workspace-root", t.TempDir(),
-		"-android-target-driver", "android-emulator", "-android-target-root", androidRoot,
-		"-android-system-image-root", imageRoot, "-android-adb-binary", `C:\Android\adb.exe`,
-		"-android-sdk-root", sdkRoot, "-android-sdkmanager-binary", `C:\Android\sdkmanager.bat`,
-		"-android-avdmanager-binary", `C:\Android\avdmanager.bat`,
-		"-android-emulator-binary", `C:\Android\emulator.exe`, "-android-backend-version", "36.3.10",
-		"-android-runtime-version", "aosp-35", "-android-adb-base-port", "5554",
-	}, ModeController)
-	if err != nil {
+	configuration := baseTestConfig()
+	configuration.statePath = filepath.Join(t.TempDir(), "state.db")
+	configuration.ledgerDirectory = t.TempDir()
+	configuration.orchestrationStateRoot = t.TempDir()
+	configuration.bundleRoot = t.TempDir()
+	configuration.materialRoot = t.TempDir()
+	configuration.agentDriver = "docker"
+	configuration.workspaceDriver = "directory"
+	configuration.deploymentProfile = profilePath
+	configuration.agentWorkspaceRoot = t.TempDir()
+	configuration.androidTargetDriver = "android-emulator"
+	configuration.androidTargetRoot = androidRoot
+	configuration.androidSystemImageRoot = imageRoot
+	configuration.androidADBBinary = `C:\Android\adb.exe`
+	configuration.androidSDKRoot = sdkRoot
+	configuration.androidSDKManagerBinary = `C:\Android\sdkmanager.bat`
+	configuration.androidAVDManagerBinary = `C:\Android\avdmanager.bat`
+	configuration.androidEmulatorBinary = `C:\Android\emulator.exe`
+	configuration.androidBackendVersion = "36.3.10"
+	configuration.androidRuntimeVersion = "aosp-35"
+	configuration.androidADBBasePort = 5554
+	if err := configuration.validate(); err != nil {
 		t.Fatal(err)
 	}
 	if configuration.androidTargetDriver != "android-emulator" || configuration.androidTargetRoot != androidRoot ||
 		configuration.androidSystemImageRoot != imageRoot || configuration.androidSDKRoot != sdkRoot || configuration.androidADBBasePort != 5554 {
-		t.Fatalf("Android flags were not retained: %#v", configuration)
+		t.Fatalf("Android selections were not retained: %#v", configuration)
 	}
 	for _, unsupported := range []int{
 		cuttlefish.ManagedEmulatorMinConsolePort - 2,
@@ -522,8 +522,8 @@ func physicalTestConfig(t *testing.T, fixture profileFixture, withTarget bool) c
 func baseTestConfig() config {
 	return config{
 		statePath: "state.db", ledgerDirectory: "ledger", orchestrationStateRoot: "orchestration",
-		bundleRoot: "bundles", materialRoot: "material", tcpAddress: "127.0.0.1:7777",
-		maxMessageBytes: 1 << 20, maxTransferBytes: 1 << 20, maxExecBytes: 1 << 20,
+		bundleRoot: "bundles", materialRoot: "material",
+		maxTransferBytes: 1 << 20, maxExecBytes: 1 << 20,
 		maxADBBytes: 1 << 20, maxBundleBytes: 1 << 20,
 		maxCaptureRecords: 10000,
 		probeTimeout:      time.Second, controlTimeout: time.Second, reconciliationInterval: time.Minute,

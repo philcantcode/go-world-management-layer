@@ -61,6 +61,22 @@ type Authority struct {
 	bundleSensitivity        domain.Sensitivity
 }
 
+// NewFromMaterial wraps an already-composed ports.MaterialAuthority when hosts
+// obtain material composition from world.Manager.Material(). Forensic repository
+// backends remain the primary construction path via New; this helper documents
+// the Manager hand-off for hosts that already hold a MaterialAuthority.
+func MaterialFromManager(manager materialManager) ports.MaterialAuthority {
+	if manager == nil {
+		return nil
+	}
+	return manager.Material()
+}
+
+// materialManager is the Manager subset required for forensic material hand-off.
+type materialManager interface {
+	Material() ports.MaterialAuthority
+}
+
 func New(backend Backend, config Config) (*Authority, error) {
 	const operation = "forensic_artifacts.new"
 	if isNilBackend(backend) {

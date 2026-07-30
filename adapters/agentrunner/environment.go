@@ -13,6 +13,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
 	"github.com/philcantcode/go-world-management-layer/internal/research"
 	"github.com/philcantcode/go-world-management-layer/internal/transport"
+	"github.com/philcantcode/go-world-management-layer/world"
 )
 
 const EnvironmentProtocolVersion uint16 = 1
@@ -20,6 +21,11 @@ const EnvironmentProtocolVersion uint16 = 1
 var ErrExecutionInProgress = errors.New("world execution is already in progress")
 
 type Options struct {
+	// Manager optionally supplies Core, Driver, and ActionEvidence from an
+	// in-process world.Open composition. Explicit Core/Driver fields still
+	// override Manager accessors when set.
+	Manager *world.Manager
+
 	Core                      *application.Core
 	Driver                    ports.AgentWorkspaceDriver
 	LeaseID                   domain.LeaseID
@@ -31,7 +37,8 @@ type Options struct {
 	HeartbeatInterval         time.Duration
 	ProtocolVersion           uint16
 	// ActionEvidence optionally records multi-dimensional action bundles for
-	// each Execute call. Nil disables capture (no-op).
+	// each Execute call. Nil disables capture (no-op). When Manager is set and
+	// ActionEvidence is nil, Manager.ActionEvidence() is used.
 	ActionEvidence *research.Store
 }
 
@@ -50,6 +57,17 @@ type Environment struct {
 }
 
 func New(options Options) (*Environment, error) {
+	if options.Manager != nil {
+		if options.Core == nil {
+			options.Core = options.Manager.Core()
+		}
+		if options.Driver == nil {
+			options.Driver = options.Manager.AgentDriver()
+		}
+		if options.ActionEvidence == nil {
+			options.ActionEvidence = options.Manager.ActionEvidence()
+		}
+	}
 	if options.Core == nil || options.Driver == nil || options.LeaseID.IsZero() || options.AgentWorkspaceID.IsZero() || !options.AgentGeneration.IsValid() || options.CapabilityDigest.IsZero() || options.AuthorizedPolicyReference == "" {
 		return nil, fmt.Errorf("core, driver, lease, agent generation, and capability digest are required")
 	}

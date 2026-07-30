@@ -183,7 +183,7 @@ go run ./cmd/world-android-image-digest -path $image
 Before publishing a policy, run `world-capabilities` with the exact SDK root,
 tool paths, loopback ADB server, emulator/runtime versions, image digest and
 package, and the same even `5554..5584` base console port configured for
-`worldd`. The report
+`world.Open`. The report
 must contain supported managed-Android and hardware-acceleration capabilities;
 its combined fingerprint is the one policies bind.
 
