@@ -19,7 +19,7 @@ func TestDirectoryCopyDeploymentPolicyCompilesAgainstExplicitCapabilities(t *tes
 	for _, requirement := range requirements {
 		levels[requirement.Name] = requirement.Level
 	}
-	for _, required := range []string{"node.os.windows", "filesystem.directory-copy.non-production", "runtime.oci.runc", "coverage.linux-container.target.lifecycle"} {
+	for _, required := range []string{"host.profile.directory-copy-non-production", "filesystem.directory-copy.non-production", "runtime.oci.runc", "coverage.linux-container.target.lifecycle"} {
 		if levels[required] != RequirementRequired {
 			t.Fatalf("capability %q level = %q, want required", required, levels[required])
 		}

@@ -26,6 +26,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/drivers/target/cuttlefish"
 	"github.com/philcantcode/go-world-management-layer/internal/drivers/target/linuxcontainer"
 	"github.com/philcantcode/go-world-management-layer/internal/orchestration/policyauthority"
+	"github.com/philcantcode/go-world-management-layer/internal/platform"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
 	"github.com/philcantcode/go-world-management-layer/policy"
 )
@@ -45,6 +46,9 @@ type capabilityDetail struct {
 }
 
 type report struct {
+	// PlatformSupport is the structured host feature matrix (supported /
+	// partial / unsupported) for this GOOS/GOARCH before driver probes run.
+	PlatformSupport       platform.SupportReport                   `json:"platform_support"`
 	Combined              capabilityReport                         `json:"combined"`
 	Agent                 capabilityReport                         `json:"agent"`
 	AgentPhysical         ports.AgentWorkspacePhysicalPolicyReport `json:"agent_physical_policy"`
@@ -332,7 +336,7 @@ func run(arguments []string) error {
 	}
 	combined, err := policyauthority.BuildCapabilityFingerprint(policyauthority.CapabilityFacts{
 		HostOS: runtime.GOOS, HostArchitecture: runtime.GOARCH, WorkspaceMode: "directory-copy-non-production",
-		DirectoryCopy: true, Components: components, IntrinsicCoverage: coverage,
+		DirectoryCopy: platform.DirectoryCopyHost(), Components: components, IntrinsicCoverage: coverage,
 	})
 	if err != nil {
 		return fmt.Errorf("compose complete capability fingerprint: %w", err)
@@ -354,8 +358,16 @@ func run(arguments []string) error {
 		}
 	}
 
+	support := platform.Report()
+	for _, line := range support.FormatWarningLines() {
+		fmt.Fprintln(os.Stderr, line)
+	}
+	for _, note := range support.EnabledDriverNotes(*androidTargetDriver, *linuxTargetDriver, "docker") {
+		fmt.Fprintln(os.Stderr, "platform support warning: selected composition:", note)
+	}
 	encoded, err := json.MarshalIndent(report{
-		Combined: mapCapabilityReport(combined), Agent: mapCapabilityReport(agentFingerprint), AgentPhysical: agentPhysical,
+		PlatformSupport: support,
+		Combined:        mapCapabilityReport(combined), Agent: mapCapabilityReport(agentFingerprint), AgentPhysical: agentPhysical,
 		LinuxTarget: targetReport, LinuxTargetPhysical: targetPhysicalReport,
 		AndroidTarget: androidReport, AndroidTargetPhysical: androidPhysicalReport,
 		ProcessObserver: configuredObserverReport, EffectivePolicy: effectivePolicy,

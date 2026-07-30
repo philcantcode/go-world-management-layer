@@ -10,6 +10,28 @@ schema, or on-disk format changes. Prefer the newest 0.x tag for consumers.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-30
+
+### Added
+
+- Darwin (macOS) durable `internal/safepath` namespaces and descriptor-safe
+  opens, enabling production `world.Open` on macOS for the logical control
+  plane and non-production directory-copy composition.
+- Structured host platform-support report at Open (`Manager.PlatformSupport()`,
+  startup log JSON + warnings) covering safepath, processlock, workspaces,
+  Docker, managed Android, containment, and guest/collector process ownership.
+- Policy capability `host.profile.directory-copy-non-production` for Windows
+  and Darwin directory-copy non-production hosts (replaces a Windows-only
+  `node.os.windows` requirement for that workspace mode).
+- CI matrix entry for `macos-latest`.
+
+### Changed
+
+- Managed Android on non-Windows hosts fails closed with explicit operator
+  messages; Darwin rejects `android-target-driver=android-emulator` at host
+  config/Open after logging structured platform-support warnings. Linux remains
+  partial (identity without Job-equivalent resource containment).
+
 ## [0.3.0] - 2026-07-30
 
 ### Added

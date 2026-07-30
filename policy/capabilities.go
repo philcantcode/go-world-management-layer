@@ -89,7 +89,8 @@ func (a *requirementAccumulator) add(name string, level RequirementLevel, path s
 func deriveCapabilityRequirements(policy *Policy) []CapabilityRequirement {
 	requirements := newRequirementAccumulator()
 	if policy.Spec.Workspace.Mode == "directory-copy-non-production" {
-		requirements.add("node.os.windows", RequirementRequired, "spec.workspace.mode")
+		// Host profile covers windows and darwin; linux production uses overlayfs.
+		requirements.add("host.profile.directory-copy-non-production", RequirementRequired, "spec.workspace.mode")
 		requirements.add("filesystem.directory-copy.non-production", RequirementRequired, "spec.workspace.mode")
 	} else {
 		requirements.add("node.os.linux", RequirementRequired, "spec.workspace.mode")

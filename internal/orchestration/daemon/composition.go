@@ -22,6 +22,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/ledger"
 	"github.com/philcantcode/go-world-management-layer/internal/orchestration"
 	"github.com/philcantcode/go-world-management-layer/internal/orchestration/policyauthority"
+	"github.com/philcantcode/go-world-management-layer/internal/platform"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
 )
 
@@ -471,7 +472,7 @@ func configureHostDriversWithFactories(ctx context.Context, configuration config
 	coverage := compositionIntrinsicCoverage(targets)
 	combinedFingerprint, err := policyauthority.BuildCapabilityFingerprint(policyauthority.CapabilityFacts{
 		HostOS: runtime.GOOS, HostArchitecture: runtime.GOARCH, WorkspaceMode: "directory-copy-non-production",
-		DirectoryCopy: true, Components: capabilityComponents, IntrinsicCoverage: coverage,
+		DirectoryCopy: platform.DirectoryCopyHost(), Components: capabilityComponents, IntrinsicCoverage: coverage,
 	})
 	if err != nil {
 		return hostComposition{}, fmt.Errorf("compose complete capability fingerprint: %w", err)

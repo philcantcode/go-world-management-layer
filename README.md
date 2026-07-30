@@ -10,7 +10,7 @@ It keeps a persistent agent workspace separate from disposable target
 sandboxes, scopes every operation to a lease and generation, and preserves
 failures and observation gaps as evidence.
 
-**Status:** v0.3.0 — active pre-v1 implementation. Minor 0.x releases may break
+**Status:** v0.4.0 — active pre-v1 implementation. Minor 0.x releases may break
 APIs, CLIs, policies, schemas, or on-disk formats; pin consumers to an exact
 tag.
 
@@ -19,15 +19,16 @@ tag.
 (`worldd` / `world-node` / `world.Dial` are removed). See
 [docs/designs/library-only-manager.md](docs/designs/library-only-manager.md).
 
-The library owns a logical lifecycle core and opt-in physical Linux and Android
-composition: digest-pinned Docker agent workspaces, directory-copy workspaces,
-Docker Linux targets, managed Android SDK Emulator targets,
-deployment-authorized local material, optional process observers, and ledger
-capture. Physical startup requires an immutable version-3 deployment profile;
-Open probes the selected drivers, compiles every strict policy against the
-complete capability fingerprint, preflights every published plan, runs startup
-reconciliation, and fails closed before returning a Manager if the result
-cannot be enforced.
+The library owns a logical lifecycle core and opt-in physical Linux, Windows,
+and Darwin composition where the host can enforce the contract: digest-pinned
+Docker agent workspaces, directory-copy workspaces (non-production on Windows
+and Darwin), Docker Linux targets, managed Android SDK Emulator targets
+(Windows-primary), deployment-authorized local material, optional process
+observers, and ledger capture. Physical startup requires an immutable version-3
+deployment profile; Open probes the selected drivers, compiles every strict
+policy against the complete capability fingerprint, preflights every published
+plan, runs startup reconciliation, logs a structured platform-support report,
+and fails closed before returning a Manager if the result cannot be enforced.
 
 The Android composition owns headless hardware-accelerated SDK Emulator AVDs,
 verifies the complete installed system-image tree against its pinned digest,
@@ -122,7 +123,7 @@ OverlayFS, attach eBPF, or contact a remote artifact service.
 | `world.Manager` (library Open) | In-process logical control plane; fixed local Subject; exclusive processlock on control state; startup reconciliation before Open returns; logical-only defaults; opt-in Docker/directory/process/ledger plus managed Android Emulator physical composition from a trusted deployment profile | Remote Dial / dual-daemon product (deleted); fleet controller behavior; physical-device composition |
 | Operator CLIs | Thin in-process wrappers (`worldctl`, `world-target`, `world-observe`, …) that embed Manager with local paths/drivers — not socket clients | Authenticated unix/TCP WorldService listen surface |
 | Docker/directory | Agent and Linux-target provisioning, input projection, exec/transfer, export, capture, physical reconciliation, lease drain, quarantine, and teardown; one mutable run per generation, exact-container stop proof, and replacement reset before another run | Requires explicit matching driver config, absolute non-overlapping roots, locally present digest-pinned images, and a version-3 deployment profile |
-| Android | On Windows, `android-target-driver=android-emulator`; exact full-tree system-image identity; durable AVD/port allocation; atomically assigned named-Job CPU/memory containment; independent guest-RAM and exact `/data` sizing; create, clean boot, readiness, scoped ADB/file transfer, one-run generations, quarantine, replacement reset, destruction, and committed-process crash reconciliation; managed and attached real-APK qualification tests | Requires a local Android SDK, a rooted/debuggable image, loopback ADB, hardware acceleration, one exact digest/package identity per deployment, and a trusted exclusive service account; managed resource containment fails closed on non-Windows hosts, a launch interruption with no exactly bound successor remains fail-closed, and physical devices are not composed |
+| Android | On Windows, `android-target-driver=android-emulator` with full named-Job CPU/memory containment; exact full-tree system-image identity; durable AVD/port allocation; independent guest-RAM and exact `/data` sizing; create, clean boot, readiness, scoped ADB/file transfer, one-run generations, quarantine, replacement reset, destruction, and committed-process crash reconciliation; managed and attached real-APK qualification tests | Requires a local Android SDK, a rooted/debuggable image, loopback ADB, hardware acceleration, one exact digest/package identity per deployment, and a trusted exclusive service account. Linux may open a partial managed path (pidfd identity) but resource containment fails closed. Darwin and other hosts fail closed at Open/config with structured platform-support warnings. Physical devices are not composed |
 | Observation/material | Durable ledger/live view, process observer supervision, ledger captures, local selection/content/output/bundle authority, and bundle sealing | Deployment observer binaries and a remote forensic authority are not bundled |
 
 With all drivers left at `none`, lifecycle calls create logical records and
@@ -189,7 +190,7 @@ Requires [Go 1.23](https://go.dev/dl/) or newer.
 Library (only supported host integration):
 
 ```console
-go get github.com/philcantcode/go-world-management-layer/world@v0.3.0
+go get github.com/philcantcode/go-world-management-layer/world@v0.4.0
 ```
 
 ```go
@@ -211,7 +212,7 @@ manager, err := world.Open(ctx, world.Config{
 Operator tools embed the same Open path:
 
 ```console
-go install github.com/philcantcode/go-world-management-layer/cmd/worldctl@v0.3.0
+go install github.com/philcantcode/go-world-management-layer/cmd/worldctl@v0.4.0
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes and [RELEASING.md](RELEASING.md)
@@ -386,12 +387,16 @@ It runs, in order:
 Use `go run ./cmd/verify -only=<gate>` for one named gate; `-h` lists the
 accepted names. Every invocation atomically writes its gate status and timing
 to `verification/summary.json` by default; `-summary` selects another path.
-Safe durable namespaces (`internal/safepath`) are implemented for Linux and
-Windows; on Darwin, packages that open those namespaces fail closed and a full
-`go test ./...` / `verify` pass is not expected for that platform. Real-node
-Docker, privileged Linux, KVM/Android, collector, artifact-service, security
-escape, performance, and soak suites are separate release evidence and are not
-implied by a local `verify` pass.
+Safe durable namespaces (`internal/safepath`) are implemented for Linux,
+Windows, and Darwin. On Open, the host emits a structured platform-support
+report (`Manager.PlatformSupport()` and startup log lines) that lists each
+feature as `supported`, `partial`, or `unsupported` with operator warnings for
+anything short of full production parity. Managed Android with Job resource
+containment remains Windows-primary; Darwin fails closed if
+`android-target-driver=android-emulator` is selected. Real-node Docker,
+privileged Linux, KVM/Android, collector, artifact-service, security escape,
+performance, and soak suites are separate release evidence and are not implied
+by a local `verify` pass.
 
 ## Security boundaries
 

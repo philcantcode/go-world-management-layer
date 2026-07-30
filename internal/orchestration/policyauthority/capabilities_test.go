@@ -36,16 +36,32 @@ func TestBuildCapabilityFingerprintPreservesComponentsWithoutInventingFilesystem
 		t.Fatal("component iteration order changed the combined fingerprint")
 	}
 	for name, expected := range map[string]policy.CapabilityStatus{
-		"filesystem.directory-copy.non-production":  policy.CapabilitySupported,
-		"filesystem.overlayfs":                      policy.CapabilityUnsupported,
-		"filesystem.reflink":                        policy.CapabilityUnsupported,
-		"runtime.oci.runc":                          policy.CapabilitySupported,
-		"coverage.linux-container.target.lifecycle": policy.CapabilitySupported,
-		"component.agent.agent.docker":              policy.CapabilitySupported,
+		"host.profile.directory-copy-non-production": policy.CapabilitySupported,
+		"filesystem.directory-copy.non-production":   policy.CapabilitySupported,
+		"filesystem.overlayfs":                       policy.CapabilityUnsupported,
+		"filesystem.reflink":                         policy.CapabilityUnsupported,
+		"runtime.oci.runc":                           policy.CapabilitySupported,
+		"coverage.linux-container.target.lifecycle":  policy.CapabilitySupported,
+		"component.agent.agent.docker":               policy.CapabilitySupported,
 	} {
 		capability, found := first.Capability(name)
 		if !found || capability.Status() != expected {
 			t.Fatalf("capability %q = %#v, found=%t, want %s", name, capability, found, expected)
+		}
+	}
+}
+
+func TestBuildCapabilityFingerprintDirectoryCopyOnDarwin(t *testing.T) {
+	fingerprint, err := BuildCapabilityFingerprint(CapabilityFacts{
+		HostOS: "darwin", HostArchitecture: "arm64", WorkspaceMode: "directory-copy-non-production", DirectoryCopy: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"host.profile.directory-copy-non-production", "filesystem.directory-copy.non-production", "node.os.darwin"} {
+		capability, found := fingerprint.Capability(name)
+		if !found || capability.Status() != policy.CapabilitySupported {
+			t.Fatalf("capability %q = %#v, found=%t", name, capability, found)
 		}
 	}
 }

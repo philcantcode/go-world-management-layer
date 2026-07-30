@@ -15,6 +15,7 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/ledger"
 	"github.com/philcantcode/go-world-management-layer/internal/orchestration"
 	"github.com/philcantcode/go-world-management-layer/internal/orchestration/policyauthority"
+	"github.com/philcantcode/go-world-management-layer/internal/platform"
 	"github.com/philcantcode/go-world-management-layer/internal/policyregistry"
 	"github.com/philcantcode/go-world-management-layer/internal/ports"
 	"github.com/philcantcode/go-world-management-layer/internal/processlock"
@@ -96,6 +97,8 @@ type Host struct {
 	Store      *store.Store
 	Ledger     *ledger.Ledger
 	Subject    string
+	// PlatformSupport is the structured host feature matrix logged at Open.
+	PlatformSupport platform.SupportReport
 
 	stateOwner  *processlock.Owner
 	composition hostComposition
@@ -157,6 +160,16 @@ func openHostOwned(
 ) (host *Host, resultErr error) {
 	if logf == nil {
 		logf = log.Printf
+	}
+	support := platform.Report()
+	logPlatformSupport(logf, support, configuration)
+	if err := platform.RequireSafePathNamespaces(); err != nil {
+		return nil, fmt.Errorf("host platform preflight: %w", err)
+	}
+	if configuration.androidTargetDriver != "none" {
+		if err := platform.RequireAndroidManagedHost(); err != nil {
+			return nil, fmt.Errorf("host platform preflight: %w", err)
+		}
 	}
 	controlStore, err := store.Open(ctx, store.Options{Path: configuration.statePath})
 	if err != nil {
@@ -262,6 +275,7 @@ func openHostOwned(
 		Store:                  controlStore,
 		Ledger:                 observations,
 		Subject:                subjectName,
+		PlatformSupport:        support,
 		stateOwner:             stateOwner,
 		composition:            composition,
 		core:                   core,
@@ -271,6 +285,19 @@ func openHostOwned(
 		cancelBackground:       cancelBackground,
 		backgroundDone:         backgroundDone,
 	}, nil
+}
+
+func logPlatformSupport(logf func(string, ...any), support platform.SupportReport, configuration config) {
+	logf("host platform support %s", support.CompactSummary())
+	for _, line := range support.FormatWarningLines() {
+		logf("%s", line)
+	}
+	for _, note := range support.EnabledDriverNotes(configuration.androidTargetDriver, configuration.linuxTargetDriver, configuration.agentDriver) {
+		logf("platform support warning: selected composition: %s", note)
+	}
+	if encoded, err := support.JSON(); err == nil {
+		logf("host platform support report json=%s", encoded)
+	}
 }
 
 // Close stops background reconciliation, closes drivers/observers, releases the
@@ -583,6 +610,9 @@ func (c config) validatePhysicalComposition() error {
 		}
 	}
 	if c.androidTargetDriver != "none" {
+		if err := platform.RequireAndroidManagedHost(); err != nil {
+			return err
+		}
 		if err := requireAbsoluteManagedRoot("android-target-root", c.androidTargetRoot); err != nil {
 			return err
 		}

@@ -77,7 +77,10 @@ func BuildCapabilityFingerprint(facts CapabilityFacts) (policy.CapabilityFingerp
 	addCapability(capabilities, "node.os."+hostOS, true, map[string]string{"architecture": architecture}, nil)
 	addCapability(capabilities, "filesystem.overlayfs", facts.OverlayFS, nil, map[string]string{"workspace_mode": workspaceMode})
 	addCapability(capabilities, "filesystem.reflink", facts.Reflink, nil, map[string]string{"workspace_mode": workspaceMode})
-	addCapability(capabilities, "filesystem.directory-copy.non-production", facts.DirectoryCopy,
+	directoryCopyHost := facts.DirectoryCopy && (hostOS == "windows" || hostOS == "darwin")
+	addCapability(capabilities, "host.profile.directory-copy-non-production", directoryCopyHost,
+		map[string]string{"production": "false", "hosts": "windows,darwin"}, map[string]string{"workspace_mode": workspaceMode, "host.os": hostOS})
+	addCapability(capabilities, "filesystem.directory-copy.non-production", directoryCopyHost,
 		map[string]string{"production": "false"}, map[string]string{"workspace_mode": workspaceMode})
 
 	agentDocker := componentSupports(components, "agent.docker")

@@ -20,11 +20,43 @@ func requireProductionHostPlatform(t *testing.T) {
 	namespace, err := safepath.OpenNamespace(t.TempDir(), "probe")
 	if err != nil {
 		if errors.Is(err, safepath.ErrUnsupported) {
-			t.Skip("production Open requires durable safepath namespaces (linux/windows)")
+			t.Skip("production Open requires durable safepath namespaces (linux/windows/darwin)")
 		}
 		t.Fatal(err)
 	}
 	_ = namespace.Close()
+}
+
+func TestOpenReportsStructuredPlatformSupport(t *testing.T) {
+	requireProductionHostPlatform(t)
+	manager := openLogicalManager(t)
+	defer func() {
+		if err := manager.Close(); err != nil {
+			t.Fatalf("close manager: %v", err)
+		}
+	}()
+	support := manager.PlatformSupport()
+	if support.GOOS == "" || support.GOARCH == "" {
+		t.Fatalf("platform support missing host identity: %#v", support)
+	}
+	found := false
+	for _, feature := range support.Features {
+		if feature.ID == "safepath.namespace" {
+			found = true
+			if feature.Status != world.PlatformFeatureSupported {
+				t.Fatalf("safepath status = %s, want supported", feature.Status)
+			}
+		}
+		if feature.ID == "target.android_emulator.managed" && feature.Status == world.PlatformFeatureUnsupported {
+			// Darwin and other non-managed hosts must surface explicit warnings.
+			if len(support.Warnings) == 0 {
+				t.Fatal("expected platform support warnings when Android is unsupported")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected safepath.namespace in platform support")
+	}
 }
 
 func TestOpenLogicalAcquireGetRelease(t *testing.T) {

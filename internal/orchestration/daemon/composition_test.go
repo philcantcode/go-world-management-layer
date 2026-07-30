@@ -23,16 +23,25 @@ import (
 	"github.com/philcantcode/go-world-management-layer/internal/testkit"
 )
 
-// directory-copy-non-production policy requires node.os.windows; physical
-// composition tests that load the e2e fixture only run on that host class.
+// directory-copy-non-production policies bind host.profile.directory-copy-non-production
+// (windows and darwin). Physical composition tests that load the e2e fixture
+// only run on those host classes.
 func requireDirectoryCopyCompositionHost(t *testing.T) {
 	t.Helper()
-	if runtime.GOOS != "windows" {
-		t.Skip("directory-copy-non-production composition requires node.os.windows")
+	if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
+		t.Skip("directory-copy-non-production composition requires windows or darwin")
+	}
+}
+
+func requireManagedAndroidHostProcess(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "windows" && runtime.GOOS != "linux" {
+		t.Skip("managed Android host-process authority is not implemented on " + runtime.GOOS)
 	}
 }
 
 func TestManagedAndroidFactoryReleasesAllocatorAfterConstructionFailure(t *testing.T) {
+	requireManagedAndroidHostProcess(t)
 	config := managedAndroidFactoryTestConfig(t, "127.0.0.1:5037")
 	if _, err := newManagedAndroidTargetDriver(config, nil); err == nil || !strings.Contains(err.Error(), "collector gate") {
 		t.Fatalf("construction error = %v", err)
@@ -50,6 +59,7 @@ func TestManagedAndroidFactoryReleasesAllocatorAfterConstructionFailure(t *testi
 }
 
 func TestProductionCompositionFactoryBuildsCompleteManagedAndroidDriver(t *testing.T) {
+	requireManagedAndroidHostProcess(t)
 	readiness := cuttlefish.CollectorReadinessFunc(func(context.Context, domain.TargetRunID, []ports.ObservationRequirement) error {
 		return nil
 	})
@@ -471,6 +481,12 @@ func TestManagedAndroidConfigValidation(t *testing.T) {
 	configuration.androidBackendVersion = "36.3.10"
 	configuration.androidRuntimeVersion = "aosp-35"
 	configuration.androidADBBasePort = 5554
+	if runtime.GOOS != "windows" && runtime.GOOS != "linux" {
+		if err := configuration.validate(); err == nil || !strings.Contains(err.Error(), "android-target-driver=android-emulator") {
+			t.Fatalf("unsupported Android host error = %v", err)
+		}
+		return
+	}
 	if err := configuration.validate(); err != nil {
 		t.Fatal(err)
 	}
